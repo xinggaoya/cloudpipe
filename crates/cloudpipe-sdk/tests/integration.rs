@@ -187,6 +187,23 @@ fn route(method: &str, path: &str, body: &str, state: &MockState) -> (u16, serde
         return (200, serde_json::json!({"success": true, "result": null}));
     }
 
+    // GET /zones — list accessible zones (used by `find_zone` and `list_zones`).
+    if method == "GET" && (path == "/zones" || path.starts_with("/zones?")) {
+        return (
+            200,
+            serde_json::json!({
+                "success": true,
+                "result": [
+                    {
+                        "id": "zone-1",
+                        "name": "example.com",
+                        "account": {"id": "acc-1"},
+                    }
+                ]
+            }),
+        );
+    }
+
     // GET /accounts/{id}/tunnels?... — find/list
     if method == "GET" && path.starts_with("/accounts/") && path.contains("/tunnels") {
         return (200, serde_json::json!({"success": true, "result": []}));
@@ -203,11 +220,19 @@ fn route(method: &str, path: &str, body: &str, state: &MockState) -> (u16, serde
 }
 
 /// Writes a fake `cloudflared` shell script and chmods it executable.
-/// The script prints one "registered tunnel connection" line and waits.
+/// The script prints one "registered tunnel connection" line and then
+/// loops sleeping so it stays alive long enough for the test to observe
+/// edge events. A SIGTERM trap makes the script exit cleanly so that the
+/// SDK's stderr pump observes EOF immediately when the process is
+/// killed (no zombie children holding the stderr write end open).
 async fn write_fake_cloudflared(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("cloudflared");
-    let script =
-        "#!/bin/sh\necho \"2025-01-01 Registered tunnel connection connIndex=0\"\nsleep 60\n";
+    let script = "\
+#!/bin/sh
+trap 'exit 0' TERM INT
+echo \"2025-01-01 Registered tunnel connection connIndex=0\"
+while true; do sleep 1; done
+";
     tokio::fs::write(&path, script).await.unwrap();
 
     #[cfg(unix)]
@@ -345,4 +370,88 @@ fn builder_clone_is_safe() {
         .zone("z")
         .domain("example.com");
     let _b2 = b.clone();
+}
+
+/// Regression test for the `wait()` bug where calling it would immediately
+/// trigger shutdown, killing the tunnel right after it came up.
+///
+/// `wait()` is now a passive block: it must not signal shutdown on its own.
+/// Only an explicit `stop()` (or another path that triggers shutdown) should
+/// drive the background task into cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_does_not_signal_shutdown() {
+    // Mock API server.
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+
+    // Fake cloudflared: print one "registered tunnel connection" line so
+    // the SDK emits `EdgeConnected`, then sleep long enough that the test
+    // can prove wait() doesn't kill it.
+    let tmp = std::env::temp_dir().join(format!("cfp-wait-test-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+    tokio::fs::create_dir_all(&tmp).await.unwrap();
+    let binary = write_fake_cloudflared(&tmp).await;
+
+    // Start the tunnel through the builder, pointing at the mock API.
+    let mut handle = TunnelBuilder::new()
+        .api(CloudflareApi::with_base("test-token", base).unwrap())
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .protocol(Protocol::Http)
+        .port(8080)
+        .subdomain("wait-passive")
+        .cloudflared_path(binary)
+        .start()
+        .await
+        .expect("start should succeed");
+
+    // After start, the tunnel and DNS record exist on the mock.
+    assert_eq!(state.tunnels.lock().unwrap().len(), 1);
+    assert_eq!(state.records.lock().unwrap().len(), 1);
+    assert!(
+        state.deleted_tunnels.lock().unwrap().is_empty(),
+        "no cleanup should have happened yet"
+    );
+    assert!(
+        state.deleted_records.lock().unwrap().is_empty(),
+        "no cleanup should have happened yet"
+    );
+
+    // `wait(&mut self)` must NOT signal shutdown. The fake cloudflared
+    // sleeps 60s, so a properly-passive wait will block past our short
+    // timeout. With the old bug, wait() would trigger shutdown and the
+    // background task would have run cleanup long before the timeout.
+    let timed_out = tokio::time::timeout(std::time::Duration::from_millis(500), handle.wait())
+        .await
+        .is_err();
+    assert!(
+        timed_out,
+        "wait() must remain pending while the tunnel is alive"
+    );
+
+    // Nothing was cleaned up during the wait.
+    assert!(
+        state.deleted_tunnels.lock().unwrap().is_empty(),
+        "wait() must not delete the tunnel"
+    );
+    assert!(
+        state.deleted_records.lock().unwrap().is_empty(),
+        "wait() must not delete the DNS record"
+    );
+
+    // An explicit `stop()` is what drives cleanup.
+    handle.stop().await.expect("stop should succeed");
+    assert!(
+        !state.deleted_tunnels.lock().unwrap().is_empty(),
+        "stop() should have deleted the tunnel"
+    );
+    assert!(
+        !state.deleted_records.lock().unwrap().is_empty(),
+        "stop() should have deleted the DNS record"
+    );
+
+    // After stop, calling stop again reports the handle is shut down.
+    let err = handle.stop().await.unwrap_err();
+    assert!(matches!(err, cloudpipe_sdk::Error::AlreadyShutDown));
 }

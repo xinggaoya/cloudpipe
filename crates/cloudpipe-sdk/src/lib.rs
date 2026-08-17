@@ -10,7 +10,7 @@
 //! use cloudpipe_sdk::{Protocol, TunnelBuilder};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let handle = TunnelBuilder::new()
+//! let mut handle = TunnelBuilder::new()
 //!     .token(std::env::var("CLOUDFLARE_API_TOKEN")?)
 //!     .domain("example.com")
 //!     .protocol(Protocol::Http)
@@ -20,7 +20,14 @@
 //!     .await?;
 //!
 //! println!("live at {}", handle.url());
-//! handle.wait().await;
+//!
+//! // `wait` blocks until the tunnel exits on its own (e.g. cloudflared
+//! // crashed or the 4h age limit was reached). It does NOT signal
+//! // shutdown — pair it with a control signal and call `stop` yourself.
+//! tokio::select! {
+//!     _ = tokio::signal::ctrl_c() => handle.stop().await?,
+//!     _ = handle.wait() => {}
+//! }
 //! # Ok(()) }
 //! ```
 //!

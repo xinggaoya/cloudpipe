@@ -1,9 +1,20 @@
 //! Handle to a running tunnel returned by [`crate::TunnelBuilder::start`].
 //!
 //! The handle exposes the public URL, lets you subscribe to more events, and
-//! provides both async ([`TunnelHandle::wait`]) and explicit
-//! ([`TunnelHandle::stop`]) ways to shut down. [`Drop`] performs best-effort
-//! cleanup if `stop` was never called.
+//! provides two ways to interact with the tunnel's lifetime:
+//!
+//! - [`TunnelHandle::wait`] — passively block until the tunnel exits on its
+//!   own (`cloudflared` crash, 4-hour age limit, etc.). Does **not** signal
+//!   shutdown; pair it with a control signal (e.g. `tokio::signal::ctrl_c`)
+//!   and call [`TunnelHandle::stop`] from there.
+//! - [`TunnelHandle::stop`] — signal shutdown, await the background task
+//!   and run Cloudflare-side cleanup.
+//!
+//! [`Drop`] performs a best-effort `shutdown.trigger()` so the background
+//! task has one last chance to run cleanup if the runtime hasn't already
+//! been torn down — but you should not rely on it. Always call
+//! [`TunnelHandle::stop`] (or the corresponding `Drop`) on every code path
+//! you control so the Cloudflare tunnel and DNS record are released.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -138,12 +149,14 @@ impl TunnelHandle {
         self.events.resubscribe()
     }
 
-    /// Blocks until the tunnel exits for any reason (timeout, child crash,
-    /// or an explicit [`stop`](Self::stop)).
-    pub async fn wait(mut self) {
-        // Trigger shutdown so the background task can wind down cleanly.
-        self.shutdown.trigger();
-
+    /// Blocks until the tunnel exits for any reason (`cloudflared` crash,
+    /// 4-hour age limit, or an explicit [`stop`](Self::stop) from another
+    /// task).
+    ///
+    /// This call is a passive wait: it does **not** signal shutdown on
+    /// its own. To stop the tunnel cleanly, call [`stop`](Self::stop) (or
+    /// trigger shutdown through another path).
+    pub async fn wait(&mut self) {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
@@ -152,9 +165,13 @@ impl TunnelHandle {
         }
     }
 
-    /// Stops the tunnel and releases all Cloudflare-side resources. Consumes
-    /// the handle so it cannot be reused.
-    pub async fn stop(mut self) -> Result<()> {
+    /// Stops the tunnel and releases all Cloudflare-side resources.
+    ///
+    /// Idempotent: calling it twice returns [`Error::AlreadyShutDown`]. If
+    /// the tunnel is already gone (e.g. `cloudflared` crashed and the
+    /// background task finished on its own), `stop` still runs the
+    /// Cloudflare-side cleanup best-effort.
+    pub async fn stop(&mut self) -> Result<()> {
         if self.stopped {
             return Err(Error::AlreadyShutDown);
         }

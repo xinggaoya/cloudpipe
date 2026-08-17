@@ -9,10 +9,8 @@ use cloudpipe_sdk::{TunnelBuilder, Protocol};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let handle = TunnelBuilder::new()
+    let mut handle = TunnelBuilder::new()
         .token(std::env::var("CLOUDFLARE_API_TOKEN")?)
-        .account("your-account-id")
-        .zone("your-zone-id")
         .domain("example.com")
         .protocol(Protocol::Http)
         .port(8080)
@@ -22,7 +20,13 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     println!("Live at {}", handle.url());
-    handle.wait().await;
+
+    // `wait` blocks until the tunnel exits on its own; Ctrl+C triggers
+    // a clean stop. `wait` itself never signals shutdown.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => handle.stop().await?,
+        _ = handle.wait() => {}
+    }
     Ok(())
 }
 ```

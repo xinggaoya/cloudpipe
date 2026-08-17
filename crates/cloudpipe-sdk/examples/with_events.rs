@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = std::env::var("CLOUDFLARE_API_TOKEN")?;
     let domain = std::env::var("CFP_DOMAIN")?;
 
-    let handle = TunnelBuilder::new()
+    let mut handle = TunnelBuilder::new()
         .token(token)
         .domain(domain)
         .protocol(Protocol::Http)
@@ -19,7 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!("[main] live at {}", handle.url());
-    handle.wait().await;
+    // Wait for Ctrl+C, then stop the tunnel cleanly so Cloudflare-side
+    // resources (tunnel, DNS record) are released.
+    let _ = tokio::signal::ctrl_c().await;
+    handle.stop().await?;
     Ok(())
 }
 

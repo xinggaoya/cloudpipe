@@ -32,7 +32,7 @@ const EVENT_BUFFER: usize = 64;
 /// ```no_run
 /// use cloudpipe_sdk::{Protocol, TunnelBuilder};
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let handle = TunnelBuilder::new()
+/// let mut handle = TunnelBuilder::new()
 ///     .token(std::env::var("CLOUDFLARE_API_TOKEN")?)
 ///     .domain("example.com")
 ///     .protocol(Protocol::Http)
@@ -41,12 +41,16 @@ const EVENT_BUFFER: usize = 64;
 ///     .start()
 ///     .await?;
 /// println!("{}", handle.url());
-/// handle.wait().await;
+/// tokio::select! {
+///     _ = tokio::signal::ctrl_c() => handle.stop().await?,
+///     _ = handle.wait() => {}
+/// }
 /// # Ok(()) }
 /// ```
 #[derive(Debug, Clone)]
 pub struct TunnelBuilder {
     token: Option<String>,
+    api: Option<CloudflareApi>,
     account_id: Option<String>,
     zone_id: Option<String>,
     domain: Option<String>,
@@ -70,6 +74,7 @@ impl TunnelBuilder {
     pub fn new() -> Self {
         Self {
             token: None,
+            api: None,
             account_id: None,
             zone_id: None,
             domain: None,
@@ -85,6 +90,17 @@ impl TunnelBuilder {
     /// Sets the Cloudflare API token.
     pub fn token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
+        self
+    }
+
+    /// Injects a pre-built [`CloudflareApi`] client.
+    ///
+    /// Most callers should use [`token`](Self::token) — the SDK will build
+    /// a `CloudflareApi` from it. This entry point is for advanced cases
+    /// (custom base URL, shared client, integration tests against a mock
+    /// API). When set, [`token`](Self::token) is ignored.
+    pub fn api(mut self, api: CloudflareApi) -> Self {
+        self.api = Some(api);
         self
     }
 
@@ -158,10 +174,11 @@ impl TunnelBuilder {
     /// Validates that all required credentials are present. Mainly useful
     /// for dry-run preflight checks.
     ///
-    /// Only `token` is strictly required — `account` / `zone` / `domain`
-    /// can be discovered automatically by `start()`.
+    /// Either [`token`](Self::token) or [`api`](Self::api) must be set.
+    /// `account` / `zone` / `domain` can be discovered automatically by
+    /// `start()`.
     pub fn validate(&self) -> Result<()> {
-        if self.token.is_none() {
+        if self.token.is_none() && self.api.is_none() {
             return Err(Error::MissingCredential("Cloudflare API token"));
         }
         Ok(())
@@ -201,12 +218,17 @@ where
 {
     /// Launches the tunnel.
     pub async fn start(mut self) -> Result<crate::TunnelHandle> {
-        let token = self
-            .inner
-            .token
-            .clone()
-            .ok_or(Error::MissingCredential("Cloudflare API token"))?;
-        let api = CloudflareApi::new(token)?;
+        let api = match self.inner.api.take() {
+            Some(api) => api,
+            None => {
+                let token = self
+                    .inner
+                    .token
+                    .clone()
+                    .ok_or(Error::MissingCredential("Cloudflare API token"))?;
+                CloudflareApi::new(token)?
+            }
+        };
 
         // Resolve account/zone/domain. When all three are provided, skip
         // discovery. Otherwise ask Cloudflare to fill the gaps:
@@ -214,7 +236,13 @@ where
         // - domain set, account/zone missing → find_zone(domain).
         // - domain missing → list_zones(); if exactly one, use it; if
         //   multiple, surface a clear error so the caller can pick.
-        let (account_id, zone_id, domain) = resolve_zone(&api, self.inner.account_id, self.inner.zone_id, self.inner.domain).await?;
+        let (account_id, zone_id, domain) = resolve_zone(
+            &api,
+            self.inner.account_id,
+            self.inner.zone_id,
+            self.inner.domain,
+        )
+        .await?;
 
         let subdomain = match self.inner.subdomain.take() {
             Some(s) if !s.is_empty() => s.to_ascii_lowercase(),
@@ -282,12 +310,11 @@ async fn resolve_zone(
             "account and zone provided but domain is missing — pass .domain(...)"
         ))),
         (None, None, Some(d)) => {
-            let zone = api
-                .find_zone(&d)
-                .await?
-                .ok_or_else(|| Error::Other(anyhow::anyhow!(
+            let zone = api.find_zone(&d).await?.ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
                     "domain \"{d}\" is not accessible with this token"
-                )))?;
+                ))
+            })?;
             Ok((zone.account.id, zone.id, zone.name))
         }
         (None, None, None) => {

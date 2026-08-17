@@ -65,7 +65,7 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("domain not configured — run `cfp key <token>` first"))?;
 
-    let handle = TunnelBuilder::new()
+    let mut handle = TunnelBuilder::new()
         .token(token)
         .account(account_id)
         .zone(zone_id)
@@ -86,11 +86,18 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
     );
 
     // Wait for either Ctrl+C or the tunnel to exit on its own.
+    // `biased` polls the Ctrl+C branch first so that an immediate Ctrl+C
+    // is observed even before `wait()` is armed, and so that `wait()`
+    // never holds a borrow of the handle while we want to call `stop()`.
     tokio::select! {
-        _ = handle.wait() => {}
+        biased;
         _ = wait_for_ctrlc() => {
             EXIT_REQUESTED.store(true, Ordering::SeqCst);
+            if let Err(err) = handle.stop().await {
+                ui::error(&format!("cleanup failed: {err:#}"));
+            }
         }
+        _ = handle.wait() => {}
     }
     Ok(())
 }
