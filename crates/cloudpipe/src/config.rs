@@ -111,11 +111,7 @@ mod tests {
     use super::*;
 
     fn temp_store(name: &str) -> ConfigStore {
-        let dir = std::env::temp_dir().join(format!(
-            "cfp-test-{}-{}",
-            name,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("cfp-test-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         ConfigStore::with_dir(dir)
     }

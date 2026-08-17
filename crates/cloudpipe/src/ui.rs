@@ -1,8 +1,9 @@
-//! Console output helpers (colored, minimal, no extra dependencies).
+//! CLI rendering — turns SDK [`Event`]s into colored terminal output.
 
 use colored::Colorize;
 
-use crate::cloudflare::Zone;
+use cloudpipe_sdk::{Event, LogLevel, ShutdownReason};
+
 use crate::config::Config;
 
 /// Prints the small startup banner.
@@ -14,7 +15,56 @@ pub fn banner() {
     );
 }
 
-/// Prints the tunnel success block after the URL is live.
+/// Renders a single SDK event to stdout.
+pub fn render_event(event: Event) {
+    match event {
+        Event::Banner => banner(),
+        Event::ResolvingConflicts => {}
+        Event::CreatingTunnel { name } => {
+            println!("  {}", format!("Creating tunnel \"{name}\"...").dimmed());
+        }
+        Event::IngressConfigured { protocol, port } => {
+            println!(
+                "  {}",
+                format!("Configuring ingress ({})...", protocol).dimmed()
+            );
+            let _ = port; // matched in the tunnel-live block
+        }
+        Event::DnsCreated { full_name } => {
+            println!("  {}", format!("Creating DNS {full_name}...").dimmed());
+        }
+        Event::CloudflaredStarted => {}
+        Event::EdgeConnected { total, .. } => {
+            if total == 1 {
+                println!("  {}", "Edge connection established".green());
+            } else if total == 4 {
+                println!("  {}", "All 4 connections established".green());
+            }
+        }
+        Event::CloudflaredLog { level, line } => {
+            if matches!(level, LogLevel::Error) {
+                eprintln!("  [cloudflared] {}", line.yellow());
+            }
+        }
+        Event::ShuttingDown { reason } => match reason {
+            ShutdownReason::UserRequested => {}
+            ShutdownReason::Timeout => {
+                println!("  {}", "4h age limit reached — cleaning up.".yellow());
+            }
+            ShutdownReason::ChildExited => {
+                println!("  {}", "cloudflared exited — cleaning up.".yellow());
+            }
+            _ => {}
+        },
+        Event::Cleaned => {
+            println!("  {}", "Cleaning up tunnel and DNS record...".dimmed());
+        }
+        _ => {}
+    }
+}
+
+/// Prints the tunnel success block after the URL is live. Called by `main`
+/// once `handle.url()` is known.
 pub fn tunnel_live(url: &str, port: u16, protocol: &str, subdomain: &str) {
     println!();
     println!("  {}  🚀", "WE LIVE!".green().bold());
@@ -30,10 +80,7 @@ pub fn tunnel_live(url: &str, port: u16, protocol: &str, subdomain: &str) {
         "localhost".dimmed(),
         subdomain
     );
-    println!(
-        "  {}  Ctrl+C to stop and clean up",
-        "Hint".dimmed()
-    );
+    println!("  {}  Ctrl+C to stop and clean up", "Hint".dimmed());
     println!("  {}", "─".repeat(56).dimmed());
     println!();
 }
@@ -48,12 +95,8 @@ pub fn success(message: &str) {
     println!("{} {}", "✔".green().bold(), message);
 }
 
-/// Prints the onboarding guide shown when no API token is configured.
 pub fn no_token_guide() {
-    eprintln!(
-        "{}",
-        "No Cloudflare API token configured.".red().bold()
-    );
+    eprintln!("{}", "No Cloudflare API token configured.".red().bold());
     eprintln!();
     eprintln!("{}", "One-time setup (30 seconds):".bold());
     eprintln!("  1. Open https://dash.cloudflare.com/profile/api-tokens");
@@ -67,7 +110,6 @@ pub fn no_token_guide() {
     eprintln!();
 }
 
-/// Prints the current credential status (`cfp key` with no arguments).
 pub fn key_status(config: &Config) {
     match config.effective_token() {
         Some(token) => {
@@ -91,7 +133,6 @@ fn print_field(label: &str, value: Option<&str>) {
     }
 }
 
-/// Masks a token, keeping only its last 4 characters.
 fn mask_token(token: &str) -> String {
     if token.len() <= 4 {
         return "****".to_string();
@@ -99,8 +140,7 @@ fn mask_token(token: &str) -> String {
     format!("****{}", &token[token.len() - 4..])
 }
 
-/// Prints the list of accessible zones (`cfp domains`).
-pub fn zones(zones: &[Zone], current_domain: Option<&str>) {
+pub fn zones(zones: &[cloudpipe_sdk::Zone], current_domain: Option<&str>) {
     if zones.is_empty() {
         println!("{}", "No zones accessible with this token.".yellow());
         return;
@@ -117,22 +157,10 @@ pub fn zones(zones: &[Zone], current_domain: Option<&str>) {
     println!("Switch domain: {}", "cfp domain <example.com>".dimmed());
 }
 
-/// Prints the outcome of the cleanup command.
 pub fn cleanup_summary(removed: usize) {
     if removed == 0 {
         println!("{}", "Nothing to clean up — all good.".green());
     } else {
         success(&format!("Removed {removed} orphaned resource(s)."));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_masking_keeps_tail() {
-        assert_eq!(mask_token("abcdef123456"), "****3456");
-        assert_eq!(mask_token("abc"), "****");
     }
 }

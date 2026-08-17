@@ -1,0 +1,30 @@
+[package]
+name = "cloudpipe-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Async Rust SDK for serverless Cloudflare tunnels (no backend service)"
+license = "MIT"
+repository = "https://github.com/xinggaoya/cloudpipe"
+homepage = "https://github.com/xinggaoya/cloudpipe"
+readme = "README.md"
+keywords = ["cloudflare", "tunnel", "localhost", "cloudflared", "ngrok-alternative", "sdk"]
+categories = ["api-bindings", "network-programming", "asynchronous"]
+
+[lib]
+name = "cloudpipe_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "fs", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }

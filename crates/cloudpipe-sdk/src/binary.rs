@@ -1,16 +1,21 @@
 //! Locates, downloads and spawns the `cloudflared` binary.
 //!
-//! `cloudflared` is Cloudflare's tunnel client — it maintains the actual QUIC
-//! connection to the Cloudflare edge. It is looked up in `PATH` first, then
-//! downloaded to `~/.cfp/bin/` from GitHub Releases.
+//! `cloudflared` is Cloudflare's tunnel client. The SDK first looks for it
+//! on `PATH`, then falls back to downloading a release asset from GitHub
+//! (with an optional mirror prefix).
 
-use anyhow::{anyhow, bail, Context, Result};
-use std::fs;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 
-/// Base URL for cloudflared release assets.
+use anyhow::{anyhow, Context as _};
+use flate2::read::GzDecoder;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+use crate::error::{InstallError, Result};
+
+/// Base URL for `cloudflared` release assets.
 const GITHUB_BASE_URL: &str = "https://github.com/cloudflare/cloudflared/releases/latest/download";
 
 /// Default GitHub mirror prefix used to speed up downloads in regions where
@@ -18,10 +23,54 @@ const GITHUB_BASE_URL: &str = "https://github.com/cloudflare/cloudflared/release
 /// `CFP_GITHUB_PROXY` env var; an empty value disables mirroring entirely.
 const DEFAULT_GITHUB_PROXY: &str = "https://v4.gh-proxy.org/";
 
+/// Classifies a single line of `cloudflared` stderr for event dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineKind {
+    /// A new edge connection was registered.
+    Connection,
+    /// A real error worth surfacing.
+    Error,
+    /// Harmless noise (origin cert hints, retries, etc.).
+    Ignore,
+}
+
+/// Classifies a single stderr line from `cloudflared`.
+pub fn classify_line(line: &str) -> LineKind {
+    const IGNORE_PATTERNS: &[&str] = &[
+        "cannot determine default origin certificate path",
+        "no file cert.pem",
+        "origincert option",
+        "tunnel_origin_cert",
+        "context canceled",
+        "connection terminated",
+        "no more connections active and exiting",
+        "serve tunnel error",
+        "retrying connection",
+        "icmp router terminated",
+        "use of closed network connection",
+        "application error 0x0",
+        "failed to accept quic stream",
+        "failed to dial to edge",
+        "timeout: no recent network activity",
+        "quic:",
+    ];
+
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("registered tunnel connection") {
+        return LineKind::Connection;
+    }
+    if IGNORE_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return LineKind::Ignore;
+    }
+    if lower.contains("err") || lower.contains("error") {
+        return LineKind::Error;
+    }
+    LineKind::Ignore
+}
+
 /// Reads the GitHub mirror prefix from `CFP_GITHUB_PROXY`, falling back to
-/// [`DEFAULT_GITHUB_PROXY`]. Trailing slashes and surrounding whitespace are
-/// stripped so the result can be joined directly to the asset path.
-fn github_proxy_from_env() -> String {
+/// [`DEFAULT_GITHUB_PROXY`].
+pub fn github_proxy_from_env() -> String {
     std::env::var("CFP_GITHUB_PROXY")
         .unwrap_or_else(|_| DEFAULT_GITHUB_PROXY.to_string())
         .trim()
@@ -32,9 +81,8 @@ fn github_proxy_from_env() -> String {
 /// Builds the ordered list of candidate download URLs for `asset`.
 ///
 /// The configured mirror (if enabled) is tried first; the direct GitHub URL
-/// is always appended as the final fallback. `proxy_override` is purely a
-/// hook for tests — pass `None` to read the live environment.
-fn candidate_urls(asset: &str, proxy_override: Option<&str>) -> Vec<String> {
+/// is always appended as the final fallback.
+pub fn candidate_urls(asset: &str, proxy_override: Option<&str>) -> Vec<String> {
     let direct = format!("{GITHUB_BASE_URL}/{asset}");
     let proxy = match proxy_override {
         Some(value) => value.trim().trim_end_matches('/').to_string(),
@@ -48,9 +96,7 @@ fn candidate_urls(asset: &str, proxy_override: Option<&str>) -> Vec<String> {
     urls
 }
 
-/// Maps (platform, arch) to the GitHub release asset name.
-///
-/// Pure function so it can be unit-tested on any platform.
+/// Maps `(platform, arch)` to the GitHub release asset name.
 pub fn download_asset_name(platform: &str, arch: &str) -> Result<&'static str> {
     let asset = match (platform, arch) {
         ("darwin", "x86_64") => "cloudflared-darwin-amd64.tgz",
@@ -60,7 +106,13 @@ pub fn download_asset_name(platform: &str, arch: &str) -> Result<&'static str> {
         ("linux", "x86_64") => "cloudflared-linux-amd64",
         ("linux", "aarch64") => "cloudflared-linux-arm64",
         ("linux", "arm") => "cloudflared-linux-arm",
-        _ => bail!("unsupported platform {platform}/{arch}"),
+        _ => {
+            return Err(InstallError::UnsupportedPlatform {
+                platform: platform.to_string(),
+                arch: arch.to_string(),
+            }
+            .into());
+        }
     };
     Ok(asset)
 }
@@ -74,13 +126,18 @@ fn binary_name() -> &'static str {
     }
 }
 
-/// Directory that holds the downloaded binary: `~/.cfp/bin`.
-fn install_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    Ok(home.join(".cfp").join("bin"))
+/// Directory that holds the downloaded binary (overridable for tests).
+pub(crate) fn install_dir(config_dir: Option<&Path>) -> Result<PathBuf> {
+    let base = match config_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join(".cfp"),
+    };
+    Ok(base.join("bin"))
 }
 
-/// Searches `PATH` (and `PATHEXT` on Windows) for an existing cloudflared.
+/// Searches `PATH` (and `PATHEXT` on Windows) for an existing `cloudflared`.
 pub fn find_in_path() -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     let name = binary_name();
@@ -118,7 +175,7 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path)
+        std::fs::metadata(path)
             .map(|m| m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
     }
@@ -128,15 +185,18 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// Ensures a cloudflared binary is available, downloading it if needed.
+/// Ensures a `cloudflared` binary is available, downloading if needed.
 ///
-/// Returns the path of the binary to use.
-pub fn ensure_installed() -> Result<PathBuf> {
+/// Returns the path to the binary.
+pub async fn ensure_installed(
+    config_dir: Option<&Path>,
+    github_proxy: Option<&str>,
+) -> Result<PathBuf> {
     if let Some(path) = find_in_path() {
         return Ok(path);
     }
 
-    let dir = install_dir()?;
+    let dir = install_dir(config_dir)?;
     let path = dir.join(binary_name());
     if is_executable(&path) {
         return Ok(path);
@@ -144,49 +204,59 @@ pub fn ensure_installed() -> Result<PathBuf> {
 
     let asset = download_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
     let is_tgz = asset.ends_with(".tgz");
-    let urls = candidate_urls(asset, None);
+    let urls = candidate_urls(asset, github_proxy);
 
     let mut last_err: Option<anyhow::Error> = None;
     for url in &urls {
-        eprintln!("Downloading cloudflared from {url} ...");
-        match download_and_install(url, &dir, &path, is_tgz) {
+        match download_and_install(url, &dir, &path, is_tgz).await {
             Ok(()) => return Ok(path),
             Err(err) => {
                 if urls.len() > 1 {
-                    eprintln!("  ↳ download failed: {err:#}; trying next source");
+                    eprintln!("Download failed ({url}): {err:#}; trying next source");
                 }
-                last_err = Some(err);
+                // Unwrap the SDK Error back into the inner anyhow::Error so we
+                // can pick the deepest cause for the final InstallError.
+                let inner = match err {
+                    crate::Error::Other(anyhow_err) => anyhow_err,
+                    other => anyhow::anyhow!("{other}"),
+                };
+                last_err = Some(inner);
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("no download sources available")))
+    Err(InstallError::Download(
+        last_err.unwrap_or_else(|| anyhow!("no download sources available")),
+    )
+    .into())
 }
 
-/// Downloads the asset and writes it to `path` (extracting `.tgz` archives).
-fn download_and_install(
-    url: &str,
-    dir: &Path,
-    path: &Path,
-    is_tgz: bool,
-) -> Result<()> {
-    let response = reqwest::blocking::get(url)
+async fn download_and_install(url: &str, dir: &Path, path: &Path, is_tgz: bool) -> Result<()> {
+    let response = reqwest::get(url)
+        .await
         .with_context(|| format!("cannot download {url}"))?
         .error_for_status()
         .with_context(|| format!("download failed for {url}"))?;
 
-    let bytes = response
-        .bytes()
-        .context("reading download body")?
-        .to_vec();
+    let bytes = response.bytes().await.context("reading download body")?;
 
     fs::create_dir_all(dir)
+        .await
         .with_context(|| format!("cannot create bin dir {}", dir.display()))?;
 
     if is_tgz {
-        extract_tgz(&bytes, dir)
-            .with_context(|| format!("extracting archive from {url}"))?;
+        // tar/flate2 are sync APIs — run on a blocking thread.
+        let bytes_vec = bytes.to_vec();
+        let dir_owned = dir.to_path_buf();
+        let path_owned = path.to_path_buf();
+        tokio::task::spawn_blocking(move || extract_tgz(&bytes_vec, &dir_owned, &path_owned))
+            .await
+            .context("extracting archive")??;
     } else {
-        fs::write(path, &bytes)
+        let mut file = fs::File::create(path)
+            .await
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        file.write_all(&bytes)
+            .await
             .with_context(|| format!("cannot write {}", path.display()))?;
     }
 
@@ -194,120 +264,46 @@ fn download_and_install(
     Ok(())
 }
 
-/// Extracts a `.tgz` archive containing the `cloudflared` binary.
-fn extract_tgz(bytes: &[u8], dir: &Path) -> Result<()> {
-    let decoder = flate2::read::GzDecoder::new(bytes);
+fn extract_tgz(bytes: &[u8], dir: &Path, path: &Path) -> Result<()> {
+    let decoder = GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
     let entries = archive.entries().context("reading tar archive")?;
     for entry in entries {
         let mut entry = entry.context("reading tar entry")?;
         let entry_path = entry.path().context("tar entry path")?.into_owned();
         if entry_path.file_name().is_some_and(|n| n == "cloudflared") {
-            let out_path = dir.join("cloudflared");
-            let mut file = fs::File::create(&out_path)
-                .with_context(|| format!("cannot create {}", out_path.display()))?;
+            let mut file = std::fs::File::create(path)
+                .with_context(|| format!("cannot create {}", path.display()))?;
             std::io::copy(&mut entry, &mut file).context("extracting cloudflared")?;
-            make_executable(&out_path);
+            make_executable(path);
+            // Ensure parent dir exists — `path` may live inside `dir`.
+            let _ = dir;
             return Ok(());
         }
     }
-    bail!("cloudflared binary not found in archive")
+    Err(crate::error::InstallError::MissingBinary.into())
 }
 
 fn make_executable(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
     }
 }
 
-/// Spawns cloudflared to run the named tunnel, piping stderr for status
-/// reporting. Routing is configured via the tunnel's remote ingress — no
-/// `--url` flag is needed.
-pub fn spawn(path: &Path, tunnel_token: &str) -> Result<Child> {
+/// Spawns `cloudflared` to run the named tunnel, with stderr piped for
+/// event dispatch.
+pub async fn spawn(path: &Path, tunnel_token: &str) -> Result<tokio::process::Child> {
     Command::new(path)
         .args(["tunnel", "run", "--token", tunnel_token])
         .env("NO_AUTOUPDATE", "true")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("cannot spawn {}", path.display()))
-}
-
-/// Classification of a cloudflared stderr line for UI display.
-#[derive(Debug, PartialEq)]
-pub enum LineKind {
-    /// A new edge connection was registered.
-    Connection,
-    /// A real error worth showing the user.
-    Error,
-    /// Harmless noise (origin cert hints, retries, etc.).
-    Ignore,
-}
-
-/// Classifies a single stderr line from cloudflared.
-///
-/// Pure function so it can be unit-tested. Ignore patterns follow the
-/// common `cloudflared` log noise (origin cert hints, retries, etc.).
-pub fn classify_line(line: &str) -> LineKind {
-    const IGNORE_PATTERNS: &[&str] = &[
-        "cannot determine default origin certificate path",
-        "no file cert.pem",
-        "origincert option",
-        "tunnel_origin_cert",
-        "context canceled",
-        "connection terminated",
-        "no more connections active and exiting",
-        "serve tunnel error",
-        "retrying connection",
-        "icmp router terminated",
-        "use of closed network connection",
-        "application error 0x0",
-        "failed to accept quic stream",
-        "failed to dial to edge",
-        "timeout: no recent network activity",
-        "quic:",
-    ];
-
-    let lower = line.to_ascii_lowercase();
-    if lower.contains("registered tunnel connection") {
-        return LineKind::Connection;
-    }
-    if IGNORE_PATTERNS.iter().any(|p| lower.contains(p)) {
-        return LineKind::Ignore;
-    }
-    if lower.contains("err") || lower.contains("error") {
-        return LineKind::Error;
-    }
-    LineKind::Ignore
-}
-
-/// Streams a stderr pipe to `on_line`, one line at a time.
-///
-/// Intended to run on a separate thread; the returned handle can be joined on
-/// shutdown. Callers pass the `ChildStderr` obtained via `child.stderr.take()`.
-pub fn stream_stderr(
-    stderr: std::process::ChildStderr,
-    mut on_line: impl FnMut(String) + Send + 'static,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let trimmed = line.trim().to_string();
-                    if !trimmed.is_empty() {
-                        on_line(trimmed);
-                    }
-                }
-            }
-        }
-    })
+        .map_err(|e| InstallError::Spawn(e).into())
 }
 
 #[cfg(test)]
@@ -339,7 +335,7 @@ mod tests {
         );
         assert_eq!(
             classify_line("ERR Failed to dial to edge"),
-            LineKind::Ignore, // network noise is ignored, not fatal
+            LineKind::Ignore,
         );
         assert_eq!(
             classify_line("ERR something went very wrong"),
@@ -353,10 +349,7 @@ mod tests {
 
     #[test]
     fn candidate_urls_with_proxy_prepends_mirror() {
-        let urls = candidate_urls(
-            "cloudflared-linux-amd64",
-            Some("https://gh-proxy.org/"),
-        );
+        let urls = candidate_urls("cloudflared-linux-amd64", Some("https://gh-proxy.org/"));
         assert_eq!(urls.len(), 2);
         assert_eq!(
             urls[0],
@@ -380,10 +373,7 @@ mod tests {
 
     #[test]
     fn candidate_urls_strips_trailing_slashes_from_proxy() {
-        let urls = candidate_urls(
-            "cloudflared-linux-amd64",
-            Some("https://gh-proxy.org///"),
-        );
+        let urls = candidate_urls("cloudflared-linux-amd64", Some("https://gh-proxy.org///"));
         assert_eq!(
             urls[0],
             "https://gh-proxy.org/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"

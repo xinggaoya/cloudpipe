@@ -188,6 +188,50 @@ For `udp`, reach the service by pointing your client at `myhost.example.com:5182
 | `cfp cleanup` | Remove dead tunnels, their DNS records and orphaned CNAMEs. |
 | `cfp -v / --version` | Show version. |
 
+## As a Rust library
+
+The same functionality is available as an async Rust SDK so you can embed
+tunneling into your own program.
+
+```toml
+[dependencies]
+cloudpipe-sdk = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+```rust
+use cloudpipe_sdk::{Protocol, TunnelBuilder};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let handle = TunnelBuilder::new()
+        .token(std::env::var("CLOUDFLARE_API_TOKEN")?)
+        .domain("example.com")            // account + zone are auto-discovered
+        .protocol(Protocol::Http)
+        .port(8080)
+        .subdomain("myapp")
+        .on_event(|event| println!("{event:?}"))
+        .start()
+        .await?;
+
+    println!("live at {}", handle.url());
+    handle.wait().await;
+    Ok(())
+}
+```
+
+See the SDK README in [`crates/cloudpipe-sdk/`](./crates/cloudpipe-sdk/) and the
+[`quickstart`](./crates/cloudpipe-sdk/examples/quickstart.rs) /
+[`with_events`](./crates/cloudpipe-sdk/examples/with_events.rs) examples.
+
+## Repository layout
+
+```
+crates/
+├── cloudpipe-sdk/        # pure async SDK (no CLI / UI deps)
+└── cloudpipe/            # `cfp` CLI binary — uses the SDK
+```
+
 ## How it works
 
 ```
