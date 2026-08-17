@@ -39,11 +39,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install musl target support (Linux only)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install musl target support (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
+
+      - name: Install musl cross toolchain (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          curl -L --fail -o /tmp/aarch64-linux-musl-cross.tgz \
+            https://musl.cc/aarch64-linux-musl-cross.tgz
+          sudo tar -xzf /tmp/aarch64-linux-musl-cross.tgz -C /opt/
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package
