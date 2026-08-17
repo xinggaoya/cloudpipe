@@ -16,7 +16,7 @@ const GITHUB_BASE_URL: &str = "https://github.com/cloudflare/cloudflared/release
 /// Default GitHub mirror prefix used to speed up downloads in regions where
 /// `github.com` is slow or blocked. Override at runtime with the
 /// `CFP_GITHUB_PROXY` env var; an empty value disables mirroring entirely.
-const DEFAULT_GITHUB_PROXY: &str = "https://gh-proxy.org/";
+const DEFAULT_GITHUB_PROXY: &str = "https://v4.gh-proxy.org/";
 
 /// Reads the GitHub mirror prefix from `CFP_GITHUB_PROXY`, falling back to
 /// [`DEFAULT_GITHUB_PROXY`]. Trailing slashes and surrounding whitespace are
