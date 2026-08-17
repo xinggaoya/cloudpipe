@@ -227,13 +227,8 @@ fn make_executable(path: &Path) {
 /// `--url` flag is needed.
 pub fn spawn(path: &Path, tunnel_token: &str) -> Result<Child> {
     Command::new(path)
-        .args([
-            "tunnel",
-            "run",
-            "--token",
-            tunnel_token,
-            "--no-autoupdate",
-        ])
+        .args(["tunnel", "run", "--token", tunnel_token])
+        .env("NO_AUTOUPDATE", "true")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
