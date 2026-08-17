@@ -60,6 +60,39 @@ cargo install --git https://github.com/xinggaoya/cloudpipe --tag v0.1.0 --bin cf
 
 Then run `cfp --version` to confirm; the binary is placed at `~/.cargo/bin/cfp` (add to PATH if needed).
 
+### Install from a mirror (mainland China / GFW)
+
+If `github.com` is slow or unreachable from your network, prepend any of the
+GitHub URLs above with a mirror prefix — `https://gh-proxy.org/` is a reliable
+default and other public proxies (e.g. `https://ghfast.top/`,
+`https://mirror.ghproxy.com/`) follow the same pattern:
+
+```bash
+# 1. Pre-built binary (auto-detect platform)
+curl -L -o cfp \
+  "https://gh-proxy.org/https://github.com/xinggaoya/cloudpipe/releases/latest/download/cfp-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')-$(uname -s | tr A-Z a-z)"
+chmod +x cfp
+sudo mv cfp /usr/local/bin/
+
+# 2. Specific Linux x86_64 binary
+curl -L -o cfp https://gh-proxy.org/https://github.com/xinggaoya/cloudpipe/releases/latest/download/cfp-linux-amd64
+chmod +x cfp
+sudo mv cfp /usr/local/bin/
+
+# 3. cargo install (from main branch, or pin a tag)
+cargo install --git https://gh-proxy.org/https://github.com/xinggaoya/cloudpipe --bin cfp
+cargo install --git https://gh-proxy.org/https://github.com/xinggaoya/cloudpipe --tag v0.1.0 --bin cfp
+
+# 4. Clone source
+git clone https://gh-proxy.org/https://github.com/xinggaoya/cloudpipe
+```
+
+The `cloudflared` helper binary that `cfp` downloads on first run also uses
+this scheme automatically: it tries the configured mirror first and falls
+back to `github.com` if the mirror is unreachable. Override the prefix with
+the `CFP_GITHUB_PROXY` env var (e.g. `CFP_GITHUB_PROXY=https://ghfast.top/`);
+set it to an empty string to disable mirroring entirely.
+
 ### Build from source
 
 ```bash
