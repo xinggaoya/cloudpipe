@@ -4,7 +4,7 @@
 //! connection to the Cloudflare edge. It is looked up in `PATH` first, then
 //! downloaded to `~/.cfp/bin/` from GitHub Releases.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,41 @@ use std::process::{Child, Command, Stdio};
 
 /// Base URL for cloudflared release assets.
 const GITHUB_BASE_URL: &str = "https://github.com/cloudflare/cloudflared/releases/latest/download";
+
+/// Default GitHub mirror prefix used to speed up downloads in regions where
+/// `github.com` is slow or blocked. Override at runtime with the
+/// `CFP_GITHUB_PROXY` env var; an empty value disables mirroring entirely.
+const DEFAULT_GITHUB_PROXY: &str = "https://gh-proxy.org/";
+
+/// Reads the GitHub mirror prefix from `CFP_GITHUB_PROXY`, falling back to
+/// [`DEFAULT_GITHUB_PROXY`]. Trailing slashes and surrounding whitespace are
+/// stripped so the result can be joined directly to the asset path.
+fn github_proxy_from_env() -> String {
+    std::env::var("CFP_GITHUB_PROXY")
+        .unwrap_or_else(|_| DEFAULT_GITHUB_PROXY.to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Builds the ordered list of candidate download URLs for `asset`.
+///
+/// The configured mirror (if enabled) is tried first; the direct GitHub URL
+/// is always appended as the final fallback. `proxy_override` is purely a
+/// hook for tests — pass `None` to read the live environment.
+fn candidate_urls(asset: &str, proxy_override: Option<&str>) -> Vec<String> {
+    let direct = format!("{GITHUB_BASE_URL}/{asset}");
+    let proxy = match proxy_override {
+        Some(value) => value.trim().trim_end_matches('/').to_string(),
+        None => github_proxy_from_env(),
+    };
+    let mut urls = Vec::new();
+    if !proxy.is_empty() {
+        urls.push(format!("{proxy}/{direct}"));
+    }
+    urls.push(direct);
+    urls
+}
 
 /// Maps (platform, arch) to the GitHub release asset name.
 ///
@@ -108,10 +143,23 @@ pub fn ensure_installed() -> Result<PathBuf> {
     }
 
     let asset = download_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
-    let url = format!("{GITHUB_BASE_URL}/{asset}");
-    eprintln!("Downloading cloudflared from {url} ...");
-    download_and_install(&url, &dir, &path, asset.ends_with(".tgz"))?;
-    Ok(path)
+    let is_tgz = asset.ends_with(".tgz");
+    let urls = candidate_urls(asset, None);
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for url in &urls {
+        eprintln!("Downloading cloudflared from {url} ...");
+        match download_and_install(url, &dir, &path, is_tgz) {
+            Ok(()) => return Ok(path),
+            Err(err) => {
+                if urls.len() > 1 {
+                    eprintln!("  ↳ download failed: {err:#}; trying next source");
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no download sources available")))
 }
 
 /// Downloads the asset and writes it to `path` (extracting `.tgz` archives).
@@ -305,6 +353,45 @@ mod tests {
         assert_eq!(
             classify_line("Cannot determine default origin certificate path"),
             LineKind::Ignore
+        );
+    }
+
+    #[test]
+    fn candidate_urls_with_proxy_prepends_mirror() {
+        let urls = candidate_urls(
+            "cloudflared-linux-amd64",
+            Some("https://gh-proxy.org/"),
+        );
+        assert_eq!(urls.len(), 2);
+        assert_eq!(
+            urls[0],
+            "https://gh-proxy.org/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+        );
+        assert_eq!(
+            urls[1],
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+        );
+    }
+
+    #[test]
+    fn candidate_urls_disabled_when_proxy_empty() {
+        let urls = candidate_urls("cloudflared-linux-amd64", Some(""));
+        assert_eq!(urls.len(), 1);
+        assert_eq!(
+            urls[0],
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+        );
+    }
+
+    #[test]
+    fn candidate_urls_strips_trailing_slashes_from_proxy() {
+        let urls = candidate_urls(
+            "cloudflared-linux-amd64",
+            Some("https://gh-proxy.org///"),
+        );
+        assert_eq!(
+            urls[0],
+            "https://gh-proxy.org/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
         );
     }
 }
