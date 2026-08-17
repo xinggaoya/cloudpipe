@@ -6,7 +6,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Cloudflare API base URL.
 pub const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
@@ -56,6 +56,19 @@ pub struct DnsRecord {
     pub id: String,
     pub name: String,
     pub content: String,
+}
+
+/// A single ingress rule in a tunnel configuration.
+///
+/// `hostname` is the public hostname this rule matches (e.g.
+/// `myapp.example.com`); `None` denotes the catch-all rule, which must be
+/// last. `service` is the local target (`http://...`, `https://...`,
+/// `tcp://...`, `udp://...`, `ssh://...`) or `http_status:404`.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngressEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    pub service: String,
 }
 
 /// Result of `GET /user/tokens/verify`.
@@ -283,6 +296,26 @@ impl CloudflareApi {
             None,
         );
         result.is_ok()
+    }
+
+    /// Replaces a tunnel's remote ingress configuration.
+    ///
+    /// Each [`IngressEntry`] maps a public hostname to a local service
+    /// (`http://...`, `https://...`, `tcp://...`, `udp://...`, `ssh://...`).
+    /// The list must end with a catch-all (`service: "http_status:404"`).
+    pub fn set_tunnel_ingress(
+        &self,
+        account_id: &str,
+        tunnel_id: &str,
+        ingress: &[IngressEntry],
+    ) -> Result<()> {
+        let body = serde_json::json!({ "config": { "ingress": ingress } });
+        self.request::<serde_json::Value>(
+            reqwest::Method::PUT,
+            &format!("/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"),
+            Some(&body),
+        )?;
+        Ok(())
     }
 }
 

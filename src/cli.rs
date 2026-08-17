@@ -3,6 +3,8 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
+use crate::tunnel::Protocol;
+
 /// cfp — serverless localhost tunnels via Cloudflare Edge.
 ///
 /// Bring your own Cloudflare API token: `cfp key <token>`, then run
@@ -15,7 +17,7 @@ use clap::{Parser, Subcommand};
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// First positional: protocol (`http`/`https`) or a port number.
+    /// First positional: protocol (`http`/`https`/`tcp`/`udp`/`ssh`) or a port.
     #[arg(value_name = "PROTOCOL_OR_PORT")]
     pub first: Option<String>,
 
@@ -61,7 +63,7 @@ pub enum Command {
 /// Normalized tunnel command arguments.
 #[derive(Debug, Clone)]
 pub struct TunnelArgs {
-    pub protocol: String,
+    pub protocol: Protocol,
     pub port: u16,
     pub subdomain: Option<String>,
 }
@@ -76,16 +78,17 @@ impl Cli {
             bail!("subcommand handled separately");
         }
 
-        let mut protocol = "http";
+        let mut protocol_token = "http";
         let mut port: Option<u16> = None;
 
         if let Some(first) = &self.first {
             match first.as_str() {
-                "http" | "https" => protocol = first,
+                "http" | "https" | "tcp" | "udp" | "ssh" => protocol_token = first,
                 _ => match first.parse::<u16>() {
                     Ok(value) => port = Some(value),
                     Err(_) => bail!(
-                        "unexpected argument \"{first}\": expected `http`, `https` or a port"
+                        "unexpected argument \"{first}\": expected a protocol \
+                         (http, https, tcp, udp, ssh) or a port"
                     ),
                 },
             }
@@ -96,7 +99,7 @@ impl Cli {
         }
 
         Ok(TunnelArgs {
-            protocol: protocol.to_string(),
+            protocol: Protocol::parse(protocol_token)?,
             port: port.unwrap_or(crate::DEFAULT_PORT),
             subdomain: self.subdomain.clone(),
         })
@@ -115,17 +118,37 @@ mod tests {
     fn ngrok_style_https_port() {
         let cli = parse(&["https", "8443"]);
         let args = cli.to_tunnel_args().unwrap();
-        assert_eq!(args.protocol, "https");
+        assert_eq!(args.protocol, Protocol::Https);
         assert_eq!(args.port, 8443);
         assert_eq!(args.subdomain, None);
+    }
+
+    #[test]
+    fn ngrok_style_tcp_and_udp_and_ssh() {
+        for (token, expected) in [
+            ("tcp", Protocol::Tcp),
+            ("udp", Protocol::Udp),
+            ("ssh", Protocol::Ssh),
+        ] {
+            let cli = parse(&[token, "9000"]);
+            let args = cli.to_tunnel_args().unwrap();
+            assert_eq!(args.protocol, expected, "for token {token}");
+            assert_eq!(args.port, 9000);
+        }
     }
 
     #[test]
     fn legacy_style_bare_port() {
         let cli = parse(&["3000"]);
         let args = cli.to_tunnel_args().unwrap();
-        assert_eq!(args.protocol, "http");
+        assert_eq!(args.protocol, Protocol::Http);
         assert_eq!(args.port, 3000);
+    }
+
+    #[test]
+    fn unknown_protocol_is_rejected() {
+        let cli = parse(&["rdp", "9000"]);
+        assert!(cli.to_tunnel_args().is_err());
     }
 
     #[test]

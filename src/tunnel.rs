@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use colored::Colorize;
 
-use crate::cloudflare::CloudflareApi;
+use crate::cloudflare::{CloudflareApi, IngressEntry};
 use crate::cloudflared::{self, LineKind};
 use crate::config::{Config, ConfigStore};
 use crate::ui;
@@ -33,12 +33,56 @@ fn exit_requested() -> bool {
 /// Options for starting a tunnel.
 #[derive(Debug, Clone)]
 pub struct TunnelOptions {
-    /// Local protocol: `http` or `https`.
-    pub protocol: String,
+    /// Local protocol scheme.
+    pub protocol: Protocol,
     /// Local port to forward.
     pub port: u16,
     /// Optional subdomain; a random one is generated otherwise.
     pub subdomain: Option<String>,
+}
+
+/// Protocol schemes accepted by Cloudflare Tunnel ingress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Http,
+    Https,
+    Tcp,
+    Udp,
+    Ssh,
+}
+
+impl Protocol {
+    /// Parses the CLI token, accepting the canonical names (`http`, `https`,
+    /// `tcp`, `udp`, `ssh`). `http2` and other variants are not supported.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "http" => Ok(Self::Http),
+            "https" => Ok(Self::Https),
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            "ssh" => Ok(Self::Ssh),
+            other => bail!(
+                "unknown protocol \"{other}\" — supported: http, https, tcp, udp, ssh"
+            ),
+        }
+    }
+
+    /// Canonical lowercase name, suitable for display.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Ssh => "ssh",
+        }
+    }
+
+    /// The local service URL this protocol produces for Cloudflare ingress,
+    /// e.g. `http://localhost:8080`.
+    pub fn local_service(self, port: u16) -> String {
+        format!("{}://localhost:{port}", self.as_str())
+    }
 }
 
 /// Generates a random subdomain (`user-1234`).
@@ -213,7 +257,24 @@ pub fn run_tunnel(opts: &TunnelOptions) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("Cloudflare returned a tunnel without a token"))?;
 
-    // 2. Point DNS at the tunnel.
+    // 2. Configure remote ingress so cloudflared knows what to forward.
+    let ingress = vec![
+        IngressEntry {
+            hostname: Some(full_name.clone()),
+            service: opts.protocol.local_service(opts.port),
+        },
+        IngressEntry {
+            hostname: None,
+            service: "http_status:404".to_string(),
+        },
+    ];
+    println!("  {}", format!("Configuring ingress ({})...", opts.protocol.as_str()).dimmed());
+    if let Err(e) = api.set_tunnel_ingress(&account_id, &tunnel.id, &ingress) {
+        let _ = api.delete_tunnel(&account_id, &tunnel.id);
+        bail!("setting tunnel ingress: {e}");
+    }
+
+    // 3. Point DNS at the tunnel.
     let cname_target = format!("{}.cfargotunnel.com", tunnel.id);
     println!("  {}", format!("Creating DNS {full_name}...").dimmed());
     if let Err(e) = api.create_dns_record(&zone_id, &full_name, &cname_target) {
@@ -221,13 +282,11 @@ pub fn run_tunnel(opts: &TunnelOptions) -> Result<()> {
         bail!("creating DNS record: {e}");
     }
 
-    // 3. Spawn cloudflared.
-    let local_target = cloudflared::local_url(&opts.protocol, opts.port);
-    let mut child = cloudflared::spawn(&binary, &tunnel_token, &local_target)
-        .context("starting cloudflared")?;
+    // 4. Spawn cloudflared using the remote ingress configuration.
+    let mut child = cloudflared::spawn(&binary, &tunnel_token).context("starting cloudflared")?;
 
     let url = format!("https://{full_name}");
-    ui::tunnel_live(&url, opts.port, &opts.protocol, &subdomain);
+    ui::tunnel_live(&url, opts.port, opts.protocol.as_str(), &subdomain);
 
     // 4. Stream stderr for status lines.
     let stderr = child
@@ -345,6 +404,34 @@ pub fn run_cleanup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_round_trips() {
+        for proto in [Protocol::Http, Protocol::Https, Protocol::Tcp, Protocol::Udp, Protocol::Ssh] {
+            assert_eq!(Protocol::parse(proto.as_str()).unwrap(), proto);
+        }
+    }
+
+    #[test]
+    fn protocol_parse_is_case_insensitive() {
+        assert_eq!(Protocol::parse("HTTP").unwrap(), Protocol::Http);
+        assert_eq!(Protocol::parse("Tcp").unwrap(), Protocol::Tcp);
+    }
+
+    #[test]
+    fn protocol_parse_rejects_unknown() {
+        assert!(Protocol::parse("ftp").is_err());
+        assert!(Protocol::parse("").is_err());
+    }
+
+    #[test]
+    fn protocol_local_service() {
+        assert_eq!(Protocol::Http.local_service(8080), "http://localhost:8080");
+        assert_eq!(Protocol::Https.local_service(8443), "https://localhost:8443");
+        assert_eq!(Protocol::Tcp.local_service(22), "tcp://localhost:22");
+        assert_eq!(Protocol::Udp.local_service(5353), "udp://localhost:5353");
+        assert_eq!(Protocol::Ssh.local_service(22), "ssh://localhost:22");
+    }
 
     #[test]
     fn subdomain_validation() {

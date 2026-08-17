@@ -174,21 +174,17 @@ fn make_executable(path: &Path) {
     }
 }
 
-/// Builds the `--url` value cloudflared connects to locally.
-pub fn local_url(protocol: &str, port: u16) -> String {
-    format!("{protocol}://localhost:{port}")
-}
-
-/// Spawns cloudflared to run the tunnel, piping stderr for status reporting.
-pub fn spawn(path: &Path, tunnel_token: &str, local_target: &str) -> Result<Child> {
+/// Spawns cloudflared to run the named tunnel, piping stderr for status
+/// reporting. Routing is configured via the tunnel's remote ingress — no
+/// `--url` flag is needed.
+pub fn spawn(path: &Path, tunnel_token: &str) -> Result<Child> {
     Command::new(path)
         .args([
             "tunnel",
             "run",
             "--token",
             tunnel_token,
-            "--url",
-            local_target,
+            "--no-autoupdate",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -290,12 +286,6 @@ mod tests {
             "cloudflared-windows-amd64.exe"
         );
         assert!(download_asset_name("freebsd", "x86_64").is_err());
-    }
-
-    #[test]
-    fn local_url_builds_expected_value() {
-        assert_eq!(local_url("http", 8080), "http://localhost:8080");
-        assert_eq!(local_url("https", 8443), "https://localhost:8443");
     }
 
     #[test]

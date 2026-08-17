@@ -10,7 +10,7 @@
 - 🪪 **Bring your own token** — your Cloudflare account, your zone, your rate-limit quota
 - 🔒 **Local-only credentials** — token stored in `~/.cfp/config.json` with mode `0600`
 - 🌐 **Custom subdomains** — pick `-s myapp` or get a random one
-- 🛣️ **Both protocols** — `http` and `https` local targets (Cloudflare edge always serves HTTPS publicly)
+- 🛣️ **Five protocols** — `http`, `https`, `tcp`, `udp`, `ssh` (Cloudflare edge always serves HTTPS publicly)
 - 🧹 **Clean exit** — Ctrl+C deletes the tunnel and DNS record automatically; no orphans
 - 🪂 **Standalone** — works offline, air-gapped, behind NAT
 
@@ -86,7 +86,7 @@ cargo build --release
 # the account and the first accessible zone.
 cfp key <CF_API_TOKEN>
 
-# Expose localhost:8080 with a random subdomain
+# Expose localhost:8080 with a random subdomain (defaults to http)
 cfp 8080
 #   => https://user-1234.example.com
 
@@ -97,6 +97,14 @@ cfp 8080 -s myapp
 # Declare the local protocol explicitly (ngrok-style)
 cfp https 8443
 #   => https://user-1234.example.com   (local: https://localhost:8443)
+
+# Expose a TCP service (e.g. SSH, Postgres, Redis — anything L4)
+cfp tcp 22 -s ssh-tunnel
+#   Reach it at ssh-tunnel.example.com (TCP)
+
+# Expose a UDP service (e.g. DNS, WireGuard)
+cfp udp 51820 -s wg
+#   Reach it at wg.example.com (UDP)
 
 # View current configuration
 cfp key
@@ -117,11 +125,30 @@ The config file lives at `~/.cfp/config.json` (mode `0600`). You can also pass t
 CLOUDFLARE_API_TOKEN=... cfp 8080
 ```
 
+### Connecting to non-HTTP tunnels
+
+For `http` / `https` (L7), just open the URL in your browser or `curl` it.
+
+For `tcp` / `udp` / `ssh` (L4), the hostname works as the public endpoint. For example, after `cfp tcp 22 -s mybox`, you can:
+
+```bash
+# Generic TCP — connect directly to the hostname
+ncat mybox.example.com 22
+ssh user@mybox.example.com      # SSH transparently falls back to direct TCP connect
+
+# Or via local-forward with socat
+socat TCP-LISTEN:2222,fork TCP:mybox.example.com:22
+```
+
+For `ssh`, Cloudflare exposes a native `cloudflared access ssh` flow that gives a browser-based auth prompt on first connect — useful when you don't want to expose the port directly. Run `cloudflared access ssh --hostname mybox.example.com` on any host with `cloudflared` installed.
+
+For `udp`, reach the service by pointing your client at `myhost.example.com:51820` (WireGuard, etc.); most work fine since Cloudflare passes the UDP datagram through.
+
 ## Commands
 
 | Command | Description |
 |---|---|
-| `cfp [http\|https] <port> [-s <subdomain>]` | Start a tunnel. `http`/`https` selects the local scheme; default is `http`, default port `8080`. |
+| `cfp [http\|https\|tcp\|udp\|ssh] <port> [-s <subdomain>]` | Start a tunnel. Protocol selects the local scheme (`http` is the default). |
 | `cfp key [TOKEN] [--clear]` | Save, show or clear the Cloudflare token. Saving auto-discovers account/zone. |
 | `cfp domain <example.com>` | Switch the base domain to a different accessible zone. |
 | `cfp domains` | List zones accessible with the saved token. |
@@ -131,16 +158,21 @@ CLOUDFLARE_API_TOKEN=... cfp 8080
 ## How it works
 
 ```
-cfp http 8080
+cfp tcp 22 -s mybox
   ├─ Load ~/.cfp/config.json              (token + account/zone/domain)
   ├─ Ensure cloudflared                   (PATH → auto-download to ~/.cfp/bin/)
   ├─ Reclaim stale tunnels / orphaned DNS with the same name
   ├─ POST /accounts/{id}/tunnels          create named tunnel
-  ├─ POST /zones/{id}/dns_records         CNAME xxx.domain → {tunnelId}.cfargotunnel.com
-  ├─ spawn cloudflared tunnel run --token ... --url http://localhost:8080
+  ├─ PUT  /accounts/{id}/cfd_tunnel/{id}/configurations
+  │        ingress: [{hostname: mybox.example.com, service: tcp://localhost:22},
+  │                  {service: http_status:404}]
+  ├─ POST /zones/{id}/dns_records         CNAME mybox.example.com → {tunnelId}.cfargotunnel.com
+  ├─ spawn cloudflared tunnel run --token ... --no-autoupdate
   └─ wait for Ctrl+C / 4h timeout / child exit
         └─ kill cloudflared → delete DNS → cleanup connections → delete tunnel
 ```
+
+All five protocols (`http`/`https`/`tcp`/`udp`/`ssh`) are configured the same way — only the `service` field in ingress changes. Routing happens entirely on Cloudflare's edge using the remote ingress configuration; `cloudflared` does not need a local config file.
 
 Conflict handling:
 - **Same-name tunnel exists and is healthy** → refuse, suggest a different name.
