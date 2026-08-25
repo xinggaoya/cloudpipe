@@ -14,6 +14,7 @@
 //! 4. The dispatch task is aborted on drop.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cloudpipe_sdk::{CloudflareApi, Protocol, TunnelBuilder};
@@ -33,6 +34,10 @@ struct MockState {
     records: CreatedRecords,
     deleted_records: Arc<Mutex<Vec<String>>>,
     deleted_tunnels: Arc<Mutex<Vec<String>>>,
+    /// Number of POST /accounts/{id}/tunnels calls — used by the
+    /// auto-restart test to assert the supervisor actually respawned the
+    /// tunnel after `cloudflared` crashed.
+    tunnel_creation_count: Arc<AtomicUsize>,
 }
 
 impl MockState {
@@ -42,6 +47,7 @@ impl MockState {
             records: Arc::new(Mutex::new(HashMap::new())),
             deleted_records: Arc::new(Mutex::new(Vec::new())),
             deleted_tunnels: Arc::new(Mutex::new(Vec::new())),
+            tunnel_creation_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -104,6 +110,7 @@ fn route(method: &str, path: &str, body: &str, state: &MockState) -> (u16, serde
             .lock()
             .unwrap()
             .insert(name.clone(), id.clone());
+        state.tunnel_creation_count.fetch_add(1, Ordering::SeqCst);
         return (
             200,
             serde_json::json!({
@@ -233,6 +240,45 @@ trap 'exit 0' TERM INT
 echo \"2025-01-01 Registered tunnel connection connIndex=0\"
 while true; do sleep 1; done
 ";
+    tokio::fs::write(&path, script).await.unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = tokio::fs::metadata(&path).await.unwrap().permissions();
+        perms.set_mode(0o755);
+        tokio::fs::set_permissions(&path, perms).await.unwrap();
+    }
+    path
+}
+
+/// Writes a "one-shot" fake `cloudflared`: the **first** invocation
+/// prints the connection line and exits cleanly (status 0), forcing the
+/// SDK's supervisor to respawn it; the **second** invocation runs
+/// forever so the test has time to call `stop()`. The invocation count
+/// is persisted to `counter_file` so the test can assert that both
+/// generations ran.
+async fn write_oneshot_cloudflared(
+    dir: &std::path::Path,
+    counter_file: &std::path::Path,
+) -> std::path::PathBuf {
+    let path = dir.join("cloudflared");
+    let counter = counter_file.display().to_string();
+    let script = format!(
+        "\
+#!/bin/sh
+trap 'exit 0' TERM INT
+COUNTER_FILE=\"{counter}\"
+count=$(cat \"$COUNTER_FILE\" 2>/dev/null || echo 0)
+count=$((count + 1))
+echo \"$count\" > \"$COUNTER_FILE\"
+echo \"2025-01-01 Registered tunnel connection connIndex=0\"
+if [ \"$count\" = \"1\" ]; then
+  exit 0
+fi
+while true; do sleep 1; done
+"
+    );
     tokio::fs::write(&path, script).await.unwrap();
 
     #[cfg(unix)]
@@ -454,4 +500,115 @@ async fn wait_does_not_signal_shutdown() {
     // After stop, calling stop again reports the handle is shut down.
     let err = handle.stop().await.unwrap_err();
     assert!(matches!(err, cloudpipe_sdk::Error::AlreadyShutDown));
+}
+
+/// With `auto_restart` enabled, a `cloudflared` crash must be recovered:
+/// the SDK respawns `cloudflared` on the same subdomain (so the public
+/// URL is stable) and re-emits the tunnel-create lifecycle events. A
+/// user-initiated `stop()` still tears everything down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_restart_respawns_after_cloudflared_crash() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+
+    // One-shot fake cloudflared: first invocation exits immediately to
+    // simulate a crash, second invocation sleeps forever.
+    let tmp = std::env::temp_dir().join(format!("cfp-restart-test-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+    tokio::fs::create_dir_all(&tmp).await.unwrap();
+    let counter_file = tmp.join("counter");
+    let binary = write_oneshot_cloudflared(&tmp, &counter_file).await;
+
+    let mut handle = TunnelBuilder::new()
+        .api(CloudflareApi::with_base("test-token", base).unwrap())
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .protocol(Protocol::Http)
+        .port(8080)
+        .subdomain("restart-test")
+        .auto_restart(true)
+        .cloudflared_path(binary)
+        .start()
+        .await
+        .expect("start should succeed");
+
+    // The URL is stable across the restart — same subdomain, same domain.
+    assert_eq!(handle.full_name(), "restart-test.example.com");
+
+    // Wait for the respawn: a fresh tunnel object must appear on the
+    // mock within a few seconds. We poll the creation counter instead of
+    // the event stream so the test isn't coupled to broadcast delivery
+    // ordering.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if state.tunnel_creation_count.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "auto-restart never fired; tunnel_creation_count={}",
+                state.tunnel_creation_count.load(Ordering::SeqCst)
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // The cloudflared stub itself ran twice — initial crashed and the
+    // respawned long-lived one.
+    let counter = std::fs::read_to_string(&counter_file).unwrap();
+    assert!(
+        counter.trim().parse::<u32>().unwrap() >= 2,
+        "expected cloudflared to have been respawned; counter={counter}"
+    );
+
+    // User-initiated stop should still tear down the live tunnel and DNS.
+    handle.stop().await.expect("stop should succeed");
+    assert!(
+        !state.deleted_tunnels.lock().unwrap().is_empty(),
+        "stop should have cleaned up the live tunnel"
+    );
+}
+
+/// Without `auto_restart`, a `cloudflared` crash must end the session —
+/// the supervisor must NOT respawn the child and `wait()` must return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_restart_off_terminates_on_crash() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+
+    let tmp = std::env::temp_dir().join(format!("cfp-norestart-test-{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+    tokio::fs::create_dir_all(&tmp).await.unwrap();
+    let counter_file = tmp.join("counter");
+    let binary = write_oneshot_cloudflared(&tmp, &counter_file).await;
+
+    let mut handle = TunnelBuilder::new()
+        .api(CloudflareApi::with_base("test-token", base).unwrap())
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .protocol(Protocol::Http)
+        .port(8080)
+        .subdomain("no-restart")
+        .auto_restart(false)
+        .cloudflared_path(binary)
+        .start()
+        .await
+        .expect("start should succeed");
+
+    // `wait()` must observe the crash and return within a few seconds.
+    // With auto_restart=true this would block forever.
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
+        .await
+        .expect("wait should return promptly after cloudflared exits");
+
+    // Exactly one tunnel was created — no respawn.
+    assert_eq!(
+        state.tunnel_creation_count.load(Ordering::SeqCst),
+        1,
+        "no respawn should have occurred with auto_restart=false"
+    );
+    let counter = std::fs::read_to_string(&counter_file).unwrap();
+    assert_eq!(counter.trim(), "1", "cloudflared ran exactly once");
 }

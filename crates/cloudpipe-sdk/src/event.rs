@@ -40,6 +40,37 @@ pub enum Event {
     /// `cloudflared` was spawned successfully.
     CloudflaredStarted,
 
+    /// The previous tunnel session ended and a new one is being created on
+    /// the same URL. Only emitted when auto-restart is enabled.
+    Restarting {
+        /// Why the previous session ended.
+        reason: ShutdownReason,
+        /// 1-based restart attempt counter — the *next* attempt will be
+        /// `attempt` (so the very first restart after the initial run is
+        /// `attempt = 2`).
+        attempt: u32,
+    },
+
+    /// A new tunnel session has finished bootstrapping and `cloudflared`
+    /// is running again on the same URL. Only emitted when auto-restart
+    /// is enabled.
+    Restarted {
+        /// 1-based restart counter — matches the `attempt` value of the
+        /// most recent [`Event::Restarting`].
+        attempt: u32,
+    },
+
+    /// The auto-restart loop has exhausted its retry budget (consecutive
+    /// bootstrap failures) and is giving up. The session is about to
+    /// enter normal shutdown. Only emitted when auto-restart is enabled.
+    RestartGivingUp {
+        /// How many consecutive bootstrap failures occurred.
+        attempts: u32,
+        /// The last error string returned by the Cloudflare API or
+        /// `cloudflared` spawn.
+        last_error: String,
+    },
+
     /// A new edge connection was registered. `cloudflared` establishes up to
     /// four QUIC connections to the edge.
     EdgeConnected {
@@ -80,16 +111,21 @@ pub enum LogLevel {
     Error,
 }
 
-/// Why a tunnel began shutting down.
+/// Why a tunnel session ended (and is potentially being restarted).
+///
+/// Note: with auto-restart enabled, a `ChildExited` or `Error` reason does
+/// **not** mark the tunnel as dead — the SDK will respawn `cloudflared` on
+/// the same URL and the next event will be [`Event::Restarting`] followed
+/// by [`Event::Restarted`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ShutdownReason {
     /// User called [`crate::TunnelHandle::stop`] (or the program is exiting).
+    /// The session is final — no auto-restart will be attempted.
     UserRequested,
-    /// The 4-hour age limit was reached.
-    Timeout,
     /// `cloudflared` exited unexpectedly on its own.
     ChildExited,
-    /// An internal task reported an unrecoverable error.
+    /// An internal task reported an unrecoverable error (typically a
+    /// failed `try_wait` on the child process).
     Error(String),
 }

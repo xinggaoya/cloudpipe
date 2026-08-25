@@ -73,6 +73,7 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
         .protocol(args.protocol)
         .port(args.port)
         .subdomain(args.subdomain.unwrap_or_default())
+        .auto_restart(args.auto_restart)
         .on_event(ui::render_event)
         .start()
         .await
@@ -83,6 +84,7 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
         args.port,
         &args.protocol.to_string(),
         handle.subdomain(),
+        args.auto_restart,
     );
 
     // Wait for either Ctrl+C or the tunnel to exit on its own.

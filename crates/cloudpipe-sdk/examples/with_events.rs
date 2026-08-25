@@ -14,6 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .domain(domain)
         .protocol(Protocol::Http)
         .port(8080)
+        .auto_restart(true)
         .on_event(render_event)
         .start()
         .await?;
@@ -36,6 +37,13 @@ fn render_event(event: Event) {
         }
         Event::DnsCreated { full_name } => println!("DNS record {full_name} created"),
         Event::CloudflaredStarted => println!("cloudflared started"),
+        Event::Restarting { reason, attempt } => {
+            println!("restarting (attempt #{attempt}): {}", describe(&reason))
+        }
+        Event::Restarted { attempt } => println!("✓ resumed on the same URL (attempt #{attempt})"),
+        Event::RestartGivingUp { attempts, last_error } => {
+            eprintln!("auto-restart giving up after {attempts} attempts: {last_error}")
+        }
         Event::EdgeConnected { conn_index, total } => {
             println!("edge connection {conn_index} established ({total} total)")
         }
@@ -46,18 +54,17 @@ fn render_event(event: Event) {
             eprintln!("[cloudflared] {line}")
         }
         Event::CloudflaredLog { .. } => {}
-        Event::ShuttingDown { reason } => println!("shutting down: {}", describe(reason)),
+        Event::ShuttingDown { reason } => println!("shutting down: {}", describe(&reason)),
         Event::Cleaned => println!("✓ all resources cleaned up"),
         _ => {}
     }
 }
 
-fn describe(reason: ShutdownReason) -> &'static str {
+fn describe(reason: &ShutdownReason) -> String {
     match reason {
-        ShutdownReason::UserRequested => "user requested",
-        ShutdownReason::Timeout => "timeout",
-        ShutdownReason::ChildExited => "cloudflared exited",
-        ShutdownReason::Error(_) => "internal error",
-        _ => "other",
+        ShutdownReason::UserRequested => "user requested".to_string(),
+        ShutdownReason::ChildExited => "cloudflared exited".to_string(),
+        ShutdownReason::Error(err) => format!("internal error: {err}"),
+        _ => "other".to_string(),
     }
 }

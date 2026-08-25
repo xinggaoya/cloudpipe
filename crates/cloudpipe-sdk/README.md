@@ -15,14 +15,16 @@ async fn main() -> anyhow::Result<()> {
         .protocol(Protocol::Http)
         .port(8080)
         .subdomain("myapp")
+        .auto_restart(true) // keep the tunnel alive across cloudflared crashes
         .on_event(|event| println!("{event:?}"))
         .start()
         .await?;
 
     println!("Live at {}", handle.url());
 
-    // `wait` blocks until the tunnel exits on its own; Ctrl+C triggers
-    // a clean stop. `wait` itself never signals shutdown.
+    // `wait` blocks until the user signals shutdown. With auto-restart
+    // enabled, cloudflared crashes are absorbed by the SDK and don't
+    // return from `wait`; Ctrl+C triggers a clean stop.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => handle.stop().await?,
         _ = handle.wait() => {}

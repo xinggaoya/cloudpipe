@@ -60,6 +60,7 @@ pub struct TunnelBuilder {
     binary_path: Option<PathBuf>,
     config_dir: Option<PathBuf>,
     github_proxy: Option<String>,
+    auto_restart: bool,
 }
 
 impl Default for TunnelBuilder {
@@ -84,6 +85,7 @@ impl TunnelBuilder {
             binary_path: None,
             config_dir: None,
             github_proxy: None,
+            auto_restart: false,
         }
     }
 
@@ -168,6 +170,23 @@ impl TunnelBuilder {
     /// Pass an empty string to disable mirroring.
     pub fn github_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.github_proxy = Some(proxy.into());
+        self
+    }
+
+    /// When `true`, the SDK automatically respawns `cloudflared` on the
+    /// same public URL if it exits on its own (crash, network drop, etc.).
+    ///
+    /// Each respawn creates a fresh Cloudflare tunnel object and DNS
+    /// record under the same subdomain, so the public hostname is stable
+    /// from the user's point of view. A user-initiated
+    /// [`crate::TunnelHandle::stop`] always terminates the session
+    /// regardless of this setting.
+    ///
+    /// Defaults to `false` at the SDK level so embedding programs get
+    /// predictable lifetime semantics; the `cfp` CLI enables it by
+    /// default.
+    pub fn auto_restart(mut self, enabled: bool) -> Self {
+        self.auto_restart = enabled;
         self
     }
 
@@ -285,6 +304,7 @@ where
             event_tx,
             shutdown: Shutdown::new(),
             dispatch: self.dispatch,
+            auto_restart: self.inner.auto_restart,
         };
 
         session::start(cfg).await

@@ -29,6 +29,15 @@ pub struct Cli {
     #[arg(short, long, value_name = "SUBDOMAIN")]
     pub subdomain: Option<String>,
 
+    /// Disable auto-restart of `cloudflared` when it exits on its own.
+    ///
+    /// By default `cfp` respawns `cloudflared` on the same public URL if
+    /// it crashes, so a long-running exposure survives transient edge
+    /// drops without manual intervention. Pass this flag to make the
+    /// process exit the first time the child goes down.
+    #[arg(long)]
+    pub no_restart: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -54,6 +63,7 @@ pub struct TunnelArgs {
     pub protocol: Protocol,
     pub port: u16,
     pub subdomain: Option<String>,
+    pub auto_restart: bool,
 }
 
 impl Cli {
@@ -86,6 +96,7 @@ impl Cli {
             protocol: Protocol::parse(protocol_token).map_err(anyhow::Error::msg)?,
             port: port.unwrap_or(crate::DEFAULT_PORT),
             subdomain: self.subdomain.clone(),
+            auto_restart: !self.no_restart,
         })
     }
 }

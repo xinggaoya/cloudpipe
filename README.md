@@ -12,6 +12,7 @@
 - 🌐 **Custom subdomains** — pick `-s myapp` or get a random one
 - 🛣️ **Five protocols** — `http`, `https`, `tcp`, `udp`, `ssh` (Cloudflare edge always serves HTTPS publicly)
 - 🧹 **Clean exit** — Ctrl+C deletes the tunnel and DNS record automatically; no orphans
+- ♻️ **Auto-restart** — `cloudflared` crashes are recovered on the same URL; the tunnel stays live indefinitely
 - 🪂 **Standalone** — works offline, air-gapped, behind NAT
 
 ## Install
@@ -181,7 +182,7 @@ For `udp`, reach the service by pointing your client at `myhost.example.com:5182
 
 | Command | Description |
 |---|---|
-| `cfp [http\|https\|tcp\|udp\|ssh] <port> [-s <subdomain>]` | Start a tunnel. Protocol selects the local scheme (`http` is the default). |
+| `cfp [http\|https\|tcp\|udp\|ssh] <port> [-s <subdomain>]` | Start a tunnel. Protocol selects the local scheme (`http` is the default). Add `--no-restart` to disable auto-restart. |
 | `cfp key [TOKEN] [--clear]` | Save, show or clear the Cloudflare token. Saving auto-discovers account/zone. |
 | `cfp domain <example.com>` | Switch the base domain to a different accessible zone. |
 | `cfp domains` | List zones accessible with the saved token. |
@@ -210,13 +211,15 @@ async fn main() -> anyhow::Result<()> {
         .protocol(Protocol::Http)
         .port(8080)
         .subdomain("myapp")
+        .auto_restart(true)               // keep the tunnel alive across cloudflared crashes
         .on_event(|event| println!("{event:?}"))
         .start()
         .await?;
 
     println!("live at {}", handle.url());
-    // `wait` blocks until the tunnel exits on its own; Ctrl+C triggers
-    // a clean stop. `wait` itself never signals shutdown.
+    // `wait` blocks until the user signals shutdown. With auto-restart
+    // enabled, cloudflared crashes are absorbed by the SDK and don't
+    // return from `wait`; Ctrl+C triggers a clean stop.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => handle.stop().await?,
         _ = handle.wait() => {}
@@ -250,8 +253,12 @@ cfp tcp 22 -s mybox
   │                  {service: http_status:404}]
   ├─ POST /zones/{id}/dns_records         CNAME mybox.example.com → {tunnelId}.cfargotunnel.com
   ├─ spawn cloudflared tunnel run --token ... --no-autoupdate
-  └─ wait for Ctrl+C / 4h timeout / child exit
-        └─ kill cloudflared → delete DNS → cleanup connections → delete tunnel
+  └─ wait for Ctrl+C (or child crash if --no-restart)
+        └─ child crash (default): kill cloudflared → delete DNS → cleanup
+           connections → delete tunnel → bootstrap a fresh tunnel on the
+           same subdomain
+        └─ Ctrl+C: kill cloudflared → delete DNS → cleanup connections
+           → delete tunnel
 ```
 
 All five protocols (`http`/`https`/`tcp`/`udp`/`ssh`) are configured the same way — only the `service` field in ingress changes. Routing happens entirely on Cloudflare's edge using the remote ingress configuration; `cloudflared` does not need a local config file.

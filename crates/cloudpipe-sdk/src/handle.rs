@@ -3,9 +3,11 @@
 //! The handle exposes the public URL, lets you subscribe to more events, and
 //! provides two ways to interact with the tunnel's lifetime:
 //!
-//! - [`TunnelHandle::wait`] — passively block until the tunnel exits on its
-//!   own (`cloudflared` crash, 4-hour age limit, etc.). Does **not** signal
-//!   shutdown; pair it with a control signal (e.g. `tokio::signal::ctrl_c`)
+//! - [`TunnelHandle::wait`] — passively block until the user-initiated
+//!   shutdown completes. With auto-restart enabled this only fires after
+//!   [`TunnelHandle::stop`]; `cloudflared` crashes are absorbed by the
+//!   respawn loop in the background task. Does **not** signal shutdown on
+//!   its own; pair it with a control signal (e.g. `tokio::signal::ctrl_c`)
 //!   and call [`TunnelHandle::stop`] from there.
 //! - [`TunnelHandle::stop`] — signal shutdown, await the background task
 //!   and run Cloudflare-side cleanup.
@@ -17,7 +19,7 @@
 //! you control so the Cloudflare tunnel and DNS record are released.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio::task::{JoinError, JoinHandle};
@@ -66,6 +68,12 @@ impl Shutdown {
     }
 }
 
+/// Holds the stderr pump task for the current session generation. The
+/// background task swaps this slot whenever it respawns `cloudflared`;
+/// [`TunnelHandle::wait`] / [`TunnelHandle::stop`] / `Drop` always await
+/// the most recent task so we don't leak a generation's pump.
+pub(crate) type StderrSlot = Arc<StdMutex<Option<JoinHandle<()>>>>;
+
 /// A live tunnel. Created by [`crate::TunnelBuilder::start`].
 ///
 /// `TunnelHandle` is `Send + Sync` so you can move it between tasks or share
@@ -78,7 +86,8 @@ pub struct TunnelHandle {
     subdomain: String,
     events: broadcast::Receiver<Event>,
     task: Option<JoinHandle<()>>,
-    stderr_task: Option<JoinHandle<()>>,
+    stderr_slot: Option<StderrSlot>,
+    _connections: Arc<AtomicUsize>,
     dispatch: crate::session::DispatchSlot,
     stopped: bool,
 }
@@ -103,7 +112,7 @@ impl TunnelHandle {
         full_name: String,
         subdomain: String,
         task: JoinHandle<()>,
-        stderr_task: JoinHandle<()>,
+        stderr_slot: StderrSlot,
         _connections: Arc<AtomicUsize>,
         dispatch: crate::session::DispatchSlot,
     ) -> Self {
@@ -116,7 +125,8 @@ impl TunnelHandle {
             subdomain,
             events,
             task: Some(task),
-            stderr_task: Some(stderr_task),
+            stderr_slot: Some(stderr_slot),
+            _connections,
             dispatch,
             stopped: false,
         }
@@ -139,29 +149,39 @@ impl TunnelHandle {
 
     /// Subscribes to lifecycle events. The returned receiver is independent
     /// of any `on_event` closure registered on the builder.
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        // Note: there's no public Sender to subscribe from, so we hand out a
-        // receiver cloned from the one stored inside the handle. It receives
-        // all events emitted from now on.
-        // (The current implementation reuses the stored receiver — in a more
-        // elaborate SDK we'd split the broadcast channel between handle and
-        // builder subscribers.)
+    pub fn subscribe(&mut self) -> broadcast::Receiver<Event> {
         self.events.resubscribe()
     }
 
-    /// Blocks until the tunnel exits for any reason (`cloudflared` crash,
-    /// 4-hour age limit, or an explicit [`stop`](Self::stop) from another
-    /// task).
+    /// Blocks until the user-initiated shutdown completes.
+    ///
+    /// With auto-restart enabled this only returns after the caller has
+    /// triggered shutdown (via [`TunnelHandle::stop`] or another path);
+    /// intermediate `cloudflared` crashes are absorbed by the respawn
+    /// loop and produce an [`Event::Restarted`] instead.
     ///
     /// This call is a passive wait: it does **not** signal shutdown on
     /// its own. To stop the tunnel cleanly, call [`stop`](Self::stop) (or
     /// trigger shutdown through another path).
+    ///
+    /// Note: `wait()` does **not** consume the background task — it
+    /// just observes its completion. A subsequent [`stop`](Self::stop)
+    /// can still drive cleanup. This matters when the caller races
+    /// `wait()` against another signal via `tokio::select!` and one
+    /// branch gets cancelled: the underlying task remains attached.
     pub async fn wait(&mut self) {
-        if let Some(task) = self.task.take() {
+        // Await the background task by reference so we don't consume it
+        // — a subsequent `stop()` still needs to drive cleanup.
+        if let Some(task) = self.task.as_mut() {
             let _ = task.await;
         }
-        if let Some(task) = self.stderr_task.take() {
-            let _ = task.await;
+        // Drain the most recent stderr pump. By the time `wait()` is
+        // returning the background task has already finished, so the
+        // slot will not be rewritten underneath us.
+        if let Some(slot) = self.stderr_slot.take() {
+            if let Some(task) = slot.lock().expect("stderr slot poisoned").take() {
+                let _ = task.await;
+            }
         }
     }
 
@@ -181,8 +201,10 @@ impl TunnelHandle {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
-        if let Some(task) = self.stderr_task.take() {
-            let _ = task.await;
+        if let Some(slot) = self.stderr_slot.take() {
+            if let Some(task) = slot.lock().expect("stderr slot poisoned").take() {
+                let _ = task.await;
+            }
         }
 
         // Belt-and-suspenders: if the background task somehow didn't clean up
@@ -229,8 +251,10 @@ impl Drop for TunnelHandle {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        if let Some(task) = self.stderr_task.take() {
-            task.abort();
+        if let Some(slot) = self.stderr_slot.take() {
+            if let Some(task) = slot.lock().expect("stderr slot poisoned").take() {
+                task.abort();
+            }
         }
         self.dispatch.abort();
     }

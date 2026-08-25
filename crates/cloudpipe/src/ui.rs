@@ -34,6 +34,32 @@ pub fn render_event(event: Event) {
             println!("  {}", format!("Creating DNS {full_name}...").dimmed());
         }
         Event::CloudflaredStarted => {}
+        Event::Restarting { reason, attempt } => {
+            println!(
+                "  {}",
+                format!(
+                    "cloudflared ended ({}) — restarting (attempt #{attempt})...",
+                    describe_reason(&reason)
+                )
+                .yellow()
+            );
+        }
+        Event::Restarted { attempt } => {
+            println!(
+                "  {}",
+                format!("Resumed on the same URL (attempt #{attempt}).").green()
+            );
+        }
+        Event::RestartGivingUp { attempts, last_error } => {
+            println!(
+                "  {}",
+                format!(
+                    "auto-restart failed {attempts} times in a row — giving up. \
+                     last error: {last_error}"
+                )
+                .red()
+            );
+        }
         Event::EdgeConnected { total, .. } => {
             if total == 1 {
                 println!("  {}", "Edge connection established".green());
@@ -46,16 +72,14 @@ pub fn render_event(event: Event) {
                 eprintln!("  [cloudflared] {}", line.yellow());
             }
         }
-        Event::ShuttingDown { reason } => match reason {
-            ShutdownReason::UserRequested => {}
-            ShutdownReason::Timeout => {
-                println!("  {}", "4h age limit reached — cleaning up.".yellow());
+        Event::ShuttingDown { reason } => {
+            if matches!(reason, ShutdownReason::ChildExited) {
+                println!(
+                    "  {}",
+                    "cloudflared exited — cleaning up before respawn.".dimmed()
+                );
             }
-            ShutdownReason::ChildExited => {
-                println!("  {}", "cloudflared exited — cleaning up.".yellow());
-            }
-            _ => {}
-        },
+        }
         Event::Cleaned => {
             println!("  {}", "Cleaning up tunnel and DNS record...".dimmed());
         }
@@ -63,9 +87,24 @@ pub fn render_event(event: Event) {
     }
 }
 
+fn describe_reason(reason: &ShutdownReason) -> String {
+    match reason {
+        ShutdownReason::UserRequested => "user requested".to_string(),
+        ShutdownReason::ChildExited => "cloudflared exited".to_string(),
+        ShutdownReason::Error(err) => format!("internal error: {err}"),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Prints the tunnel success block after the URL is live. Called by `main`
 /// once `handle.url()` is known.
-pub fn tunnel_live(url: &str, port: u16, protocol: &str, subdomain: &str) {
+pub fn tunnel_live(
+    url: &str,
+    port: u16,
+    protocol: &str,
+    subdomain: &str,
+    auto_restart: bool,
+) {
     println!();
     println!("  {}  🚀", "WE LIVE!".green().bold());
     println!();
@@ -80,7 +119,14 @@ pub fn tunnel_live(url: &str, port: u16, protocol: &str, subdomain: &str) {
         "localhost".dimmed(),
         subdomain
     );
-    println!("  {}  Ctrl+C to stop and clean up", "Hint".dimmed());
+    if auto_restart {
+        println!(
+            "  {}  Ctrl+C to stop; cloudflared auto-restarts on crash",
+            "Hint".dimmed()
+        );
+    } else {
+        println!("  {}  Ctrl+C to stop and clean up", "Hint".dimmed());
+    }
     println!("  {}", "─".repeat(56).dimmed());
     println!();
 }
