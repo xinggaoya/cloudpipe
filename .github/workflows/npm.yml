@@ -121,6 +121,10 @@ jobs:
           --dts index.d.ts
       - name: Verify .node binary exists
         working-directory: crates/cloudpipe-node
+        # Force git-bash even on Windows — the PowerShell default
+        # refuses bash-isms like `! ls` in an `if` clause, and grepping
+        # for a stray file pattern is more readable in bash anyway.
+        shell: bash
         run: |
           ls -la npm/
           if ! ls npm/cloudpipe*.node >/dev/null 2>&1; then
