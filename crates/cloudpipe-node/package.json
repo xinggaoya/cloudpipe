@@ -33,8 +33,6 @@
     "npm/index.js",
     "npm/index.d.ts",
     "npm/cloudpipe.linux-x64-gnu.node",
-    "npm/cloudpipe.linux-x64-musl.node",
-    "npm/cloudpipe.linux-arm64-gnu.node",
     "npm/cloudpipe.darwin-arm64.node",
     "npm/cloudpipe.darwin-x64.node",
     "npm/cloudpipe.win32-x64-msvc.node",
@@ -57,9 +55,7 @@
       "aarch64-apple-darwin",
       "x86_64-apple-darwin",
       "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-linux-musl",
-      "aarch64-unknown-linux-gnu"
+      "x86_64-unknown-linux-gnu"
     ]
   }
 }

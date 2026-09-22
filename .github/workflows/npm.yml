@@ -85,18 +85,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             label: Linux x86_64 (gnu)
             extra: ''
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            label: Linux x86_64 (musl)
-            # `--cross-compile` (formerly `--zig`) selects cargo-zigbuild
-            # so the Linux runner can emit musl / aarch64 wheels without
-            # a separately installed cross toolchain. napi-rs/cli v3 +
-            # zigs the `--zig` flag in favour of this canonical name.
-            extra: '--cross-compile'
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            label: Linux aarch64 (gnu)
-            extra: '--cross-compile'
+          # Linux aarch64-gnu + Linux x86_64-musl are deferred to v0.2.0.
+          # Both need a zig cross-compiler on the runner (`cargo-zigbuild`
+          # alone ships without one). Set `matrix.extra` to
+          # `--cross-compile` and add a zig setup step (e.g.
+          # `mlugg/setup-zig@v2`) once you want to ship them.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

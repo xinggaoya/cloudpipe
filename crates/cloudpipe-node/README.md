@@ -10,8 +10,10 @@
 npm install cloudpipe
 ```
 
-Prebuilt binaries are shipped for macOS (arm64 + x64), Linux (x64-gnu,
-x64-musl, aarch64-gnu), and Windows (x64-msvc).
+Prebuilt binaries are shipped for macOS (arm64 + x64), Linux (x64-gnu),
+and Windows (x64-msvc). Linux aarch64-gnu and Alpine/musl support are
+scheduled for v0.2.0 — see the workflows' matrix entry for the upstream
+zig-cross-compile setup we still need to land.
 
 ## Quick start
 
