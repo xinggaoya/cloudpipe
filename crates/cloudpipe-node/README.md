@@ -87,14 +87,19 @@ fields.
 ### Errors
 
 `cloudpipe` does not subclass the JS `Error` — the cloudpipe-specific
-taxonomy is encoded as a `[CODE]` prefix on `error.message`. Use the
-[`parseErrorCode`](./index.d.ts) helper or split the prefix off yourself:
+taxonomy is encoded as a `[CODE]` prefix on `error.message`
+(optionally with a `:KIND` sub-class for `CLOUDFLARE_API`, e.g.
+`[CLOUDFLARE_API:RATE_LIMITED]`). Use the exported
+[`parseErrorCode`](./index.d.ts) helper to extract the code without
+hand-rolling a regex:
 
 ```js
+import { connect, parseErrorCode } from 'cloudpipe';
+
 try {
  await connect({ token });
 } catch (err) {
- const code = err.message.match(/^\[(\w+(?::\w+)?)\]/)?.[1];
+ const code = parseErrorCode(err.message);
  // e.g. "CLOUDFLARE_API:RATE_LIMITED"
  switch (code) {
  case 'MISSING_CREDENTIAL': ...
@@ -103,8 +108,9 @@ try {
 }
 ```
 
-The full code list is in
-[`index.d.ts`](./index.d.ts) (`CloudpipeErrorCode`).
+The full top-level code list is in
+[`index.d.ts`](./index.d.ts) (`CloudpipeErrorCode`); the
+`CLOUDFLARE_API` sub-kind catalog is `CloudflareApiKind`.
 
 ## License
 

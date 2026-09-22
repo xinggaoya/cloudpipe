@@ -6,7 +6,7 @@
   "types": "index.d.ts",
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": ">=18.0.0"
   },
   "keywords": [
     "cloudflare",
@@ -14,8 +14,18 @@
     "cloudflared",
     "localhost",
     "ngrok-alternative",
-    "napi-rs"
+    "napi-rs",
+    "napi"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xinggaoya/cloudpipe.git",
+    "directory": "crates/cloudpipe-node"
+  },
+  "homepage": "https://github.com/xinggaoya/cloudpipe#readme",
+  "bugs": {
+    "url": "https://github.com/xinggaoya/cloudpipe/issues"
+  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
@@ -30,13 +40,16 @@
     "npm/cloudpipe.win32-x64-msvc.node",
     "index.d.ts",
     "README.md",
+    "LICENSE",
     "package.json"
   ],
   "scripts": {
-    "build": "napi build --platform --release --strip --output-dir ./npm --js ./npm/index.js --dts ./npm/index.d.ts",
-    "build:debug": "napi build --platform --output-dir ./npm",
-    "build:local": "napi build --target $(rustc -vV | sed -n 's|host: ||p') --platform --release --strip --output-dir ./npm --js ./npm/index.js --dts ./npm/index.d.ts",
-    "test": "node examples/quickstart.js"
+    "build": "napi build --platform --release --strip --output-dir ./npm --js index.js --dts index.d.ts",
+    "build:debug": "napi build --platform --output-dir ./npm --js index.js --dts index.d.ts",
+    "build:local": "napi build --target $(rustc -vV | sed -n 's|host: ||p') --platform --release --strip --output-dir ./npm --js index.js --dts index.d.ts",
+    "test": "node test/smoke.js",
+    "test:examples": "node examples/quickstart.js && node examples/with-events.js",
+    "prepublishOnly": "npm run build && npm run test"
   },
   "napi": {
     "binaryName": "cloudpipe",

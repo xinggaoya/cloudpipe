@@ -12,6 +12,33 @@ env:
   RUST_BACKTRACE: short
 
 jobs:
+  # Pre-flight: confirm the npm package name is still available (or that
+  # we own the namespace) before spending CI cycles on six native builds.
+  # Also pulls public metadata so a publish race / accidental name squat
+  # becomes a workflow-visible failure instead of a publish error.
+  preflight:
+    name: npm preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org/
+      - name: Check package name availability
+        env:
+          PACKAGE_NAME: cloudpipe
+        run: |
+          set -euo pipefail
+          # `npm view <name>` exits 0 with metadata when the name exists.
+          # We want the workflow to fail loudly if the name is already
+          # taken — that's a race we need to settle manually.
+          if npm view "$PACKAGE_NAME" name >/dev/null 2>&1; then
+            current=$(npm view "$PACKAGE_NAME" name version 2>/dev/null || true)
+            echo "::error::npm package '$PACKAGE_NAME' already exists: $current"
+            exit 1
+          fi
+          echo "ok: '$PACKAGE_NAME' is available on registry.npmjs.org"
+
   lint:
     name: Rust lint (cloudpipe-node)
     runs-on: ubuntu-latest
@@ -32,7 +59,7 @@ jobs:
 
   build:
     name: napi build (${{ matrix.label }})
-    needs: lint
+    needs: [lint, preflight]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -85,8 +112,9 @@ jobs:
             --release \
             --strip \
             ${{ matrix.extra }} \
-            --js ./npm/index.js \
-            --dts ./npm/index.d.ts
+            --output-dir ./npm \
+            --js index.js \
+            --dts index.d.ts
       - name: Verify .node binary exists
         working-directory: crates/cloudpipe-node
         run: |
@@ -139,14 +167,22 @@ jobs:
           cp crates/cloudpipe-node/index.d.ts npm-staging/index.d.ts
           cp crates/cloudpipe-node/package.json npm-staging/package.json
           cp crates/cloudpipe-node/README.md npm-staging/README.md
+          cp crates/cloudpipe-node/LICENSE npm-staging/LICENSE
           # Copy every .node artifact into the staging area.
+          # IMPORTANT: the .node binaries must live in npm-staging/npm/,
+          # the same directory as index.js, because napi-rs's loader
+          # uses a relative `require('./X.node')` from index.js. The
+          # package.json `files` field only matches entries under npm/.
           for n in artifacts/*/npm/cloudpipe*.node; do
             [ -f "$n" ] || continue
-            cp "$n" npm-staging/
+            cp "$n" npm-staging/npm/
           done
           ls -la npm-staging/
           echo "---"
           ls -la npm-staging/npm/
+          echo "---"
+          echo "Pack dry-run from staging dir to verify layout:"
+          (cd npm-staging && npm pack --dry-run --ignore-scripts)
       - name: Publish to npm
         working-directory: npm-staging
         env:

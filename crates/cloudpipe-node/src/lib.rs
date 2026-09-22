@@ -116,8 +116,124 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Extracts the `[CODE]` prefix from a cloudpipe error message.
+///
+/// Cloudpipe surfaces its error taxonomy as a `[CODE]` prefix on
+/// `error.message` (e.g. `"[CLOUDFLARE_API:RATE_LIMITED] ..."`). This
+/// helper splits the prefix off without forcing JS callers to write
+/// their own regex.
+///
+/// Returns:
+///
+/// - the bare code (`"MISSING_CREDENTIAL"`) for top-level codes,
+/// - the composed `PARENT:KIND` form for `CloudflareApi` errors
+///   (`"CLOUDFLARE_API:RATE_LIMITED"`),
+/// - or `null` when no `[CODE]` prefix is present.
+#[napi]
+pub fn parse_error_code(message: String) -> Option<String> {
+    use crate::error::{CloudflareApiKind, CloudpipeErrorCode};
+    let raw = message.strip_prefix('[')?;
+    let end = raw.find(']')?;
+    let inner = &raw[..end];
+    let mut parts = inner.splitn(2, ':');
+    let parent = parts.next()?;
+
+    // Validate against the typed enum so a future code rename/refactor
+    // surfaces as a Rust compile error instead of a silent JS-side
+    // string drift.
+    let parent_code = match parent {
+        "MISSING_CREDENTIAL" => CloudpipeErrorCode::MissingCredential,
+        "CLOUDFLARE_API" => CloudpipeErrorCode::CloudflareApi,
+        "CLOUDFLARE_BINARY" => CloudpipeErrorCode::CloudflaredBinary,
+        "INVALID_SUBDOMAIN" => CloudpipeErrorCode::InvalidSubdomain,
+        "SUBDOMAIN_IN_USE" => CloudpipeErrorCode::SubdomainInUse,
+        "ALREADY_SHUT_DOWN" => CloudpipeErrorCode::AlreadyShutDown,
+        "IO" => CloudpipeErrorCode::Io,
+        "OTHER" => CloudpipeErrorCode::Other,
+        // Unknown parent — fall through and return the raw text. We
+        // deliberately don't fail so forward-compat works both ways:
+        // newer SDK emits an unknown parent -> older JS helper still
+        // gets a string back, not an exception.
+        _ => return Some(parent.to_string()),
+    };
+    let _ = parent_code;
+
+    // For CloudflareApi, surface the parent + kind verbatim. Other
+    // codes don't carry a sub-kind.
+    let suffix = match parts.next() {
+        Some(s) => s,
+        None => return Some(parent.to_string()),
+    };
+    // Validate the sub-kind against the typed enum; if it doesn't match,
+    // return the raw text (forward compat again).
+    let suffix_code = match suffix {
+        "RATE_LIMITED" => CloudflareApiKind::RateLimited,
+        "DNS_EXISTS" => CloudflareApiKind::DnsExists,
+        "AUTH_FAILED" => CloudflareApiKind::AuthFailed,
+        "INVALID_TOKEN" => CloudflareApiKind::InvalidToken,
+        "OTHER" => CloudflareApiKind::Other,
+        _ => return Some(format!("{parent}:{suffix}")),
+    };
+    let _ = suffix_code;
+    Some(format!("{parent}:{suffix}"))
+}
+
 // Silence unused-Arc warning while we wire things up incrementally.
 #[allow(dead_code)]
 fn _arc<T>(t: T) -> Arc<T> {
     Arc::new(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_error_code;
+
+    #[test]
+    fn parses_simple_code() {
+        assert_eq!(
+            parse_error_code("[MISSING_CREDENTIAL] need a token".into()),
+            Some("MISSING_CREDENTIAL".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_compound_kind() {
+        assert_eq!(
+            parse_error_code("[CLOUDFLARE_API:RATE_LIMITED] too many".into()),
+            Some("CLOUDFLARE_API:RATE_LIMITED".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_null_on_plain_message() {
+        assert_eq!(parse_error_code("no prefix here".into()), None);
+    }
+
+    #[test]
+    fn returns_null_on_malformed_prefix() {
+        assert_eq!(parse_error_code("[not closed here".into()), None);
+    }
+
+    #[test]
+    fn unknown_code_passes_through() {
+        // Forward-compat: a future SDK version emits a brand-new code
+        // that this helper doesn't know about -> return it verbatim
+        // instead of throwing.
+        assert_eq!(
+            parse_error_code("[FUTURE_CODE] blah".into()),
+            Some("FUTURE_CODE".to_string())
+        );
+        assert_eq!(
+            parse_error_code("[FUTURE_CODE:NEXT_KIND] blah".into()),
+            Some("FUTURE_CODE:NEXT_KIND".to_string())
+        );
+    }
+
+    #[test]
+    fn known_parent_with_unknown_subkind_passes_through() {
+        assert_eq!(
+            parse_error_code("[CLOUDFLARE_API:RATE_LIMITED_EXTENDED] blah".into()),
+            Some("CLOUDFLARE_API:RATE_LIMITED_EXTENDED".to_string())
+        );
+    }
 }

@@ -147,9 +147,11 @@ export declare class Listener {
 }
 
 /**
- * Cloudpipe error codes. The JS side surfaces them as a `[CODE]` prefix
- * on `error.message` — JS callers should split the prefix off the
- * front before falling through to the underlying SDK message.
+ * Cloudpipe top-level error codes. The JS side surfaces them as a
+ * `[CODE]` prefix on `error.message`, with an optional `:KIND` suffix
+ * for `CLOUDFLARE_API` (e.g. `[CLOUDFLARE_API:RATE_LIMITED]`). JS callers
+ * should split the prefix off the front before falling through to the
+ * underlying SDK message — see {@link parseErrorCode}.
  */
 export type CloudpipeErrorCode =
   | 'MISSING_CREDENTIAL'
@@ -161,17 +163,27 @@ export type CloudpipeErrorCode =
   | 'IO'
   | 'OTHER';
 
+/** Sub-kind appended after `CLOUDFLARE_API:` for API-classified errors. */
+export type CloudflareApiKind =
+  | 'RATE_LIMITED'
+  | 'DNS_EXISTS'
+  | 'AUTH_FAILED'
+  | 'INVALID_TOKEN'
+  | 'OTHER';
+
 /**
- * Extracts the `[CODE]` prefix from a cloudpipe error message. Useful
- * when you need to branch on the typed cause without parsing the rest.
+ * Extracts the `[CODE]` (or `[CODE:KIND]`) prefix from a cloudpipe
+ * error message. Returns `null` when the message does not carry the
+ * prefix (e.g. an `Error` thrown from outside the cloudpipe boundary).
  *
  * ```ts
  * try {
  *   await connect({ token });
- * } catch catch (e: any) {
+ * } catch (e: any) {
  *   const code = parseErrorCode(e.message);
- *   if (code === 'CLOUDFLARE_API') ...
+ *   if (code === 'CLOUDFLARE_API:RATE_LIMITED') ...
+ *   else if (code === 'MISSING_CREDENTIAL') ...
  * }
  * ```
  */
-export function parseErrorCode(message: string): CloudpipeErrorCode | null;
+export function parseErrorCode(message: string): string | null;
