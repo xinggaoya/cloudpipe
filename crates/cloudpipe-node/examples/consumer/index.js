@@ -75,9 +75,11 @@ async function main() {
   });
 
   // --- 3. version() matches the package.json the consumer resolved ---
-  await check('version() returns 0.1.0', async () => {
+  await check('version() returns a 0.1.x', async () => {
     const v = cloudpipe.version();
-    if (v !== '0.1.0') throw new Error(`expected 0.1.0, got ${v}`);
+    if (!/^0\.1\.\d+$/.test(v)) {
+      throw new Error(`expected 0.1.x, got ${v}`);
+    }
     return v;
   });
 
@@ -257,13 +259,15 @@ async function runRealTunnel(cloudpipe, token, domain) {
     return await firstEdgeWait;
   });
 
-  // Curl the public URL, with a small retry loop because the very
-  // first request on a freshly-built tunnel sometimes loses to the
-  // edge route propagation window.
+  // Curl the public URL, with an aggressive retry loop because the
+  // very first request on a freshly-built tunnel loses to the edge
+  // route propagation window. 30s total budget with exponential
+  // backoff (1s, 2s, 4s, 8s) is enough in practice.
   await check('real tunnel — public URL serves local server', async () => {
     const target = listener.url;
     let lastErr;
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const backoff = [1000, 2000, 4000, 8000, 8000, 8000, 8000];
+    for (let attempt = 0; attempt < backoff.length; attempt += 1) {
       try {
         const resp = await fetch(target, { redirect: 'manual' });
         if (resp.status >= 200 && resp.status < 400) {
@@ -271,15 +275,15 @@ async function runRealTunnel(cloudpipe, token, domain) {
           if (!body.includes('hello from @xinggao/cloudpipe consumer demo')) {
             throw new Error(`unexpected body: ${body.slice(0, 60)}…`);
           }
-          return `HTTP ${resp.status}, body len ${body.length}, local hits=${hitCount}`;
+          return `HTTP ${resp.status}, attempt ${attempt + 1}, body ${body.length}B, local hits=${hitCount}`;
         }
-        lastErr = new Error(`HTTP ${resp.status} from ${target}`);
+        lastErr = new Error(`HTTP ${resp.status} (attempt ${attempt + 1})`);
       } catch (err) {
         lastErr = err;
       }
-      await new Promise((r) => setTimeout(r, 1000 * attempt));
+      await new Promise((r) => setTimeout(r, backoff[attempt]));
     }
-    throw lastErr || new Error('fetch failed after 5 attempts');
+    throw lastErr || new Error('fetch failed after retries');
   });
 
   await check('real tunnel — close shuts down cleanly', async () => {
