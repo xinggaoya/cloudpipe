@@ -1,0 +1,5 @@
+# Demo's own dependencies — committed lockfile is unnecessary, npm
+# regenerates `package-lock.json` on first install with whatever
+# registry the consumer uses.
+node_modules/
+package-lock.json

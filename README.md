@@ -275,7 +275,10 @@ with a GitHub mirror default for users behind the GFW.
 See [`crates/cloudpipe-node/README.md`](./crates/cloudpipe-node/) and the
 [`quickstart`](./crates/cloudpipe-node/examples/quickstart.js) /
 [`with-events`](./crates/cloudpipe-node/examples/with-events.js)
-examples for the full API.
+examples for the full API. An end-to-end **consumer demo** that runs
+against the *published* npm tarball (not the local source) lives in
+[`crates/cloudpipe-node/examples/consumer/`](./crates/cloudpipe-node/examples/consumer/)
+and exits non-zero if anything regresses in the next publish.
 
 ## Repository layout
 

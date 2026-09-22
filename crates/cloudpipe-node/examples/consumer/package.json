@@ -1,0 +1,17 @@
+{
+  "name": "@xinggao/cloudpipe-consumer-demo",
+  "version": "0.0.1",
+  "private": true,
+  "description": "End-to-end consumer demo for @xinggao/cloudpipe — proves the published npm tarball works in a fresh project.",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "demo": "node index.js"
+  },
+  "dependencies": {
+    "@xinggao/cloudpipe": "^0.1.0"
+  }
+}
