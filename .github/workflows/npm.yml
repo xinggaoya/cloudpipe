@@ -175,14 +175,27 @@ jobs:
       - name: Assemble npm package
         run: |
           set -euo pipefail
+          echo "=== debug: artifacts layout ==="
+          ls -la artifacts/ || true
+          echo "---"
+          find artifacts/ -maxdepth 4 -type f 2>/dev/null | head -40 || true
+          echo "==="
           rm -rf npm-staging
           mkdir -p npm-staging/npm
-          # The napi-rs generated index.js / index.d.ts are identical
-          # across platforms — only the .node binaries differ. Take
-          # them from the first artifact.
-          first_dir=$(ls -d artifacts/*/npm | head -1)
-          cp "$first_dir/index.js" npm-staging/npm/index.js
-          [ -f "$first_dir/index.d.ts" ] && cp "$first_dir/index.d.ts" npm-staging/npm/index.d.ts
+          # actions/download-artifact with merge-multiple: true dumps
+          # every artifact's files flat into artifacts/. Surviving
+          # files from each artifact are: index.js, index.d.ts, and a
+          # cloudpipe.<platform>.node binary. We pick the JS + dts from
+          # any artifact (they're byte-identical across platforms) and
+          # pick up every .node binary for the platform matrix.
+          first_entry=$(find artifacts/ -maxdepth 2 -type f -name 'index.js' | head -1)
+          if [ -z "$first_entry" ]; then
+            echo "::error::no artifact index.js found — did upload-artifact pop a usable artifact?"
+            exit 1
+          fi
+          cp "$first_entry" npm-staging/npm/index.js
+          first_dts=$(find artifacts/ -maxdepth 2 -type f -name 'index.d.ts' | head -1)
+          [ -n "$first_dts" ] && cp "$first_dts" npm-staging/npm/index.d.ts
           # Use our hand-written type definitions so consumers get the full
           # event-name catalog and typed callback signatures.
           cp crates/cloudpipe-node/index.d.ts npm-staging/index.d.ts
@@ -194,10 +207,17 @@ jobs:
           # the same directory as index.js, because napi-rs's loader
           # uses a relative `require('./X.node')` from index.js. The
           # package.json `files` field only matches entries under npm/.
-          for n in artifacts/*/npm/cloudpipe*.node; do
+          node_count=0
+          while IFS= read -r n; do
             [ -f "$n" ] || continue
             cp "$n" npm-staging/npm/
-          done
+            node_count=$((node_count + 1))
+          done < <(find artifacts/ -maxdepth 3 -type f -name 'cloudpipe*.node')
+          if [ "$node_count" -eq 0 ]; then
+            echo "::error::no cloudpipe*.node in artifacts/ — upload step dropped them?"
+            exit 1
+          fi
+          echo "collected $node_count .node binary(ies)"
           ls -la npm-staging/
           echo "---"
           ls -la npm-staging/npm/
