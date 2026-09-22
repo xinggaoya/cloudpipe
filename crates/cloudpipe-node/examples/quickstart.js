@@ -9,7 +9,7 @@
 // Run with:
 //   node examples/quickstart.js
 
-const { connect } = require('cloudpipe');
+const { connect } = require('@xinggao/cloudpipe');
 
 (async () => {
  const token = process.env.CLOUDFLARE_API_TOKEN;

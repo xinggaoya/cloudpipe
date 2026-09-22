@@ -5,6 +5,8 @@
 
 const path = require('node:path');
 
+// Path-based require: smoke test loads from the local built artifact
+// rather than the registry, so the package name is irrelevant here.
 const mod = require(path.resolve(__dirname, '..', 'npm', 'index.js'));
 const api = mod.default ?? mod;
 

@@ -7,6 +7,7 @@
 
 const path = require('node:path');
 
+// Path-based require — load from the local built artifact.
 const mod = require(path.resolve(__dirname, '..', 'npm', 'index.js'));
 const api = mod.default ?? mod;
 

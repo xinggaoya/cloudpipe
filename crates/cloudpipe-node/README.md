@@ -7,7 +7,7 @@
 ## Install
 
 ```bash
-npm install cloudpipe
+npm install @xinggao/cloudpipe
 ```
 
 Prebuilt binaries are shipped for macOS (arm64 + x64), Linux (x64-gnu),
@@ -18,7 +18,7 @@ zig-cross-compile setup we still need to land.
 ## Quick start
 
 ```js
-import { connect } from 'cloudpipe';
+import { connect } from '@xinggao/cloudpipe';
 
 const listener = await connect({
   token: process.env.CLOUDFLARE_API_TOKEN,
@@ -96,7 +96,7 @@ taxonomy is encoded as a `[CODE]` prefix on `error.message`
 hand-rolling a regex:
 
 ```js
-import { connect, parseErrorCode } from 'cloudpipe';
+import { connect, parseErrorCode } from '@xinggao/cloudpipe';
 
 try {
  await connect({ token });

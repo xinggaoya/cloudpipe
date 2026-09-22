@@ -239,11 +239,11 @@ Node.js — same `connect()` shape as `@ngrok/ngrok`, same `Listener`
 handle, same lifecycle events.
 
 ```bash
-npm install cloudpipe
+npm install @xinggao/cloudpipe
 ```
 
 ```js
-import { connect } from 'cloudpipe';
+import { connect } from '@xinggao/cloudpipe';
 
 const listener = await connect({
   token: process.env.CLOUDFLARE_API_TOKEN,

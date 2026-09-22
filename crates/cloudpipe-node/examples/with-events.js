@@ -10,7 +10,7 @@
 // Run with:
 //   node examples/with-events.js
 
-const { connect } = require('cloudpipe');
+const { connect } = require('@xinggao/cloudpipe');
 
 function parse(json) {
  try {
