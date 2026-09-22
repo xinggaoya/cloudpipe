@@ -232,12 +232,58 @@ See the SDK README in [`crates/cloudpipe-sdk/`](./crates/cloudpipe-sdk/) and the
 [`quickstart`](./crates/cloudpipe-sdk/examples/quickstart.rs) /
 [`with_events`](./crates/cloudpipe-sdk/examples/with_events.rs) examples.
 
+## As a Node.js library
+
+The same functionality is available as an npm-installable package for
+Node.js — same `connect()` shape as `@ngrok/ngrok`, same `Listener`
+handle, same lifecycle events.
+
+```bash
+npm install cloudpipe
+```
+
+```js
+import { connect } from 'cloudpipe';
+
+const listener = await connect({
+  token: process.env.CLOUDFLARE_API_TOKEN,
+  domain: 'example.com',
+  protocol: 'http',
+  port: 8080,
+  subdomain: 'myapp',
+  autoRestart: true,             // keep the tunnel alive across cloudflared crashes
+});
+
+listener.on('dnsCreated', (json) => {
+  const { fullName } = JSON.parse(json);
+  console.log(`DNS created for ${fullName}`);
+});
+
+console.log(`live at ${listener.url}`);
+
+process.on('SIGINT', async () => {
+  await listener.close();
+  process.exit(0);
+});
+```
+
+Prebuilt binaries are shipped for macOS (arm64 + x64), Linux
+(x64-gnu, x64-musl, aarch64-gnu), and Windows (x64-msvc). No separate
+`cloudflared` install required — the SDK downloads it on first use,
+with a GitHub mirror default for users behind the GFW.
+
+See [`crates/cloudpipe-node/README.md`](./crates/cloudpipe-node/) and the
+[`quickstart`](./crates/cloudpipe-node/examples/quickstart.js) /
+[`with-events`](./crates/cloudpipe-node/examples/with-events.js)
+examples for the full API.
+
 ## Repository layout
 
 ```
 crates/
-├── cloudpipe-sdk/        # pure async SDK (no CLI / UI deps)
-└── cloudpipe/            # `cfp` CLI binary — uses the SDK
+├── cloudpipe-sdk/        # pure async Rust SDK (no CLI / UI deps)
+├── cloudpipe/            # `cfp` CLI binary — uses the SDK
+└── cloudpipe-node/       # napi-rs Node.js bindings — uses the SDK
 ```
 
 ## How it works

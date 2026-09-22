@@ -1,0 +1,52 @@
+{
+  "name": "cloudpipe",
+  "version": "0.1.0",
+  "description": "Serverless Cloudflare tunnels for Node.js — no backend, no auth, no cloudflared install.",
+  "main": "npm/index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "cloudflare",
+    "tunnel",
+    "cloudflared",
+    "localhost",
+    "ngrok-alternative",
+    "napi-rs"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "files": [
+    "npm/index.js",
+    "npm/index.d.ts",
+    "npm/cloudpipe.linux-x64-gnu.node",
+    "npm/cloudpipe.linux-x64-musl.node",
+    "npm/cloudpipe.linux-arm64-gnu.node",
+    "npm/cloudpipe.darwin-arm64.node",
+    "npm/cloudpipe.darwin-x64.node",
+    "npm/cloudpipe.win32-x64-msvc.node",
+    "index.d.ts",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "build": "napi build --platform --release --strip --output-dir ./npm --js ./npm/index.js --dts ./npm/index.d.ts",
+    "build:debug": "napi build --platform --output-dir ./npm",
+    "build:local": "napi build --target $(rustc -vV | sed -n 's|host: ||p') --platform --release --strip --output-dir ./npm --js ./npm/index.js --dts ./npm/index.d.ts",
+    "test": "node examples/quickstart.js"
+  },
+  "napi": {
+    "binaryName": "cloudpipe",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu"
+    ]
+  }
+}

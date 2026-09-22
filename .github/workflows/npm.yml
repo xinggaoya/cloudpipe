@@ -1,0 +1,158 @@
+name: npm
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  lint:
+    name: Rust lint (cloudpipe-node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/cloudpipe-node -> target
+      - name: Format check
+        run: cargo fmt -p cloudpipe-node -- --check
+      - name: Build workspace
+        run: cargo build -p cloudpipe-node --lib
+      - name: Clippy
+        run: cargo clippy -p cloudpipe-node --all-targets -- -D warnings
+
+  build:
+    name: napi build (${{ matrix.label }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macOS arm64
+            extra: ''
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            label: macOS x86_64
+            extra: ''
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows x86_64
+            extra: ''
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: Linux x86_64 (gnu)
+            extra: ''
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            label: Linux x86_64 (musl)
+            extra: '--zig'
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            label: Linux aarch64 (gnu)
+            extra: '--zig'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install napi-rs CLI
+        run: npm install -g @napi-rs/cli@3
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/cloudpipe-node -> target
+      - name: Build (cloudpipe-node)
+        working-directory: crates/cloudpipe-node
+        run: |
+          napi build \
+            --platform \
+            --target ${{ matrix.target }} \
+            --release \
+            --strip \
+            ${{ matrix.extra }} \
+            --js ./npm/index.js \
+            --dts ./npm/index.d.ts
+      - name: Verify .node binary exists
+        working-directory: crates/cloudpipe-node
+        run: |
+          ls -la npm/
+          if ! ls npm/cloudpipe*.node >/dev/null 2>&1; then
+            echo "::error::no cloudpipe*.node artifact produced"
+            exit 1
+          fi
+      - name: Upload .node binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudpipe-node-${{ matrix.target }}
+          path: |
+            crates/cloudpipe-node/npm/index.js
+            crates/cloudpipe-node/npm/index.d.ts
+            crates/cloudpipe-node/npm/cloudpipe*.node
+
+  publish:
+    name: npm publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org/
+      - name: Download all .node binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Assemble npm package
+        run: |
+          set -euo pipefail
+          rm -rf npm-staging
+          mkdir -p npm-staging/npm
+          # The napi-rs generated index.js / index.d.ts are identical
+          # across platforms — only the .node binaries differ. Take
+          # them from the first artifact.
+          first_dir=$(ls -d artifacts/*/npm | head -1)
+          cp "$first_dir/index.js" npm-staging/npm/index.js
+          [ -f "$first_dir/index.d.ts" ] && cp "$first_dir/index.d.ts" npm-staging/npm/index.d.ts
+          # Use our hand-written type definitions so consumers get the full
+          # event-name catalog and typed callback signatures.
+          cp crates/cloudpipe-node/index.d.ts npm-staging/index.d.ts
+          cp crates/cloudpipe-node/package.json npm-staging/package.json
+          cp crates/cloudpipe-node/README.md npm-staging/README.md
+          # Copy every .node artifact into the staging area.
+          for n in artifacts/*/npm/cloudpipe*.node; do
+            [ -f "$n" ] || continue
+            cp "$n" npm-staging/
+          done
+          ls -la npm-staging/
+          echo "---"
+          ls -la npm-staging/npm/
+      - name: Publish to npm
+        working-directory: npm-staging
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # --ignore-scripts because the package.json scripts reference
+          # `napi`, which we don't need for publishing prebuilt artifacts.
+          npm publish --provenance --ignore-scripts
+          echo "published cloudpipe@${{ github.ref_name }} to npm"
