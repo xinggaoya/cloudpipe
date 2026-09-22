@@ -231,5 +231,8 @@ jobs:
         run: |
           # --ignore-scripts because the package.json scripts reference
           # `napi`, which we don't need for publishing prebuilt artifacts.
-          npm publish --provenance --ignore-scripts
+          # --access public is required when --provenance is in play for a
+          # brand-new package — npm refuses to mint a Sigstore attestation
+          # for private/visibility-undeclared packages.
+          npm publish --provenance --access public --ignore-scripts
           echo "published cloudpipe@${{ github.ref_name }} to npm"
