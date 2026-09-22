@@ -135,10 +135,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cloudpipe-node-${{ matrix.target }}
+          # Upload from inside crates/cloudpipe-node so the artifact
+          # zip uses `npm/index.js` etc. as top-level entries —
+          # otherwise download-artifact restores the leading
+          # `crates/cloudpipe-node/` prefix and the assemble step
+          # can't find artifacts/*/npm/.
           path: |
-            crates/cloudpipe-node/npm/index.js
-            crates/cloudpipe-node/npm/index.d.ts
-            crates/cloudpipe-node/npm/cloudpipe*.node
+            npm/index.js
+            npm/index.d.ts
+            npm/cloudpipe*.node
 
   publish:
     name: npm publish
