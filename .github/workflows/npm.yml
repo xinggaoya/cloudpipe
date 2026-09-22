@@ -135,7 +135,16 @@ jobs:
   publish:
     name: npm publish
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Two trigger paths:
+    #   * `v*` tag push → first-class release, picks up the tag's version
+    #     for the published package.
+    #   * `workflow_dispatch` → standalone npm-only release (does NOT
+    #     require bumping the cfp CLI tag), so the npm package can ship
+    #     out-of-band with the Rust crates. Always uses the version
+    #     currently in package.json.
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
