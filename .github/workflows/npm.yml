@@ -132,23 +132,17 @@ jobs:
             exit 1
           fi
       - name: Upload .node binary
-        working-directory: crates/cloudpipe-node
         uses: actions/upload-artifact@v4
         with:
           name: cloudpipe-node-${{ matrix.target }}
-          # Upload from inside crates/cloudpipe-node so the artifact
-          # zip uses `npm/index.js` etc. as top-level entries —
-          # otherwise download-artifact restores the leading
-          # `crates/cloudpipe-node/` prefix and the assemble step
-          # can't find artifacts/*/npm/.
-          # `if-no-files-found: error` turns "missing files" into a
-          # build failure instead of the v4 default `warn`, which
-          # otherwise papers over an empty artifact.
+          # Pass the directory itself (not globs). For directory
+          # uploads, actions/upload-artifact@v4 strips the parent
+          # prefix in the zip, so the artifact zip's top entries are
+          # `npm/index.js`, `npm/index.d.ts`, `cloudpipe*.node`.
+          # Pair with `merge-multiple: true` (default false) so all
+          # artifacts land under `artifacts/<name>/npm/`.
           if-no-files-found: error
-          path: |
-            npm/index.js
-            npm/index.d.ts
-            npm/cloudpipe*.node
+          path: crates/cloudpipe-node/npm
 
   publish:
     name: npm publish
