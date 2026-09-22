@@ -180,7 +180,7 @@ async function main() {
   const token = process.env.CLOUDFLARE_API_TOKEN;
   const domain = process.env.CLOUDFLARE_DOMAIN;
   if (token && domain) {
-    await runRealTunnel(token, domain);
+    await runRealTunnel(cloudpipe, token, domain);
   } else {
     checks.push({
       name: 'real tunnel (skip — set CLOUDFLARE_API_TOKEN + CLOUDFLARE_DOMAIN to enable)',
@@ -199,10 +199,12 @@ async function main() {
   console.log('\nall checks ok');
 }
 
-async function runRealTunnel(token, domain) {
+async function runRealTunnel(cloudpipe, token, domain) {
   // Tiny HTTP server — anything we hit returns a marker so we can
   // prove the tunnel actually routed.
+  let hitCount = 0;
   const server = http.createServer((req, res) => {
+    hitCount += 1;
     res.writeHead(200, { 'content-type': 'text/plain' });
     res.end(`hello from @xinggao/cloudpipe consumer demo at ${new Date().toISOString()}\n`);
   });
@@ -228,21 +230,56 @@ async function runRealTunnel(token, domain) {
     if (!listener || typeof listener.url !== 'string' || !listener.url.startsWith('https://')) {
       throw new Error(`bad listener.url = ${listener && listener.url}`);
     }
-    return `${listener.url} (subdomain=${listener.subdomain})`;
+    return `${listener.url} (subdomain=${listener.subdomain}, fullName=${listener.fullName})`;
   });
 
-  // Curl the public URL and assert the body round-tripped.
+  // Subscribe to lifecycle events for diagnostic output.
+  // The first 'edgeConnected' event means the tunnel has a live QUIC
+  // connection to the CF edge, so waiting for it before fetching
+  // gives a much higher hit-rate on the first try.
+  const firstEdgeWait = new Promise((resolve, reject) => {
+    const t = setTimeout(
+      () => reject(new Error('edgeConnected did not fire in 30s')),
+      30_000,
+    );
+    listener.on('edgeConnected', (json) => {
+      clearTimeout(t);
+      try {
+        const p = JSON.parse(json);
+        resolve(`conn=${p.connIndex}/${p.total}`);
+      } catch {
+        resolve(json);
+      }
+    });
+  });
+
+  await check('real tunnel — edgeConnected lifecycle event', async () => {
+    return await firstEdgeWait;
+  });
+
+  // Curl the public URL, with a small retry loop because the very
+  // first request on a freshly-built tunnel sometimes loses to the
+  // edge route propagation window.
   await check('real tunnel — public URL serves local server', async () => {
-    // Tiny inline fetch; Node 18+ has global fetch.
-    const resp = await fetch(listener.url, { redirect: 'manual' });
-    if (resp.status < 200 || resp.status >= 400) {
-      throw new Error(`HTTP ${resp.status} from ${listener.url}`);
+    const target = listener.url;
+    let lastErr;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      try {
+        const resp = await fetch(target, { redirect: 'manual' });
+        if (resp.status >= 200 && resp.status < 400) {
+          const body = await resp.text();
+          if (!body.includes('hello from @xinggao/cloudpipe consumer demo')) {
+            throw new Error(`unexpected body: ${body.slice(0, 60)}…`);
+          }
+          return `HTTP ${resp.status}, body len ${body.length}, local hits=${hitCount}`;
+        }
+        lastErr = new Error(`HTTP ${resp.status} from ${target}`);
+      } catch (err) {
+        lastErr = err;
+      }
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
     }
-    const body = await resp.text();
-    if (!body.includes('hello from @xinggao/cloudpipe consumer demo')) {
-      throw new Error(`unexpected body: ${body.slice(0, 60)}…`);
-    }
-    return `HTTP ${resp.status}, body len ${body.length}`;
+    throw lastErr || new Error('fetch failed after 5 attempts');
   });
 
   await check('real tunnel — close shuts down cleanly', async () => {

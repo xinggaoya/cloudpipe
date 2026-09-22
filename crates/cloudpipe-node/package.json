@@ -1,6 +1,6 @@
 {
   "name": "@xinggao/cloudpipe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Serverless Cloudflare tunnels for Node.js — no backend, no auth, no cloudflared install.",
   "main": "npm/index.js",
   "types": "index.d.ts",

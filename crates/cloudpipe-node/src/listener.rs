@@ -101,9 +101,16 @@ impl Listener {
 
         let builder = builder.on_event(move |event: Event| {
             let (name, payload) = event_to_payload(&event);
-            // `blocking_send` is fine here: `on_event` runs inside the
-            // SDK's session task, which is itself a non-async thread.
-            let _ = event_tx.blocking_send((name.to_string(), payload));
+            // Use `try_send` rather than `blocking_send` — the
+            // closure now runs inside the napi-rs multi-thread
+            // tokio runtime, where blocking the current thread
+            // panics with "Cannot block the current thread from
+            // within a runtime." Channel capacity is 64 and the
+            // event rate is bounded by cloudflared's lifecycle
+            // (a handful of events per minute), so dropping on
+            // overflow is safe — the next event from the SDK
+            // will refresh whatever the JS handler cares about.
+            let _ = event_tx.try_send((name.to_string(), payload));
         });
 
         let join_result = runtime().spawn(async move { builder.start().await }).await;
