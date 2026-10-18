@@ -61,6 +61,23 @@ const listener = await connect({
 
 `originHostHeader` is there for services that route on their own hostname.
 
+## Diagnostics
+
+The SDK emits `debug`/`warn` events for reconnect retries, backoff and
+cleanup failures. They are collected by a subscriber you install:
+
+```bash
+CFP_LOG=debug node app.js
+```
+
+```js
+const { connect, initLogging } = require('@xinggao/cloudpipe');
+initLogging();   // reads CFP_LOG
+```
+
+Without it the events are dropped, so a tunnel that keeps flapping looks
+like a tunnel that keeps flapping for no visible reason.
+
 ## Lifecycle events
 
 Subscribe to the same lifecycle events the CLI exposes:

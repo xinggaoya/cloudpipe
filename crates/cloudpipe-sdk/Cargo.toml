@@ -18,6 +18,7 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 dirs = { workspace = true }
 flate2 = { workspace = true }
+futures = "0.3"
 getrandom = "0.3"
 reqwest = { workspace = true }
 serde = { workspace = true }

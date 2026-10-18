@@ -438,14 +438,3 @@ impl Listener {
 // produces an *independent* sender, so dropping that clone changed nothing.
 // The mechanism that actually works is field destruction, so it is left to
 // the field order rather than pretended at here.
-
-impl Listener {
-    /// Releases the command channel early.
-    ///
-    /// Only needed if a `cmd_tx` clone ever outlives the listener; today
-    /// nothing does, and the assertions below keep it that way.
-    #[cfg(test)]
-    fn sender_count_would_not_outlive_self(&self) -> usize {
-        std::sync::Arc::strong_count(&self.callbacks)
-    }
-}

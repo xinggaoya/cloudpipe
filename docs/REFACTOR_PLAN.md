@@ -2,6 +2,9 @@
 
 > 基于对 `crates/cloudpipe-sdk`、`crates/cloudpipe`（CLI）、`crates/cloudpipe-node`（napi）、
 > 三条 GitHub Actions 工作流与全部文档的通读。所有条目均已在本地复现验证。
+>
+> **状态：已全部实施。** 每条的实现方式与计划的差异、以及实施过程中发现并
+> 修复的额外缺陷，都记录在文末的「实施结果」一节。
 
 ---
 
@@ -582,3 +585,59 @@ P4-4 文档矛盾清理
 | P1-8 | mock 返回 3 页 zone，断言全部拿到 |
 | P3-1 | `cfp https <自签端口>` 可正常访问 |
 | P3-8 | `await wait(); await close();` 不再挂起 |
+
+
+---
+
+# 实施结果
+
+## 与计划的主要差异
+
+计划是提案，实施中被证据推翻或改进的部分：
+
+| 条目 | 计划的方案 | 实际做法 | 原因 |
+|---|---|---|---|
+| P0-6 | RAII `BootstrapGuard` / `scopeguard` | `Created { tunnel, dns }` 台账 + 显式 `rollback()` | 显式台账比 Drop guard 更容易看出「哪些资源被创建了」，且不需要新依赖 |
+| P1-2 | 流式下载 + `fs2` 文件锁 | 校验后原子 rename；并发由 rename 抢占 | 单进程场景下 `.part` + `rename` 已足够；见下方「已知限制」 |
+| P1-5 | `OnceLock<PathBuf>` 缓存 + `debug_log!` 宏 | 整体删除 `log_debug`，改用 `tracing` + CLI/Node 各自的 subscriber | `CFP_DEBUG_LOG` 是个无文档的隐藏开关；`tracing` 已是既有依赖，装上 subscriber 才是正解 |
+| P2-1 | 拆 7 个模块 | 拆 6 个（`log.rs` 取消，`policy.rs` 新增） | `log.rs` 的职责随 P1-5 一起消失；`policy.rs` 把策略类从 supervisor 机制里分出去 |
+| P3-5 | 引入 `NullAsDefault<T>` | `request_unit -> Option<T>` + 独立的 `request_ignore` | 两个函数比一个 trait 边界更清楚，且不需要 unsafe/unsafe-free 的 Default 约束 |
+| P3-10 | `SessionManager` 多隧道管理 | 未做 | 这是一个新特性而非修复，且当前没有对应的使用场景；其余 3 条（stop 超时、cleanup 便捷入口、删除死 API）已做 |
+
+## 实施中发现并修复的额外缺陷
+
+计划本身没预见到的：
+
+1. **`originRequest` 序列化键名错误**（client.rs）—— 类型和 CLI 开关都加了，
+   但 serde 生成了 `origin_request`，Cloudflare 会静默忽略。README 主打的
+   「自签 HTTPS 可用」因此实际不生效。
+2. **cloudflared 摘要表是伪造的** —— 首次实现时填的是占位哈希，会让所有没有
+   PATH 上 cloudflared 的机器首次运行即失败。改为只填经 release 实际校验的
+   摘要，并新增 `verify-checksums` CI job 作为长期保障。
+3. **token 文件 unlink 竞态**，以及一个**恒真**的单测（断言了流程中从不出现的
+   `cloudflared.part`，所以无论代码怎么写都通过）。
+4. **`ApiError::Timeout` 从未被构造**，导致 CLI 的超时提示是不可达分支。
+5. **`is_retryable` 把 Cloudflare 业务码当 HTTP 状态码比较**，`7003`
+   （could-not-route）被误判为可重试，白重放三次。
+6. **cleanup 重复计数**：死隧道的 DNS 记录会被两个分支各报一次。
+7. **`resolve_zone` 的文档与实现矛盾**：`account()` / `zone()` 文档称「可选」，
+   实现却要求三者同给。
+8. **deny.toml 语法错误 + 与真实依赖图不符**，会让新增的 audit job 必红；
+   修正后又暴露出一个真实的 rustls advisory。
+9. **MSRV 声明错误**：README 写 1.70+，但 `LazyLock` 要 1.80。
+10. **P0-3 完成后 `--exclude cloudpipe-node` 变成 no-op**，四处「cannot link」
+    的注释随之失效。
+
+## 已知限制
+
+诚实记录尚未覆盖的部分：
+
+- **cloudflared 摘要表只覆盖 Linux x86_64 / arm64**。其他平台需要手动安装，
+  或设 `CFP_CLOUDFLARED_SHA256`。这是刻意的：无法校验的可执行文件绝不安装。
+  `verify-checksums` job 会打印缺失项，补齐是一条命令的事。
+- **无跨进程文件锁**。`.part` + 原子 `rename` 保证了并发读取者只会看到完整
+  文件，但两个进程仍会重复下载一次。代价是一次带宽，而非正确性问题。
+- **`SessionManager`（多隧道并行管理）未做** —— 属于新特性，见上表。
+- **`--json` 只覆盖 `cfp cleanup`**，隧道/key/domain 仍是人类可读输出。
+- **Node 的 `off(event)` 是整事件清空**，不能移除单个回调（与 ngrok 的
+  `off(event, cb)` 语义不同）。

@@ -11,7 +11,8 @@ categories = ["api-bindings", "network-programming"]
 links = "cloudpipe"
 # NOTE: `cdylib` only — this crate is a Node addon, not something a Rust
 # consumer links against. All testable logic lives in `cloudpipe-node-core`
-# precisely because a cdylib's test harness cannot link napi symbols.
+# because a cdylib's test harness cannot reliably link the `napi_*` symbols
+# (they resolve only inside a Node.js process).
 
 [lib]
 name = "cloudpipe_node"
@@ -24,6 +25,7 @@ cloudpipe-node-core = { path = "../cloudpipe-node-core", version = "0.1.1" }
 napi = { workspace = true }
 napi-derive = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
 
 [build-dependencies]
 napi-build = { workspace = true }

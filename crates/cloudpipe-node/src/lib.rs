@@ -21,6 +21,87 @@ mod listener;
 use cloudpipe_node_core::{CloudflareApiKind, CloudpipeErrorCode};
 use tokio::runtime::Runtime;
 
+/// Installs a `tracing` subscriber for the SDK's internal `debug!`/`warn!`
+/// output.
+///
+/// Without this, a Node consumer sees nothing at all when the supervisor
+/// retries a reconnect or the Cloudflare client backs off — the diagnostics
+/// exist but are dropped on the floor, because nothing collects them. The
+/// `cfp` CLI installs its own subscriber for the same reason.
+///
+/// Reads `CFP_LOG=trace|debug|info|warn|error|off`; anything else, or an
+/// unset variable, disables logging so a library never writes to a
+/// consumer's stderr uninvited.
+///
+/// Safe to call more than once; later calls are ignored.
+#[napi]
+pub fn init_logging() {
+    let level = match std::env::var("CFP_LOG")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "trace" => tracing::Level::TRACE,
+        "debug" => tracing::Level::DEBUG,
+        "info" => tracing::Level::INFO,
+        "warn" | "warning" => tracing::Level::WARN,
+        "error" => tracing::Level::ERROR,
+        _ => return,
+    };
+    // A duplicate install is an error, not a panic: the addon may be
+    // loaded into more than one context.
+    let _ = tracing::subscriber::set_global_default(StderrSubscriber { level });
+}
+
+/// Minimal `tracing::Subscriber` writing to stderr.
+///
+/// Spans are not tracked — nothing in the SDK creates any, and supporting
+/// them properly is where the complexity lives. `tracing-subscriber` would
+/// work too, but it is a heavy dependency for an addon whose whole selling
+/// point is a small install.
+struct StderrSubscriber {
+    level: tracing::Level,
+}
+
+impl tracing::Subscriber for StderrSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= self.level
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        use std::io::Write as _;
+        let meta = event.metadata();
+        let mut visitor = FieldVisitor(String::new());
+        event.record(&mut visitor);
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "[cloudpipe {}] {}", meta.level(), meta.target());
+        let _ = writeln!(err, "  {}", visitor.0.trim());
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Concatenates an event's message fields into one string.
+struct FieldVisitor(String);
+
+impl tracing::field::Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{} = {value:?} ", field.name());
+    }
+}
+
 pub use listener::Listener;
 
 use napi::bindgen_prelude::*;

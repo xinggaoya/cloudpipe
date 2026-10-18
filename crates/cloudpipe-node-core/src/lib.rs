@@ -3,8 +3,9 @@
 //! Everything in this crate is a plain function or a plain enum with **no
 //! dependency on `napi`**. That separation exists for a concrete reason:
 //! `cloudpipe-node` is a `cdylib`, so a `cargo test --lib` harness for it
-//! fails to link (`undefined symbol: napi_call_threadsafe_function`) —
-//! the napi symbols only resolve inside a Node.js process.
+//! cannot be assumed to link — the `napi_*` symbols only resolve reliably
+//! inside a Node.js process, and on a toolchain without that platform's
+//! addon headers the link simply fails.
 //!
 //! Moving the mapping/parsing/formatting logic here means it is covered by
 //! real unit tests on `cargo test -p cloudpipe-node-core`, and it leaves

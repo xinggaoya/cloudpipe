@@ -9,11 +9,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
 
-# `cloudpipe-node` is a cdylib. A `cargo test --all-targets` harness for it
-# fails to link, because the `napi_*` symbols only resolve inside a Node.js
-# process — so it is excluded from the test/clippy matrix and covered by
-# `cloudpipe-node-core` (the napi-free crate holding the testable logic)
-# plus the `test:examples` job in `npm.yml`.
+# Testable logic lives in `cloudpipe-node-core` because a `cargo test`
+# harness for a cdylib cannot link `napi_*` symbols on some platforms. The
+# binding crate itself is built and linted as a lib, and its runtime surface
+# is covered by `test/smoke.js` (npm run test) and the `smoke` job in
+# `npm.yml`.
 jobs:
   fmt:
     name: Format
@@ -38,22 +38,37 @@ jobs:
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
       - name: Build workspace
-        run: cargo build --workspace --exclude cloudpipe-node --all-targets
+        run: cargo build --workspace --all-targets
       - name: Run tests
-        run: cargo test --workspace --exclude cloudpipe-node --all-targets
+        run: cargo test --workspace --all-targets
       - name: Run doc tests
-        run: cargo test --workspace --exclude cloudpipe-node --doc
-      - name: Build the Node addon (lib only)
-        run: cargo build -p cloudpipe-node --lib
+        run: cargo test --workspace --doc
       - name: Build SDK without CLI deps
         run: |
           cargo tree -p cloudpipe-sdk | grep -iE 'colored|clap|ctrlc|napi' \
             && (echo "SDK pulls in CLI/binding-only deps" && exit 1) \
             || echo "SDK is dependency-clean"
       - name: Clippy
-        run: |
-          cargo clippy --workspace --exclude cloudpipe-node --all-targets -- -D warnings
-          cargo clippy -p cloudpipe-node --lib -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  node-smoke:
+    name: Node addon smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: Swatinem/rust-cache@v2
+      - name: Install napi-rs CLI
+        run: npm install -g @napi-rs/cli@3
+      - name: Build the addon
+        working-directory: crates/cloudpipe-node
+        run: npm run build:debug
+      - name: Check the exported surface
+        working-directory: crates/cloudpipe-node
+        run: npm test
 
   verify-checksums:
     name: cloudflared checksums

@@ -202,6 +202,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -219,6 +220,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "flate2",
+ "futures",
  "getrandom 0.3.4",
  "reqwest",
  "serde",

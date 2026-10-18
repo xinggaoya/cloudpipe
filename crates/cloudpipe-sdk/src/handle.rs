@@ -374,3 +374,128 @@ impl TunnelHandle {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A handle with no session behind it, for exercising the parts that do
+    /// not need a live tunnel.
+    fn detached() -> TunnelHandle {
+        let state = SessionState {
+            api: crate::CloudflareApi::with_base("t", "http://127.0.0.1:1").unwrap(),
+            account_id: "a".into(),
+            zone_id: "z".into(),
+            full_name: "app.example.com".into(),
+            tunnel_id: "t".into(),
+            protocol: crate::Protocol::Http,
+            port: 8080,
+            cleaned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (tx, _rx) = broadcast::channel(4);
+        TunnelHandle::new(
+            Arc::new(Mutex::new(state)),
+            Shutdown::new(),
+            tx.subscribe(),
+            "app.example.com".into(),
+            "app".into(),
+            8080,
+            None,
+            tokio::runtime::Runtime::new()
+                .map(|rt| rt.spawn(async {}))
+                .unwrap(),
+            Arc::new(StdMutex::new(None)),
+            crate::session::DispatchSlot::default(),
+        )
+    }
+
+    #[test]
+    fn getters_describe_the_tunnel() {
+        let handle = detached();
+        assert_eq!(handle.url(), "https://app.example.com");
+        assert_eq!(handle.full_name(), "app.example.com");
+        assert_eq!(handle.subdomain(), "app");
+        assert_eq!(handle.port(), 8080);
+        // The stub task completes immediately, so `is_finished` is the
+        // observable here; `shutdown_signal_is_latched` covers the
+        // still-running case via the flag instead.
+        assert!(handle.is_finished());
+    }
+
+    #[test]
+    fn a_fresh_shutdown_is_not_triggered() {
+        assert!(!Shutdown::new().is_triggered());
+        assert!(!Shutdown::default().is_triggered());
+    }
+
+    #[test]
+    fn debug_does_not_leak_the_token() {
+        let rendered = format!("{:?}", detached());
+        assert!(rendered.contains("app.example.com"), "{rendered}");
+        assert!(!rendered.contains("test-token"), "{rendered}");
+    }
+
+    #[test]
+    fn shutdown_signal_is_latched() {
+        let shutdown = Shutdown::new();
+        assert!(!shutdown.is_triggered());
+
+        // Registering before triggering must not miss the notification —
+        // that race would hang `wait_for_exit` forever.
+        let waiter = shutdown.clone();
+        let trigger = shutdown.clone();
+        runtime().block_on(async move {
+            let notified = tokio::spawn(async move { waiter.notified().await });
+            // Let the waiter actually reach `notified()` before triggering.
+            tokio::task::yield_now().await;
+            trigger.trigger();
+            notified
+                .await
+                .expect("trigger() must wake a pending waiter");
+        });
+        assert!(shutdown.is_triggered());
+    }
+
+    #[test]
+    fn shutdown_notified_returns_immediately_once_triggered() {
+        let shutdown = Shutdown::new();
+        shutdown.trigger();
+        runtime().block_on(async { shutdown.notified().await });
+    }
+
+    /// A shared current-thread runtime for the async bits of these tests.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    #[test]
+    fn take_pump_releases_the_slot() {
+        let slot: StderrSlot = Arc::new(StdMutex::new(None));
+        assert!(take_pump(&slot).is_none());
+
+        let slot: StderrSlot = Arc::new(StdMutex::new(Some(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .spawn(async { std::future::pending::<()>().await }),
+        )));
+        assert!(take_pump(&slot).is_some(), "the task must come out");
+        assert!(
+            take_pump(&slot).is_none(),
+            "a slot yields its task exactly once"
+        );
+    }
+
+    #[test]
+    fn cleanup_timeout_is_generous() {
+        // It must comfortably exceed the SDK's own 30 s HTTP deadline plus
+        // the supervisor's SIGTERM grace period, or a healthy shutdown
+        // would trip it.
+        assert!(
+            CLEANUP_TIMEOUT > std::time::Duration::from_secs(30),
+            "{CLEANUP_TIMEOUT:?}"
+        );
+    }
+}

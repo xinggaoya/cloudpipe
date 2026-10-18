@@ -90,6 +90,21 @@ export declare function connect(options: ConnectOptions): Promise<Listener>;
 export declare function version(): string;
 
 /**
+ * Installs a `tracing` subscriber for the SDK's internal diagnostics
+ * (reconnect retries, Cloudflare backoff). Reads
+ * `CFP_LOG=trace|debug|info|warn|error`; unset or `off` leaves logging
+ * disabled, so the addon never writes to a consumer's stderr uninvited.
+ *
+ * ```ts
+ * initLogging();          // with CFP_LOG=debug in the environment
+ * const listener = await connect({ ... });
+ * ```
+ *
+ * Safe to call more than once; later calls are ignored.
+ */
+export declare function initLogging(): void;
+
+/**
  * Every event name `Listener#on` accepts, so a name can be validated
  * against the same list the runtime enforces.
  */

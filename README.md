@@ -335,10 +335,11 @@ crates/
 └── cloudpipe-node/          # napi-rs Node.js bindings — thin `#[napi]` shell
 ```
 
-`cloudpipe-node` is a `cdylib`, so a `cargo test` harness for it cannot
-link (the `napi_*` symbols only resolve inside a Node.js process).
-Everything worth testing therefore lives in `cloudpipe-node-core`; the
-addon crate holds only the annotated shell.
+`cloudpipe-node` is a `cdylib`, so a `cargo test` harness for it cannot be
+assumed to link — the `napi_*` symbols only resolve inside a Node.js
+process. Everything worth testing therefore lives in
+`cloudpipe-node-core`; the addon crate holds only the annotated shell, and
+its runtime surface is exercised by `npm test` (`test/smoke.js`).
 
 ## How it works
 
@@ -380,6 +381,7 @@ Other guarantees worth knowing about:
 - You need a domain managed by Cloudflare (any plan, including free).
 - Cloudflare's API rate limits apply per token. The SDK retries transient failures automatically; sustained heavy use may still need `cfp cleanup`.
 - The `cloudflared` binary is downloaded on first use and stored at `~/.cfp/bin/cloudflared` (~40 MB). Its version is pinned, so upgrading `cfp` to pick up a newer `cloudflared` is deliberate.
+- The built-in SHA-256 table covers Linux x86_64 and arm64. On other platforms, either install `cloudflared` yourself and put it on `PATH`, or set `CFP_CLOUDFLARED_SHA256=<digest you verified>` — an unverified executable is never installed. CI re-derives the table from the release on every build, so a stale or wrong digest fails the build rather than your first run.
 - Auto-restart uses a bounded retry budget (5 attempts, 500 ms doubling to an 8 s cap). Beyond that the session ends and reports why, rather than reconnecting forever.
 
 ## License

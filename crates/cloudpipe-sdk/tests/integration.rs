@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cloudpipe_sdk::{CloudflareApi, Protocol, TunnelBuilder};
+use cloudpipe_sdk::{CleanupAction, CloudflareApi, Protocol, TunnelBuilder};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -269,13 +269,19 @@ fn route(req: &Req, state: &MockState) -> (u16, Value) {
                         continue;
                     }
                 }
-                if let Some(status) = &status {
-                    // Only `healthy` matches, which is what the SDK probes.
-                    if status != "healthy" {
+                // Tunnels created with a name prefixed `dead-` are reported
+                // as down, so cleanup's dead-tunnel branch is reachable.
+                let reported_status = if tname.starts_with("dead-") {
+                    "down"
+                } else {
+                    "healthy"
+                };
+                if let Some(want) = &status {
+                    if want != reported_status {
                         continue;
                     }
                 }
-                out.push(json!({"id": id, "name": tname, "status": "healthy"}));
+                out.push(json!({"id": id, "name": tname, "status": reported_status}));
             }
             return ok(Value::Array(out));
         }
@@ -1052,22 +1058,47 @@ async fn update_port_republishes_ingress_and_keeps_the_url() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn preview_cleanup_changes_nothing() {
+async fn preview_cleanup_finds_dead_resources_and_deletes_nothing() {
     let state = MockState::new();
     let base = spawn_mock_api(state.clone()).await;
     let api = api_for(&base);
 
-    // A stale tunnel plus its DNS record is two resources, not three — the
-    // old count attributed 2 per tunnel.
-    state.tunnels().insert("dead".into(), "tun-dead".into());
+    // The mock reports `dead-*` tunnels as `down`, which is what makes
+    // cleanup's dead-tunnel branch reachable at all.
+    state
+        .tunnels()
+        .insert("dead-app".into(), "tun-dead-app".into());
     state
         .records()
-        .insert("dead.example.com".into(), "rec-dead".into());
+        .insert("dead-app.example.com".into(), "rec-dead-app".into());
 
     let report = cloudpipe_sdk::preview_cleanup(&api, "acc-1", "zone-1", "example.com")
         .await
         .expect("preview should succeed");
 
+    // The previous version of this test asserted only that nothing had been
+    // deleted, which passed even when the scan found nothing at all.
+    assert_eq!(
+        report.would_remove.len(),
+        2,
+        "a tunnel plus its DNS record is two resources, not three: {report:?}"
+    );
+    assert!(
+        report
+            .would_remove
+            .iter()
+            .any(|a| matches!(a, CleanupAction::Tunnel { name, .. } if name == "dead-app")),
+        "{report:?}"
+    );
+    assert!(
+        report.would_remove.iter().any(
+            |a| matches!(a, CleanupAction::DnsRecord { name, .. } if name == "dead-app.example.com")
+        ),
+        "{report:?}"
+    );
+
+    assert!(report.removed.is_empty());
+    assert_eq!(report.removed_count(), 0);
     assert!(
         state.deleted_tunnels().is_empty(),
         "a dry run must not delete anything"
@@ -1076,8 +1107,70 @@ async fn preview_cleanup_changes_nothing() {
         state.deleted_records().is_empty(),
         "a dry run must not delete anything"
     );
-    assert_eq!(report.removed.len(), 0);
-    assert_eq!(report.removed_count(), 0);
+    assert!(
+        state.tunnels().contains_key("dead-app"),
+        "a dry run must not remove the resource from the zone"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_reclaims_dead_tunnels_and_their_records() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let api = api_for(&base);
+
+    state
+        .tunnels()
+        .insert("dead-one".into(), "tun-dead-one".into());
+    state
+        .tunnels()
+        .insert("dead-two".into(), "tun-dead-two".into());
+    state
+        .records()
+        .insert("dead-one.example.com".into(), "rec-one".into());
+    // `dead-two` has no record left — the common case, and must not be an
+    // error.
+
+    let report = cloudpipe_sdk::cleanup_with_report(&api, "acc-1", "zone-1", "example.com")
+        .await
+        .expect("cleanup should succeed");
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.removed.len(), 3, "2 tunnels + 1 record: {report:?}");
+    assert!(report.would_remove.is_empty());
+    assert!(state.tunnels().is_empty(), "both tunnels must be gone");
+    assert!(state.records().is_empty(), "the orphan record must be gone");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_never_touches_records_that_are_not_tunnel_cnames() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let api = api_for(&base);
+
+    // A zone full of ordinary DNS: DMARC, SPF, ACME challenge, a user's
+    // own record. None point at a tunnel, so cleanup must not delete them.
+    for (name, id) in [
+        ("_dmarc.example.com", "rec-dmarc"),
+        ("example.com", "rec-apex"),
+    ] {
+        state.records().insert(name.into(), id.into());
+    }
+    // The mock's DNS listing always reports `tun-x.cfargotunnel.com` as the
+    // content, which *is* a tunnel CNAME — so give one a non-tunnel target
+    // by pinning a specific record the mock echoes differently.
+    state
+        .records()
+        .insert("keep.example.com".into(), "rec-keep".into());
+
+    let report = cloudpipe_sdk::preview_cleanup(&api, "acc-1", "zone-1", "example.com")
+        .await
+        .expect("preview should succeed");
+
+    assert!(
+        state.deleted_records().is_empty(),
+        "cleanup deleted something without a dead tunnel: {report:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

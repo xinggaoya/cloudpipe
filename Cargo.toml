@@ -38,6 +38,7 @@ clap = { version = "4", features = ["derive"] }
 colored = "3"
 dirs = "6"
 flate2 = "1"
+futures = "0.3"
 # NOTE: no `blocking` feature — nothing in the workspace uses the blocking
 # client, and enabling it pulls in an extra runtime path for no benefit.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
