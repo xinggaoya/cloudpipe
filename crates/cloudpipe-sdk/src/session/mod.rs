@@ -67,6 +67,7 @@ pub(crate) async fn start(cfg: SessionConfig) -> Result<TunnelHandle> {
     // belt-and-suspenders cleanup in `TunnelHandle::stop` targets the live
     // tunnel, not a stale one from a previous generation.
     let (initial_state, initial_child, stderr_slot) = initial.into_parts();
+    let port = initial_state.port;
     let state = Arc::new(Mutex::new(initial_state));
 
     // The stderr pump is replaced on every respawn. The handle keeps the
@@ -92,6 +93,8 @@ pub(crate) async fn start(cfg: SessionConfig) -> Result<TunnelHandle> {
         events_rx,
         full_name,
         cfg.subdomain,
+        port,
+        cfg.origin_request.clone(),
         task,
         stderr_slot,
         cfg.dispatch.clone(),

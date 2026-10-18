@@ -84,6 +84,53 @@ pub struct ConnectOptions {
     /// Pass an empty string to disable mirroring.
     #[napi(js_name = "githubProxy")]
     pub github_proxy: Option<String>,
+
+    /// Skip TLS verification when the origin is `https://` with a
+    /// self-signed certificate — the normal case for a local dev server.
+    /// Defaults to `false`.
+    #[napi(js_name = "noTlsVerify")]
+    pub no_tls_verify: Option<bool>,
+
+    /// Send this `Host` header to the origin instead of the public
+    /// hostname. Needed when the local service routes on its own host.
+    #[napi(js_name = "originHostHeader")]
+    pub origin_host_header: Option<String>,
+
+    /// Reconnection budget used when `autoRestart` is enabled.
+    /// Defaults to 5 attempts with a 500 ms doubling backoff.
+    #[napi(js_name = "restartPolicy")]
+    pub restart_policy: Option<RestartPolicyOptions>,
+}
+
+/// Reconnection budget for `autoRestart`.
+#[napi(object)]
+pub struct RestartPolicyOptions {
+    /// Consecutive bootstrap failures tolerated before giving up.
+    pub max_attempts: Option<u32>,
+    /// Delay before the first retry, in milliseconds.
+    #[napi(js_name = "baseDelayMs")]
+    pub base_delay_ms: Option<u32>,
+    /// Ceiling on any single retry delay, in milliseconds.
+    #[napi(js_name = "maxDelayMs")]
+    pub max_delay_ms: Option<u32>,
+}
+
+impl RestartPolicyOptions {
+    /// Merges the JS-supplied subset over the defaults.
+    fn resolve(&self) -> cloudpipe_sdk::RestartPolicy {
+        let default = cloudpipe_sdk::RestartPolicy::default();
+        cloudpipe_sdk::RestartPolicy {
+            max_attempts: self.max_attempts.unwrap_or(default.max_attempts),
+            base_delay: self
+                .base_delay_ms
+                .map(|ms| std::time::Duration::from_millis(ms.into()))
+                .unwrap_or(default.base_delay),
+            max_delay: self
+                .max_delay_ms
+                .map(|ms| std::time::Duration::from_millis(ms.into()))
+                .unwrap_or(default.max_delay),
+        }
+    }
 }
 
 /// Opens a new tunnel and returns a handle to it.
@@ -148,6 +195,7 @@ pub fn error_codes() -> Vec<String> {
         CloudpipeErrorCode::SubdomainInUse,
         CloudpipeErrorCode::AlreadyShutDown,
         CloudpipeErrorCode::Io,
+        CloudpipeErrorCode::InvalidArgument,
         CloudpipeErrorCode::Other,
     ]
     .iter()

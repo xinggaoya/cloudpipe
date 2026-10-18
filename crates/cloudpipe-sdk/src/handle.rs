@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio::task::JoinHandle;
 
+use crate::client::OriginRequest;
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::session::SessionState;
@@ -97,6 +98,10 @@ pub struct TunnelHandle {
     full_name: String,
     subdomain: String,
     events: broadcast::Receiver<Event>,
+    /// Mirrors `SessionState::port` so the getter needs no lock.
+    port: u16,
+    /// Origin tuning to re-publish on every `update_port`.
+    origin_request: Option<OriginRequest>,
     task: Option<JoinHandle<()>>,
     stderr_slot: Option<StderrSlot>,
     dispatch: crate::session::DispatchSlot,
@@ -122,6 +127,8 @@ impl TunnelHandle {
         events: broadcast::Receiver<Event>,
         full_name: String,
         subdomain: String,
+        port: u16,
+        origin_request: Option<OriginRequest>,
         task: JoinHandle<()>,
         stderr_slot: StderrSlot,
         dispatch: crate::session::DispatchSlot,
@@ -134,6 +141,8 @@ impl TunnelHandle {
             full_name,
             subdomain,
             events,
+            port,
+            origin_request,
             task: Some(task),
             stderr_slot: Some(stderr_slot),
             dispatch,
@@ -160,6 +169,66 @@ impl TunnelHandle {
     /// of any `on_event` closure registered on the builder.
     pub fn subscribe(&mut self) -> broadcast::Receiver<Event> {
         self.events.resubscribe()
+    }
+
+    /// The local port currently forwarded by the tunnel.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Whether the background session task has finished.
+    ///
+    /// With auto-restart enabled this only becomes `true` after
+    /// [`stop`](Self::stop) or after the retry budget is exhausted.
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| t.is_finished())
+    }
+
+    /// Re-points the tunnel at a different local port.
+    ///
+    /// The public hostname — and therefore any URL already shared — is
+    /// unchanged; only the local target moves. This rewrites the tunnel's
+    /// remote ingress configuration, so it takes effect without a restart
+    /// and without touching DNS.
+    ///
+    /// ```no_run
+    /// # use cloudpipe_sdk::{Protocol, TunnelBuilder};
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut handle = TunnelBuilder::new()
+    ///     .token(std::env::var("CLOUDFLARE_API_TOKEN")?)
+    ///     .domain("example.com")
+    ///     .protocol(Protocol::Http)
+    ///     .port(8080)
+    ///     .start()
+    ///     .await?;
+    /// assert_eq!(handle.port(), 8080);
+    /// handle.update_port(9090).await?;
+    /// assert_eq!(handle.port(), 9090);
+    /// # Ok(()) }
+    /// ```
+    pub async fn update_port(&mut self, port: u16) -> Result<()> {
+        if self.stopped {
+            return Err(Error::AlreadyShutDown);
+        }
+        if port == 0 {
+            return Err(Error::InvalidPort(port));
+        }
+        // Short lock: read the coordinates, then do the API write with no
+        // guard held.
+        let snapshot = { self.state.lock().await.clone() };
+        snapshot
+            .api
+            .set_tunnel_ingress(
+                &snapshot.account_id,
+                &snapshot.tunnel_id,
+                &snapshot.ingress_for_port(port, self.origin_request.as_ref()),
+            )
+            .await?;
+        // Commit only after Cloudflare accepted it, so a failed update
+        // leaves `port()` reporting what is actually live.
+        self.state.lock().await.port = port;
+        self.port = port;
+        Ok(())
     }
 
     /// Blocks until the user-initiated shutdown completes.

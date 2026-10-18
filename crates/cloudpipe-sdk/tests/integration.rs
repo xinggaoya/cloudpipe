@@ -39,6 +39,23 @@ struct MockState {
     fail_create_times: AtomicUsize,
     /// Set to make `POST .../dns_records` fail, for rollback tests.
     fail_dns_create: AtomicBool,
+    /// Last ingress configuration written per tunnel id.
+    ingress: Mutex<HashMap<String, Value>>,
+}
+
+impl MockState {
+    /// The service string the given tunnel's hostname rule points at.
+    fn service_for(&self, tunnel_id: &str) -> Option<String> {
+        let guard = self.ingress.lock().unwrap();
+        let rules = guard.get(tunnel_id)?;
+        rules
+            .as_array()?
+            .iter()
+            .find(|r| r.get("hostname").is_some_and(|h| h.as_str().is_some()))?
+            .get("service")?
+            .as_str()
+            .map(str::to_string)
+    }
 }
 
 impl MockState {
@@ -222,6 +239,20 @@ fn route(req: &Req, state: &MockState) -> (u16, Value) {
         }
 
         if req.method == "PUT" && req.path.contains("/cfd_tunnel/") {
+            let tid = req
+                .path
+                .split("/cfd_tunnel/")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or("")
+                .to_string();
+            let ingress = req
+                .body
+                .get("config")
+                .and_then(|c| c.get("ingress"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            state.ingress.lock().unwrap().insert(tid, ingress);
             return ok(Value::Null);
         }
 
@@ -964,6 +995,91 @@ async fn wait_is_passive_and_does_not_clean_up() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_port_republishes_ingress_and_keeps_the_url() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = write_fake_cloudflared(tmp.path(), None).await;
+
+    let mut handle = TunnelBuilder::new()
+        .api(api_for(&base))
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .protocol(Protocol::Http)
+        .port(8080)
+        .subdomain("moving")
+        .cloudflared_path(binary)
+        .start()
+        .await
+        .expect("start should succeed");
+
+    let tunnel_id = state.tunnels().values().next().cloned().unwrap();
+    assert_eq!(handle.port(), 8080);
+    assert_eq!(
+        state.service_for(&tunnel_id).as_deref(),
+        Some("http://localhost:8080")
+    );
+
+    handle
+        .update_port(9090)
+        .await
+        .expect("update_port should succeed");
+
+    // The public URL is unchanged — that is the entire point of
+    // update_port — and only the local origin moved.
+    assert_eq!(handle.url(), "https://moving.example.com");
+    assert_eq!(handle.port(), 9090);
+    assert_eq!(
+        state.service_for(&tunnel_id).as_deref(),
+        Some("http://localhost:9090")
+    );
+
+    // Nothing was recreated: still one tunnel, one DNS record.
+    assert_eq!(state.tunnel_creation_count.load(Ordering::SeqCst), 1);
+    assert_eq!(state.records().len(), 1);
+
+    assert!(
+        handle.update_port(0).await.is_err(),
+        "port 0 must be refused"
+    );
+
+    handle.stop().await.expect("stop should succeed");
+    assert!(
+        handle.update_port(3000).await.is_err(),
+        "a stopped handle must refuse updates"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preview_cleanup_changes_nothing() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let api = api_for(&base);
+
+    // A stale tunnel plus its DNS record is two resources, not three — the
+    // old count attributed 2 per tunnel.
+    state.tunnels().insert("dead".into(), "tun-dead".into());
+    state
+        .records()
+        .insert("dead.example.com".into(), "rec-dead".into());
+
+    let report = cloudpipe_sdk::preview_cleanup(&api, "acc-1", "zone-1", "example.com")
+        .await
+        .expect("preview should succeed");
+
+    assert!(
+        state.deleted_tunnels().is_empty(),
+        "a dry run must not delete anything"
+    );
+    assert!(
+        state.deleted_records().is_empty(),
+        "a dry run must not delete anything"
+    );
+    assert_eq!(report.removed.len(), 0);
+    assert_eq!(report.removed_count(), 0);
+}
+
 async fn dropping_the_handle_still_releases_cloudflare_resources() {
     let state = MockState::new();
     let base = spawn_mock_api(state.clone()).await;

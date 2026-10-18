@@ -34,6 +34,8 @@ pub enum CloudpipeErrorCode {
     AlreadyShutDown,
     /// Generic I/O failure (file, network, process spawn).
     Io,
+    /// An invalid argument was supplied (e.g. port 0).
+    InvalidArgument,
     /// Anything else — surfaces the SDK's underlying message.
     Other,
 }
@@ -49,6 +51,7 @@ impl CloudpipeErrorCode {
             Self::SubdomainInUse => "SUBDOMAIN_IN_USE",
             Self::AlreadyShutDown => "ALREADY_SHUT_DOWN",
             Self::Io => "IO",
+            Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::Other => "OTHER",
         }
     }
@@ -104,6 +107,7 @@ pub fn classify(
         E::SubdomainInUse(_) => (CloudpipeErrorCode::SubdomainInUse, None),
         E::AlreadyShutDown => (CloudpipeErrorCode::AlreadyShutDown, None),
         E::Io(_) => (CloudpipeErrorCode::Io, None),
+        E::InvalidPort(_) => (CloudpipeErrorCode::InvalidArgument, None),
         E::Join(_) | E::Other(_) => (CloudpipeErrorCode::Other, None),
     }
 }
@@ -168,6 +172,7 @@ mod tests {
             "ALREADY_SHUT_DOWN"
         );
         assert_eq!(CloudpipeErrorCode::Io.as_str(), "IO");
+        assert_eq!(CloudpipeErrorCode::InvalidArgument.as_str(), "INVALID_ARGUMENT");
         assert_eq!(CloudpipeErrorCode::Other.as_str(), "OTHER");
     }
 

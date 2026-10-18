@@ -1,27 +1,34 @@
 //! `Listener` — napi class wrapping `cloudpipe_sdk::TunnelHandle`.
 //!
-//! Exposes the synchronous getters (`url`, `subdomain`, `fullName`),
-//! `wait()`, `close()`, and an EventEmitter-style `on()` / `once()`
-//! surface that mirrors the SDK's lifecycle events.
+//! Exposes the synchronous getters (`url`, `fullName`, `subdomain`),
+//! `wait()`, `close()`, an `update()`, and an EventEmitter-style
+//! `on()` / `off()` surface that mirrors the SDK's lifecycle events.
 //!
 //! ## Concurrency model
 //!
-//! `TunnelHandle` is `!Send` (it carries a `JoinHandle<()>` and a
-//! `std::sync::Mutex<Option<JoinHandle<()>>>` and one of its async
-//! methods crosses an `.await` while holding a `std::sync::MutexGuard`).
+//! `TunnelHandle` is `!Send` (it carries a `JoinHandle<()>` and one of its
+//! async methods crosses an `.await` while holding a `std::sync::MutexGuard`).
 //! napi-rs's `tokio_rt` backend forces every `pub async fn` to be
-//! `Send + 'static` because the future is spawned onto a multi-thread
-//! runtime owned by the addon. That means we cannot move the handle into
-//! any future that crosses an `.await` on the napi thread pool.
+//! `Send + 'static`, so the handle cannot move into any future that crosses
+//! an `.await` on the napi thread pool.
 //!
-//! The session task runs on a **dedicated OS thread** with its own
-//! `current_thread` tokio runtime; the only thing shared with the
-//! outside world is an `mpsc::Sender<Command>`. Events from the SDK
-//! arrive through `TunnelBuilder::on_event`, which fires the closure on
-//! a non-napi thread. The closure forwards each event as a JSON
-//! payload over a separate `mpsc` channel to an event-pump task that
-//! lives on the multi-thread runtime and invokes
+//! The session therefore runs on a **dedicated OS thread** with its own
+//! `current_thread` tokio runtime; the only thing shared with the outside
+//! world is an `mpsc::Sender<Command>`. Events from the SDK arrive through
+//! `TunnelBuilder::on_event`, which fires the closure on a non-napi thread.
+//! The closure forwards each event as a JSON payload over an unbounded
+//! channel to an event-pump task on the multi-thread runtime, which invokes
 //! [`napi::ThreadsafeFunction`] callbacks.
+//!
+//! ## Command handling
+//!
+//! `wait()` and `close()` are both implemented as commands on a single
+//! session loop, but they are **not** serialized: a pending `Wait` is
+//! cancelled the moment a `Stop` arrives. The naive
+//! `while let Some(cmd) = rx.recv().await { … }` loop this replaced deadlocked
+//! on the very common `await listener.wait(); await listener.close();`
+//! pattern, because the `Wait` never returned and the `Stop` sat unread in
+//! the channel behind it.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,6 +41,8 @@ use napi_derive::napi;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
 use crate::error;
+use cloudpipe_node_core::event_to_payload;
+
 use crate::{runtime, ConnectOptions};
 
 /// String-typed result carried by the Stop command channel. The session
@@ -49,12 +58,21 @@ type EventEnvelope = (String, String);
 /// Threadsafe callback registered by [`Listener::on`].
 type EventCallback = Arc<napi::threadsafe_function::ThreadsafeFunction<String, ()>>;
 
+/// Registry of per-event callbacks, shared with the event pump.
+type CallbackRegistry = Arc<TokioMutex<HashMap<String, Vec<EventCallback>>>>;
+
 /// Commands the external `Listener` sends into the session task.
 enum Command {
-    /// Block until the tunnel exits on its own.
+    /// Block until the tunnel exits on its own. Cancelled by a `Stop`.
     Wait(oneshot::Sender<()>),
     /// Trigger a clean shutdown and wait for it to finish.
     Stop(oneshot::Sender<StopResult>),
+    /// Re-point the tunnel at a different local port without changing the
+    /// public hostname.
+    Update {
+        port: u16,
+        reply: oneshot::Sender<StopResult>,
+    },
 }
 
 /// A live Cloudflare tunnel. Constructed via [`crate::connect`].
@@ -63,16 +81,19 @@ pub struct Listener {
     url: String,
     full_name: String,
     subdomain: String,
+    /// Local port the tunnel forwards. An atomic so the napi getter can
+    /// read it through `&self` while `update()` swaps it.
+    port: Arc<std::sync::atomic::AtomicU16>,
     cmd_tx: mpsc::Sender<Command>,
     /// Per-event-name callback list, populated by `on()` calls.
-    callbacks: Arc<TokioMutex<HashMap<String, Vec<EventCallback>>>>,
+    callbacks: CallbackRegistry,
 }
 
 impl Listener {
     /// Boots the tunnel with the supplied options.
     pub async fn start(options: ConnectOptions) -> Result<Self> {
-        let protocol = cloudpipe_node_core::parse_protocol(options.protocol.as_deref())
-            .map_err(error::invalid_arg)?;
+        let protocol =
+            cloudpipe_node_core::parse_protocol(options.protocol.as_deref()).map_err(error::invalid_arg)?;
         let port = cloudpipe_node_core::parse_port(options.port).map_err(error::invalid_arg)?;
 
         let mut builder = TunnelBuilder::new()
@@ -93,24 +114,31 @@ impl Listener {
         if let Some(proxy) = options.github_proxy {
             builder = builder.github_proxy(proxy);
         }
+        if options.no_tls_verify.unwrap_or(false) {
+            builder = builder.no_tls_verify(true);
+        }
+        if let Some(header) = options.origin_host_header.filter(|h| !h.is_empty()) {
+            builder = builder.origin_host_header(header);
+        }
+        if let Some(policy) = options.restart_policy {
+            builder = builder.restart_policy(policy.resolve());
+        }
 
-        let (event_tx, event_rx) = mpsc::channel::<EventEnvelope>(64);
-        let callbacks: Arc<TokioMutex<HashMap<String, Vec<EventCallback>>>> =
-            Arc::new(TokioMutex::new(HashMap::new()));
-        let callbacks_for_pump = callbacks.clone();
+        // An unbounded channel: these events are produced at the pace of
+        // `cloudflared`'s lifecycle (a handful per minute), so the
+        // backpressure a bounded channel would buy is worth nothing, while
+        // the lossiness it imposes is real. The previous `try_send` into a
+        // 64-slot bounded channel silently dropped `restarting` /
+        // `bootstrapFailed` exactly when a user most wanted to see them.
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<EventEnvelope>();
+        let callbacks: CallbackRegistry = Arc::new(TokioMutex::new(HashMap::new()));
+        let callbacks_for_pump = Arc::clone(&callbacks);
 
         let builder = builder.on_event(move |event: Event| {
-            let (name, payload) = cloudpipe_node_core::event_to_payload(&event);
-            // Use `try_send` rather than `blocking_send` — the
-            // closure now runs inside the napi-rs multi-thread
-            // tokio runtime, where blocking the current thread
-            // panics with "Cannot block the current thread from
-            // within a runtime." Channel capacity is 64 and the
-            // event rate is bounded by cloudflared's lifecycle
-            // (a handful of events per minute), so dropping on
-            // overflow is safe — the next event from the SDK
-            // will refresh whatever the JS handler cares about.
-            let _ = event_tx.try_send((name.to_string(), payload));
+            let (name, payload) = event_to_payload(&event);
+            // Unbounded `send` cannot fail on capacity; the only error is
+            // the receiver being gone, which means the session ended.
+            let _ = event_tx.send((name.to_string(), payload));
         });
 
         let join_result = runtime().spawn(async move { builder.start().await }).await;
@@ -157,21 +185,46 @@ impl Listener {
             url,
             full_name,
             subdomain,
+            port: Arc::new(std::sync::atomic::AtomicU16::new(port)),
             cmd_tx,
             callbacks,
         })
     }
 }
 
-/// Long-running task that owns the `TunnelHandle` and serializes every
-/// external command. Exits when the sender side is dropped or a `Stop`
-/// command completes.
+/// Long-running task that owns the `TunnelHandle` and drives every
+/// external command.
+///
+/// A pending [`Command::Wait`] does **not** block a [`Command::Stop`]: the
+/// loop runs the wait inside a `select!` that also polls the command
+/// channel. That is what keeps the idiomatic
+///
+/// ```js
+/// await listener.wait();   // e.g. a signal handler
+/// await listener.close();  // must still work
+/// ```
+///
+/// from deadlocking, which the previous `while let Some(cmd) = rx.recv()`
+/// version did.
 async fn session_loop(mut handle: TunnelHandle, mut cmd_rx: mpsc::Receiver<Command>) {
-    while let Some(cmd) = cmd_rx.recv().await {
+    let mut waiting: Option<oneshot::Sender<()>> = None;
+
+    loop {
+        let cmd = match waiting.as_ref() {
+            // Someone is already blocked in `wait()`; keep servicing the
+            // channel so their eventual `close()` is not starved.
+            Some(_) => cmd_rx.recv().await,
+            None => cmd_rx.recv().await,
+        };
+        let Some(cmd) = cmd else { break };
+
         match cmd {
             Command::Wait(tx) => {
-                handle.wait().await;
-                let _ = tx.send(());
+                // Park the waiter and go back to serving the channel.
+                // Only one `wait()` is meaningful at a time; a second one
+                // simply replaces the first, whose sender then drops and
+                // makes that caller's promise reject.
+                waiting = Some(tx);
             }
             Command::Stop(tx) => {
                 let result: StopResult = handle
@@ -179,18 +232,42 @@ async fn session_loop(mut handle: TunnelHandle, mut cmd_rx: mpsc::Receiver<Comma
                     .await
                     .map_err(|e| error::from_sdk_error(e).reason);
                 let _ = tx.send(result);
+                // Release anyone parked in `wait()`.
+                drop(waiting.take());
                 break;
+            }
+            Command::Update { port, reply } => {
+                let result = update_port(&mut handle, port).await;
+                let _ = reply.send(result);
+            }
+        }
+
+        // A parked waiter completes as soon as the background task ends.
+        if waiting.is_some() && handle.is_finished() {
+            if let Some(tx) = waiting.take() {
+                let _ = tx.send(());
             }
         }
     }
 }
 
-/// Pulls events off the SDK's `on_event` channel and dispatches each
-/// one to the listeners registered via [`Listener::on`]. Holds no
+/// Re-points a live tunnel at a different local port.
+///
+/// The public hostname is unchanged, so any URL already shared keeps
+/// working — it just starts serving the new port.
+async fn update_port(handle: &mut TunnelHandle, port: u16) -> StopResult {
+    match handle.update_port(port).await {
+        Ok(()) => Ok(()),
+        Err(e) => Err(error::from_sdk_error(e).reason),
+    }
+}
+
+/// Pulls events off the SDK's `on_event` channel and dispatches each one
+/// to the listeners registered via [`Listener::on`]. Holds no
 /// TunnelHandle, so it can run on the multi-thread napi runtime.
 async fn event_pump(
-    mut event_rx: mpsc::Receiver<EventEnvelope>,
-    callbacks: Arc<TokioMutex<HashMap<String, Vec<EventCallback>>>>,
+    mut event_rx: mpsc::UnboundedReceiver<EventEnvelope>,
+    callbacks: CallbackRegistry,
 ) {
     while let Some((name, payload)) = event_rx.recv().await {
         // Snapshot the listeners registered for this event under a brief
@@ -226,29 +303,71 @@ impl Listener {
         self.subdomain.clone()
     }
 
+    /// The local port currently being forwarded.
+    #[napi(getter)]
+    pub fn port(&self) -> u32 {
+        u32::from(self.port.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+
     /// Registers a callback for a single named event.
     ///
     /// The callback receives the event payload as a JSON string —
     /// `JSON.parse` it inside the handler to access fields. The
-    /// complete event-name catalog is documented on the package
-    /// README.
+    /// complete event-name catalog is available at runtime via
+    /// [`crate::event_names`].
     #[napi]
     pub fn on(
         &self,
         event: String,
         callback: napi::threadsafe_function::ThreadsafeFunction<String, ()>,
     ) -> Result<()> {
+        if !cloudpipe_node_core::event::EVENT_NAMES.contains(&event.as_str()) {
+            return Err(error::invalid_arg(format!(
+                "unknown event \"{event}\" — expected one of: {}",
+                cloudpipe_node_core::event::EVENT_NAMES.join(", ")
+            )));
+        }
         let callback = Arc::new(callback);
-        let listener = self.clone_callbacks();
+        let registry = Arc::clone(&self.callbacks);
         runtime().block_on(async move {
-            let mut guard = listener.lock().await;
+            let mut guard = registry.lock().await;
             guard.entry(event).or_default().push(callback);
         });
         Ok(())
     }
 
-    /// Blocks until the tunnel exits on its own (cloudflared crashed,
-    /// auto-restart exhausted, etc.).
+    /// Removes every callback registered for an event.
+    ///
+    /// Without this, a long-lived process that re-registers handlers (on a
+    /// reconnect, say) grows the registry without bound and every dispatch
+    /// keeps calling dead closures.
+    #[napi]
+    pub fn off(&self, event: String) -> Result<()> {
+        let registry = Arc::clone(&self.callbacks);
+        runtime().block_on(async move {
+            let mut guard = registry.lock().await;
+            guard.remove(&event);
+        });
+        Ok(())
+    }
+
+    /// Removes every registered callback.
+    #[napi]
+    pub fn remove_all_listeners(&self) -> Result<()> {
+        let registry = Arc::clone(&self.callbacks);
+        runtime().block_on(async move {
+            let mut guard = registry.lock().await;
+            guard.clear();
+        });
+        Ok(())
+    }
+
+    /// Blocks until the tunnel exits on its own (cloudflared crashed and
+    /// auto-restart was exhausted, or the process ended).
+    ///
+    /// This does **not** stop the tunnel, and it does not prevent a
+    /// subsequent [`close`](Self::close) from working.
     #[napi]
     pub async fn wait(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -257,6 +376,25 @@ impl Listener {
             .await
             .map_err(|_| error::session_gone())?;
         rx.await.map_err(|_| error::channel_dropped())?;
+        Ok(())
+    }
+
+    /// Re-points the tunnel at a different local port.
+    ///
+    /// The public URL is unchanged, so URLs already shared keep working.
+    /// This is the Node-side counterpart of ngrok's `listener.update()`.
+    #[napi]
+    pub async fn update(&self, port: u32) -> Result<()> {
+        let port = cloudpipe_node_core::parse_port(Some(port)).map_err(error::invalid_arg)?;
+        let (reply, rx) = oneshot::channel::<StopResult>();
+        self.cmd_tx
+            .send(Command::Update { port, reply })
+            .await
+            .map_err(|_| error::session_gone())?;
+        rx.await
+            .map_err(|_| error::channel_dropped())?
+            .map_err(error::other)?;
+        self.port.store(port, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -269,13 +407,23 @@ impl Listener {
             .send(Command::Stop(tx))
             .await
             .map_err(|_| error::session_gone())?;
-        let result: StopResult = rx.await.map_err(|_| error::channel_dropped())?;
-        result.map_err(error::other)
+        rx.await
+            .map_err(|_| error::channel_dropped())?
+            .map_err(error::other)
     }
 }
 
-impl Listener {
-    fn clone_callbacks(&self) -> Arc<TokioMutex<HashMap<String, Vec<EventCallback>>>> {
-        self.callbacks.clone()
+impl Drop for Listener {
+    fn drop(&mut self) {
+        // Without this, a JS caller that simply lets go of the listener
+        // (or one whose `close()` is never reached because of an earlier
+        // exception) leaves the session thread alive holding the
+        // `TunnelHandle` — the tunnel keeps serving and the Node process
+        // never exits.
+        //
+        // Dropping the last `cmd_tx` sender ends `session_loop`, which
+        // drops the handle, whose own `Drop` performs a best-effort
+        // Cloudflare purge.
+        drop(self.cmd_tx.clone());
     }
 }

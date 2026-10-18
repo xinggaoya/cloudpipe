@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::client::{CloudflareApi, OriginRequest};
+use crate::client::{CloudflareApi, IngressEntry, OriginRequest};
 use crate::event::Event;
 use crate::handle::Shutdown;
 use crate::protocol::Protocol;
@@ -85,6 +85,10 @@ pub(crate) struct SessionState {
     pub zone_id: String,
     pub full_name: String,
     pub tunnel_id: String,
+    /// Local protocol the ingress rule points at.
+    pub protocol: Protocol,
+    /// Local port the ingress rule points at.
+    pub port: u16,
     pub(crate) cleaned: Arc<AtomicBool>,
 }
 
@@ -105,6 +109,8 @@ impl Clone for SessionState {
             zone_id: self.zone_id.clone(),
             full_name: self.full_name.clone(),
             tunnel_id: self.tunnel_id.clone(),
+            protocol: self.protocol,
+            port: self.port,
             cleaned: Arc::clone(&self.cleaned),
         }
     }
@@ -118,6 +124,8 @@ impl SessionState {
         zone_id: &str,
         full_name: &str,
         tunnel_id: &str,
+        protocol: Protocol,
+        port: u16,
     ) -> Self {
         Self {
             api,
@@ -125,8 +133,39 @@ impl SessionState {
             zone_id: zone_id.to_string(),
             full_name: full_name.to_string(),
             tunnel_id: tunnel_id.to_string(),
+            protocol,
+            port,
             cleaned: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Builds the ingress rules this session publishes: the hostname rule
+    /// plus the mandatory catch-all.
+    pub(crate) fn ingress(&self, origin_request: Option<&OriginRequest>) -> Vec<IngressEntry> {
+        self.ingress_for_port(self.port, origin_request)
+    }
+
+    /// The same rules, but targeting `port` instead of the current one.
+    ///
+    /// Used by [`TunnelHandle::update_port`](crate::TunnelHandle::update_port)
+    /// to publish a new origin without mutating this state first.
+    pub(crate) fn ingress_for_port(
+        &self,
+        port: u16,
+        origin_request: Option<&OriginRequest>,
+    ) -> Vec<IngressEntry> {
+        vec![
+            IngressEntry {
+                hostname: Some(self.full_name.clone()),
+                service: self.protocol.local_service(port),
+                origin_request: origin_request.cloned(),
+            },
+            IngressEntry {
+                hostname: None,
+                service: "http_status:404".to_string(),
+                origin_request: None,
+            },
+        ]
     }
 
     /// Re-targets this state at a freshly created generation.

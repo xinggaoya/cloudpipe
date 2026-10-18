@@ -15,7 +15,6 @@ use tracing::warn;
 
 use crate::binary::{self, LineKind};
 use crate::client::CloudflareApi;
-use crate::client::IngressEntry;
 use crate::error::{Error, Result};
 use crate::event::{Event, LogLevel};
 use crate::handle::StderrSlot;
@@ -147,20 +146,21 @@ async fn inner(
         ))
     })?;
 
-    let ingress = vec![
-        IngressEntry {
-            hostname: Some(full_name.to_string()),
-            service: cfg.protocol.local_service(cfg.port),
-            origin_request: cfg.origin_request.clone(),
-        },
-        IngressEntry {
-            hostname: None,
-            service: "http_status:404".to_string(),
-            origin_request: None,
-        },
-    ];
+    let state = SessionState::new(
+        cfg.api.clone(),
+        &cfg.account_id,
+        &cfg.zone_id,
+        full_name,
+        &tunnel.id,
+        cfg.protocol,
+        cfg.port,
+    );
     cfg.api
-        .set_tunnel_ingress(&cfg.account_id, &tunnel.id, &ingress)
+        .set_tunnel_ingress(
+            &cfg.account_id,
+            &tunnel.id,
+            &state.ingress(cfg.origin_request.as_ref()),
+        )
         .await?;
     if is_initial {
         emit(
@@ -235,13 +235,7 @@ async fn inner(
     });
 
     Ok(Bootstrap {
-        state: SessionState::new(
-            cfg.api.clone(),
-            &cfg.account_id,
-            &cfg.zone_id,
-            full_name,
-            &tunnel.id,
-        ),
+        state,
         child,
         stderr_task,
     })

@@ -42,6 +42,11 @@ pub enum Error {
     #[error("tunnel already shut down")]
     AlreadyShutDown,
 
+    /// An invalid local port (only `0` is rejected today; `u16` has already
+    /// done the range checking).
+    #[error("invalid local port: {0}")]
+    InvalidPort(u16),
+
     /// The background session task panicked.
     #[error("background task panicked: {0}")]
     Join(#[from] tokio::task::JoinError),

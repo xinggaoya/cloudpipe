@@ -36,12 +36,18 @@ pub fn extract_code(message: &str) -> Option<String> {
         "SUBDOMAIN_IN_USE" => CloudpipeErrorCode::SubdomainInUse,
         "ALREADY_SHUT_DOWN" => CloudpipeErrorCode::AlreadyShutDown,
         "IO" => CloudpipeErrorCode::Io,
+        "INVALID_ARGUMENT" => CloudpipeErrorCode::InvalidArgument,
         "OTHER" => CloudpipeErrorCode::Other,
-        // Unknown parent — fall through and return the raw text. We
-        // deliberately don't fail so forward-compat works both ways:
-        // a newer SDK emitting an unknown parent gives an older JS helper
-        // a string back, not an exception.
-        _ => return Some(parent.to_string()),
+        // Unknown parent — return the raw text verbatim, sub-kind included.
+        // We deliberately don't fail so forward-compat works both ways: a
+        // newer SDK emitting an unknown code gives an older JS helper the
+        // whole string back, not an exception and not a truncated prefix.
+        _ => {
+            return Some(match parts.next() {
+                Some(suffix) => format!("{parent}:{suffix}"),
+                None => parent.to_string(),
+            })
+        }
     };
     // Anchors the typed match above so the compiler flags a rename.
     let _ = parent_code;
@@ -134,6 +140,7 @@ mod tests {
             "[SUBDOMAIN_IN_USE] x",
             "[ALREADY_SHUT_DOWN] x",
             "[IO] x",
+            "[INVALID_ARGUMENT] x",
             "[OTHER] x",
         ];
         for input in codes {
