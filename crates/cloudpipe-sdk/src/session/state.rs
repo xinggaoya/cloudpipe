@@ -155,16 +155,12 @@ impl SessionState {
         origin_request: Option<&OriginRequest>,
     ) -> Vec<IngressEntry> {
         vec![
-            IngressEntry {
-                hostname: Some(self.full_name.clone()),
-                service: self.protocol.local_service(port),
-                origin_request: origin_request.cloned(),
-            },
-            IngressEntry {
-                hostname: None,
-                service: "http_status:404".to_string(),
-                origin_request: None,
-            },
+            IngressEntry::hostname(
+                self.full_name.clone(),
+                self.protocol.local_service(port),
+                origin_request.cloned(),
+            ),
+            IngressEntry::catch_all(),
         ]
     }
 

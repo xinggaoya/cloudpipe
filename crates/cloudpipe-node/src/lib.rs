@@ -192,6 +192,7 @@ pub fn error_codes() -> Vec<String> {
         CloudpipeErrorCode::CloudflareApi,
         CloudpipeErrorCode::CloudflaredBinary,
         CloudpipeErrorCode::InvalidSubdomain,
+        CloudpipeErrorCode::InvalidDomain,
         CloudpipeErrorCode::SubdomainInUse,
         CloudpipeErrorCode::AlreadyShutDown,
         CloudpipeErrorCode::Io,

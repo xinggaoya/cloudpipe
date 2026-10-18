@@ -5,6 +5,8 @@ mod config;
 mod logging;
 mod ui;
 
+use std::cell::OnceCell;
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
@@ -31,29 +33,87 @@ fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    // One context per invocation: the config store, the parsed config, and
+    // a lazily-built API client. Previously each handler repeated the
+    // same "open store → load → maybe bail on a missing token" sequence,
+    // and `run_tunnel_command` did not even share the token check the
+    // other three used — so the same failure produced two different
+    // messages depending on which command hit it.
+    let ctx = Ctx::load()?;
     match cli.command {
-        Some(Command::Key { token, clear }) => handle_key(token, clear).await,
-        Some(Command::Domain { domain }) => handle_domain(domain).await,
-        Some(Command::Domains) => handle_domains().await,
-        Some(Command::Cleanup(args)) => handle_cleanup(args).await,
-        None => run_tunnel_command(cli.to_tunnel_args()?).await,
+        Some(Command::Key { token, clear }) => handle_key(&ctx, token, clear).await,
+        Some(Command::Domain { domain }) => handle_domain(&ctx, domain).await,
+        Some(Command::Domains) => handle_domains(&ctx).await,
+        Some(Command::Cleanup(args)) => handle_cleanup(&ctx, args).await,
+        None => run_tunnel_command(&ctx, cli.to_tunnel_args()?).await,
     }
 }
 
-async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
-    let store = ConfigStore::default()?;
-    let config = store.load();
-    let Some(token) = config.effective_token() else {
+/// Everything a command needs from disk and the environment.
+struct Ctx {
+    store: ConfigStore,
+    config: Config,
+    /// Cached so a handler that makes several API calls reuses one client
+    /// (and therefore one connection pool).
+    api: OnceCell<CloudflareApi>,
+}
+
+impl Ctx {
+    /// Opens the config store and reads the current config.
+    fn load() -> Result<Self> {
+        let store = ConfigStore::default()?;
+        let config = store.load();
+        Ok(Self {
+            store,
+            config,
+            api: OnceCell::new(),
+        })
+    }
+
+    /// The effective token, with the standard "run `cfp key` first" help.
+    fn token(&self) -> Result<String> {
+        self.config.effective_token().ok_or_else(|| {
+            anyhow!("no Cloudflare API token configured — run `cfp key <token>` first")
+        })
+    }
+
+    /// An API client for the effective token.
+    ///
+    /// The same message for every command: previously three handlers said
+    /// "no token configured" and a fourth said "no Cloudflare API token
+    /// configured", so the advice a user saw depended on the command.
+    fn api(&self) -> Result<&CloudflareApi> {
+        if let Some(api) = self.api.get() {
+            return Ok(api);
+        }
+        let api = CloudflareApi::new(self.token()?).map_err(anyhow::Error::msg)?;
+        let _ = self.api.set(api);
+        self.api
+            .get()
+            .ok_or_else(|| anyhow!("could not initialise the Cloudflare client"))
+    }
+
+    /// The account/zone/domain trio, for commands that operate on one zone.
+    fn zone(&self) -> Result<config::TunnelContext> {
+        self.config.require_tunnel_context()
+    }
+}
+
+async fn run_tunnel_command(ctx: &Ctx, args: TunnelArgs) -> Result<()> {
+    if ctx.config.effective_token().is_none() {
+        // Starting a tunnel is the one command where the missing token is
+        // worth a setup walkthrough rather than a one-liner.
         ui::no_token_guide();
         bail!("no Cloudflare API token configured");
-    };
-    let ctx = config.require_tunnel_context()?;
+    }
+    let zone = ctx.zone()?;
+    let token = ctx.token()?;
 
     let mut builder = TunnelBuilder::new()
         .token(token)
-        .account(ctx.account_id)
-        .zone(ctx.zone_id)
-        .domain(ctx.domain)
+        .account(zone.account_id)
+        .zone(zone.zone_id)
+        .domain(zone.domain)
         .protocol(args.protocol)
         .port(args.port)
         .subdomain(args.subdomain.unwrap_or_default())
@@ -104,20 +164,19 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
     Ok(())
 }
 
-async fn handle_key(token: Option<String>, clear: bool) -> Result<()> {
-    let store = ConfigStore::default()?;
-    let mut config = store.load();
-
+async fn handle_key(ctx: &Ctx, token: Option<String>, clear: bool) -> Result<()> {
     if clear {
         let cleared = Config::new_empty();
-        store.save(&cleared)?;
+        ctx.store.save(&cleared)?;
         ui::success("All credentials cleared.");
         ui::key_status(&cleared);
         return Ok(());
     }
 
     let Some(token) = token else {
-        ui::key_status(&config);
+        // Bare `cfp key` shows the current status, so a missing token is
+        // the documented outcome here rather than an error.
+        ui::key_status(&ctx.config);
         return Ok(());
     };
 
@@ -131,21 +190,27 @@ async fn handle_key(token: Option<String>, clear: bool) -> Result<()> {
     let status = api
         .verify_token()
         .await
-        .map_err(anyhow::Error::msg)
-        .context("verifying token (check the value, network, or permissions)")?;
+        .map_err(ui::render_sdk_error)
+        .context("verifying token — check the value, your network, and the token's permissions")?;
     ui::success(&format!("Token verified (status: {}).", status.status));
 
-    let zones = api.list_zones().await.map_err(anyhow::Error::msg).context(
-        "listing accessible zones — make sure the token has Zone:Read on at least one zone",
-    )?;
+    let zones = api
+        .list_zones()
+        .await
+        .map_err(ui::render_sdk_error)
+        .with_context(|| {
+            "listing accessible zones — make sure the token has Zone:Read on at least one zone"
+        })?;
 
     if zones.is_empty() {
         bail!("token is valid but has access to no zones — add a Zone:Read resource to the token");
     }
 
+    let mut config = ctx.config.clone();
     config.apply_zone(&zones[0])?;
     config.token = Some(trimmed.to_string());
-    store.save(&config)?;
+    ctx.store.save(&config)?;
+
     if zones.len() == 1 {
         ui::success(&format!(
             "Saved. Tunnels will be exposed under {}.",
@@ -163,54 +228,45 @@ async fn handle_key(token: Option<String>, clear: bool) -> Result<()> {
     Ok(())
 }
 
-async fn handle_domain(domain: String) -> Result<()> {
-    let store = ConfigStore::default()?;
-    let mut config = store.load();
-    let api = load_api(&config)?;
-    let zone = api
+async fn handle_domain(ctx: &Ctx, domain: String) -> Result<()> {
+    let zone = ctx
+        .api()?
         .find_zone(&domain)
         .await
-        .map_err(anyhow::Error::msg)
+        .map_err(ui::render_sdk_error)
         .with_context(|| format!("looking up zone \"{domain}\""))?
-        .ok_or_else(|| anyhow!("zone \"{domain}\" is not accessible with the saved token"))?;
+        .ok_or_else(|| {
+            anyhow!("zone \"{domain}\" is not accessible with the saved token — run `cfp domains` to list what you can reach")
+        })?;
 
+    let mut config = ctx.config.clone();
     config.apply_zone(&zone)?;
-    store.save(&config)?;
+    ctx.store.save(&config)?;
     ui::success(&format!("Switched to {domain}."));
     Ok(())
 }
 
-async fn handle_domains() -> Result<()> {
-    let store = ConfigStore::default()?;
-    let config = store.load();
-    let api = load_api(&config)?;
-    let zones = api.list_zones().await.map_err(anyhow::Error::msg)?;
-    ui::zones(&zones, config.domain.as_deref());
+async fn handle_domains(ctx: &Ctx) -> Result<()> {
+    let zones = ctx
+        .api()?
+        .list_zones()
+        .await
+        .map_err(ui::render_sdk_error)?;
+    ui::zones(&zones, ctx.config.domain.as_deref());
     Ok(())
 }
 
-async fn handle_cleanup(args: CleanupArgs) -> Result<()> {
-    let store = ConfigStore::default()?;
-    let config = store.load();
-    let ctx = config.require_tunnel_context()?;
-    let api = load_api(&config)?;
+async fn handle_cleanup(ctx: &Ctx, args: CleanupArgs) -> Result<()> {
+    let zone = ctx.zone()?;
+    let api = ctx.api()?;
 
     let report = if args.dry_run {
-        cloudpipe_sdk::preview_cleanup(&api, &ctx.account_id, &ctx.zone_id, &ctx.domain).await
+        cloudpipe_sdk::preview_cleanup(api, &zone.account_id, &zone.zone_id, &zone.domain).await
     } else {
-        cloudpipe_sdk::cleanup_with_report(&api, &ctx.account_id, &ctx.zone_id, &ctx.domain).await
+        cloudpipe_sdk::cleanup_with_report(api, &zone.account_id, &zone.zone_id, &zone.domain).await
     }
     .map_err(ui::render_sdk_error)?;
 
     ui::cleanup_summary(&report, args.dry_run, args.json);
     Ok(())
-}
-
-/// Builds an API client from the effective token, reporting the standard
-/// "run `cfp key` first" guidance when none is configured.
-fn load_api(config: &Config) -> Result<CloudflareApi> {
-    let token = config
-        .effective_token()
-        .ok_or_else(|| anyhow!("no token configured — run `cfp key <token>` first"))?;
-    CloudflareApi::new(token).map_err(anyhow::Error::msg)
 }

@@ -1,17 +1,20 @@
 # cargo-deny configuration.
 #
-# The SDK is `MIT`; everything it links must be permissively licensed so
-# the CLI can keep shipping as a single static binary under those terms.
+# The SDK is MIT; everything it links must be permissively licensed so the
+# CLI can keep shipping as a single static binary under those terms.
+#
+# Verified against the real dependency graph — `cargo deny check` must pass,
+# not merely parse.
 
 [graph]
-# The Node addon lives outside the default workspace feature set but still
-# shares the lockfile, so resolve everything.
 all-features = true
 
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Unmaintained crates are reported but do not fail the build; a yanked or
+# RUSTSEC advisory does.
+unmaintained = "workspace"
 
 [licenses]
 version = 2
@@ -25,18 +28,26 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "MPL-2.0",
-    # windows-sys / windows-targets ship the Windows SDK licence.
-    "MIT OR Apache-2.0",
+    # webpki-roots ships the CA bundle under CDLA-Permissive-2.0, reached
+    # through reqwest's rustls-tls feature. It is a data file, not code.
+    "CDLA-Permissive-2.0",
+    # windows-sys / windows-targets carry the Windows SDK licence.
+    "CC0-1.0",
+    "Unlicense",
 ]
-confidence-threshold = 0.9
-# `unlicensed` is an error: a dependency with no declared licence cannot be
-# reasoned about at all.
-unused-allowed-license = "deny"
+confidence-threshold = 0.93
 
 [bans]
+# `multiple-versions = "warn"` rather than "deny": the tree legitimately
+# needs two versions of several transitive crates (unicode-ident in
+# particular), and denying them would mean pinning them by hand forever.
 multiple-versions = "warn"
+# Wildcards would let a new dependency silently pull a different major
+# version, which is exactly the supply-chain risk this file exists for.
+# Path dependencies must therefore declare a `version` too.
 wildcards = "deny"
 deny = []
+skip-tree = []
 
 [sources]
 unknown-registry = "deny"

@@ -215,19 +215,36 @@ impl Supervisor {
 /// Grace period between SIGTERM and SIGKILL on shutdown.
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 
+/// Sends `SIGTERM` to `pid`.
+///
+/// The workspace denies `unsafe_code`, so this is the one place in the
+/// tree that opts back in — `tokio::process::Child::kill` only offers
+/// SIGKILL, and skipping the graceful step is what made shutdown drop
+/// in-flight requests before this existed.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn signal_term(pid: i32) -> std::io::Result<()> {
-    // SAFETY: `kill` with SIGTERM is async-signal-safe and `pid` comes
-    // from a `Child` this process spawned, so it is always a live,
-    // child-owned pid while we hold the `Child`.
-    unsafe {
-        if libc_kill(pid, 15) == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+    // SAFETY:
+    // - `kill(2)` is async-signal-safe and has no memory-safety
+    //   requirements; the only failure mode is a stale pid.
+    // - `pid` comes from `tokio::process::Child::id()`, so it is a process
+    //   this crate spawned and is the direct parent of — we never signal
+    //   anything we did not create, and the `Child` is still alive here so
+    //   the pid has not been recycled yet.
+    // - `SIGTERM` (15) is the portable default termination request and
+    //   asks `cloudflared` to close its QUIC sessions rather than dropping
+    //   them.
+    let rc = unsafe { libc_kill(pid, SIGNAL_TERM) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
+
+/// `SIGTERM` on every Unix platform this builds for.
+#[cfg(unix)]
+const SIGNAL_TERM: i32 = 15;
 
 #[cfg(unix)]
 extern "C" {

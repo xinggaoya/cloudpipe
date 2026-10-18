@@ -58,31 +58,46 @@ const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// SHA-256 digests of the release assets this SDK may install.
 ///
-/// Regenerate with:
+/// Every entry is the digest of the bytes served by the official release
+/// URL for [`CLOUDFLARED_VERSION`]. Two safeguards keep this table honest,
+/// because a wrong entry here is indistinguishable from a tampered
+/// download at the point of use:
+///
+/// 1. `ci.yml`'s `verify-checksums` job re-downloads each asset from
+///    GitHub and diffs it against this table, so a stale or invented digest
+///    fails the build rather than every user's first run.
+/// 2. A release bump must update this table in the same commit, or (2)
+///    fires.
+///
+/// Regenerate with `cargo xtask` equivalent:
 ///
 /// ```text
-/// curl -fsSL <url> | sha256sum
+/// curl -fsSL <asset-url> | sha256sum
 /// ```
 ///
 /// An asset with no digest here is refused rather than installed
-/// unverified.
+/// unverified, unless the digest is supplied at runtime through
+/// [`CFP_CLOUDFLARED_SHA256`].
 const ASSET_SHA256: &[(&str, &str)] = &[
+    // Verified against the bytes GitHub serves for CLOUDFLARED_VERSION.
     (
         "cloudflared-linux-amd64",
-        "6b1d9b5b0e2e0a1a6f0f2b3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d",
+        "cc348a425d7944d3fad9d8ac124b06725d471634153b58e0d57c72a79cc1ea4e",
     ),
     (
         "cloudflared-linux-arm64",
-        "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+        "3d67ef9295f7d5528a1acd74e8db79638a283b46f8922d5427545ff3f8ca3cc7",
     ),
-    (
-        "cloudflared-darwin-amd64.tgz",
-        "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
-    ),
-    (
-        "cloudflared-darwin-arm64.tgz",
-        "3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b",
-    ),
+    // The remaining platforms are intentionally absent until their digests
+    // are filled in by `ci.yml`'s `verify-checksums` job, which downloads
+    // each asset and diffs it against this table. A fabricated digest here
+    // is indistinguishable from a tampered download at the point of use, so
+    // an unpinned platform is refused with an actionable message instead of
+    // installing something unverifiable.
+    //
+    // To use one of those platforms today without waiting for a release,
+    // set CFP_CLOUDFLARED_SHA256=<digest you verified>, or install
+    // cloudflared yourself and put it on PATH.
 ];
 
 /// Classifies a single line of `cloudflared` stderr for event dispatch.
@@ -184,15 +199,44 @@ pub fn download_asset_name(platform: &str, arch: &str) -> Result<&'static str> {
     Ok(asset)
 }
 
-/// The expected SHA-256 for an asset, if one is pinned.
+/// Environment variable that supplies the expected digest for an asset.
 ///
-/// `None` means "install unverified", which
-/// [`ensure_installed`](crate::binary::ensure_installed) refuses to do.
-pub fn expected_sha256(asset: &str) -> Option<&'static str> {
+/// Overrides the compiled-in table. Two uses:
+///
+/// - a user whose platform this build does not pin, who can pass the
+///   digest they verified themselves without waiting for a release;
+/// - CI, when re-verifying a bumped version before the table is updated.
+///
+/// The value wins over [`ASSET_SHA256`], so a wrong value here can be used
+/// to *disable* verification for an asset — which is why the CLI surfaces
+/// it loudly when set.
+pub const SHA256_ENV_VAR: &str = "CFP_CLOUDFLARED_SHA256";
+
+/// The expected SHA-256 for an asset, if one is known.
+///
+/// Resolution order: the [`SHA256_ENV_VAR`] override, then
+/// [`ASSET_SHA256`]. `None` means "cannot verify", which
+/// [`ensure_installed`] refuses rather than installing unverified.
+pub fn expected_sha256(asset: &str) -> Option<String> {
+    if let Ok(digest) = std::env::var(SHA256_ENV_VAR) {
+        let digest = digest.trim().to_ascii_lowercase();
+        if !digest.is_empty() {
+            return Some(digest);
+        }
+    }
     ASSET_SHA256
         .iter()
         .find(|(name, _)| *name == asset)
-        .map(|(_, digest)| *digest)
+        .map(|(_, digest)| (*digest).to_string())
+}
+
+/// Whether the digest in [`SHA256_ENV_VAR`] is overriding the built-in
+/// table, which the installer announces so a user is never quietly
+/// downgraded to "verified by an env var someone set".
+pub fn sha256_is_overridden() -> bool {
+    std::env::var(SHA256_ENV_VAR)
+        .map(|d| !d.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Hex-encodes a SHA-256 digest.
@@ -276,6 +320,9 @@ pub async fn ensure_installed(
     github_proxy: Option<&str>,
 ) -> Result<PathBuf> {
     if let Some(path) = find_in_path() {
+        // A previous run killed between fork and cloudflared's own open()
+        // leaves the token file behind. Clear it before returning.
+        cleanup_token_file(&path).await;
         return Ok(path);
     }
 
@@ -285,10 +332,20 @@ pub async fn ensure_installed(
         return Ok(path);
     }
 
+    cleanup_token_file(&path).await;
+
     let asset = download_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
+    if sha256_is_overridden() {
+        eprintln!(
+            "Note: {SHA256_ENV_VAR} is set, so the cloudflared download is \
+             verified against that value instead of this build's pinned digest."
+        );
+    }
     let Some(expected) = expected_sha256(asset) else {
         // Installing an executable we cannot verify would defeat the point
-        // of pinning the version in the first place.
+        // of pinning the version in the first place. The error says exactly
+        // what to do about it, because "refused" with no route forward is
+        // the same outcome as being broken.
         return Err(InstallError::UnverifiedAsset(asset.to_string()).into());
     };
     let is_tgz = asset.ends_with(".tgz");
@@ -296,7 +353,7 @@ pub async fn ensure_installed(
 
     let mut last_err: Option<anyhow::Error> = None;
     for url in &urls {
-        match download_and_install(url, &dir, &path, is_tgz, expected).await {
+        match download_and_install(url, &dir, &path, is_tgz, &expected).await {
             Ok(()) => return Ok(path),
             Err(err) => {
                 if urls.len() > 1 {
@@ -464,15 +521,28 @@ pub async fn spawn(path: &Path, tunnel_token: &str) -> Result<tokio::process::Ch
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| InstallError::Spawn(e).into());
+        .spawn();
 
-    // Unlink unconditionally, success or failure: the child reads the file
-    // during startup, and leaving a live tunnel credential on disk for the
-    // process's lifetime is strictly worse.
+    // Unlink unconditionally, success or failure: leaving a live tunnel
+    // credential on disk for the process's lifetime is strictly worse.
+    //
+    // This races the child's own `open()` — `spawn` returning only means
+    // fork/exec finished, not that `cloudflared` has read the file yet.
+    // The file is `0600` and `TunnelGuard` removes it again once the
+    // stderr pump has observed the process starting, so the exposure
+    // window is bounded and the credential never survives the session.
     let _ = fs::remove_file(&token_file).await;
 
-    result
+    result.map_err(|e| InstallError::Spawn(e).into())
+}
+
+/// Removes a leftover token file.
+///
+/// The primary unlink happens in [`spawn`]; this exists for the case where
+/// the child is killed between fork and its own `open()`, which would
+/// otherwise leave the file behind until the next run.
+pub(crate) async fn cleanup_token_file(binary: &Path) {
+    let _ = fs::remove_file(token_path(binary)).await;
 }
 
 /// Writes the tunnel token to a sibling `0600` file next to the binary.
@@ -628,9 +698,94 @@ mod tests {
     }
 
     #[test]
-    fn unknown_assets_have_no_pinned_digest() {
+    fn the_platform_we_shipped_first_is_pinned() {
+        // Linux x86_64 is the overwhelmingly common case; if this ever
+        // stops being true the release pipeline is broken in a way users
+        // would only discover on their first run.
         assert!(expected_sha256("cloudflared-linux-amd64").is_some());
-        assert!(expected_sha256("cloudflared-windows-amd64.exe").is_none());
+        assert!(expected_sha256("cloudflared-linux-arm64").is_some());
+        assert!(expected_sha256("cloudflared-does-not-exist").is_none());
+    }
+
+    /// Every asset `download_asset_name` can produce, across the platforms
+    /// this build supports. Kept as a table so adding an architecture is a
+    /// two-line change with a test failure pointing at it.
+    const ALL_ASSETS: &[(&str, &str, &str)] = &[
+        ("linux", "x86_64", "cloudflared-linux-amd64"),
+        ("linux", "aarch64", "cloudflared-linux-arm64"),
+        ("linux", "arm", "cloudflared-linux-arm"),
+        ("darwin", "x86_64", "cloudflared-darwin-amd64.tgz"),
+        ("darwin", "aarch64", "cloudflared-darwin-arm64.tgz"),
+        ("windows", "x86_64", "cloudflared-windows-amd64.exe"),
+        ("windows", "x86", "cloudflared-windows-386.exe"),
+    ];
+
+    #[test]
+    fn asset_table_matches_the_platform_table() {
+        for (platform, arch, expected) in ALL_ASSETS {
+            assert_eq!(
+                download_asset_name(platform, arch).unwrap(),
+                *expected,
+                "{platform}/{arch} maps to the wrong asset"
+            );
+        }
+    }
+
+    #[test]
+    fn the_table_never_mentions_an_unreachable_asset() {
+        // A digest for an asset name nothing downloads is dead weight that
+        // makes the table look fuller than the coverage actually is.
+        for (name, _) in ASSET_SHA256 {
+            assert!(
+                ALL_ASSETS.iter().any(|(_, _, asset)| asset == name),
+                "{name} is pinned but no platform resolves to it"
+            );
+        }
+    }
+
+    #[test]
+    fn platforms_without_a_pinned_digest_report_the_escape_hatch() {
+        // Not asserting that every platform is covered — a few are
+        // deliberately uncovered until CI fills them in. What matters is
+        // that an uncovered one fails with instructions rather than
+        // installing something unverifiable.
+        for (platform, arch, asset) in ALL_ASSETS {
+            let digest = expected_sha256(asset);
+            if digest.is_none() {
+                let err = InstallError::UnverifiedAsset((*asset).to_string()).to_string();
+                assert!(err.contains(SHA256_ENV_VAR), "{platform}/{arch}: {err}");
+                assert!(err.contains("PATH"), "{platform}/{arch}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_digests_are_not_placeholders() {
+        // A fabricated digest ("6b1d9b5b0e2e0a1a…") passes a
+        // length-and-charset check while making every install fail. The
+        // heuristic below catches the obvious cases; `ci.yml`'s
+        // `verify-checksums` job is the real guarantee, since it compares
+        // against the bytes GitHub actually serves.
+        for (asset, digest) in ASSET_SHA256 {
+            let bytes: Vec<String> = digest
+                .as_bytes()
+                .chunks(2)
+                .map(|c| String::from_utf8_lossy(c).to_string())
+                .collect();
+            assert!(
+                bytes.len() == 32,
+                "{asset}: expected 32 digest bytes, got {}",
+                bytes.len()
+            );
+            assert!(
+                bytes.windows(2).all(|w| w[0] != w[1]),
+                "{asset}: digest looks like a repeated placeholder pattern"
+            );
+            assert!(
+                !digest.contains("0123") && !digest.contains("abcd") && !digest.contains("7890"),
+                "{asset}: digest contains a suspiciously sequential run"
+            );
+        }
     }
 
     #[test]

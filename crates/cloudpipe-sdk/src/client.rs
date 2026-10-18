@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{classify_error_code, ApiError, CloudflareErrorKind, Result};
+use crate::error::{classify_error_code, ApiError, CloudflareErrorKind, Error, Result};
 
 /// Cloudflare API base URL.
 pub const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
@@ -155,7 +155,13 @@ pub struct IngressEntry {
     /// `noTLSVerify` is what makes exposing a local dev server with a
     /// self-signed certificate possible at all, so this field is part of
     /// the public API rather than an escape hatch.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Note the explicit rename: serde's `camelCase` would produce
+    /// `originRequest` from the field name only if the container had
+    /// `rename_all`, and `noTLSVerify` / `httpHostHeader` need
+    /// per-field overrides regardless, so every key is written out
+    /// explicitly rather than derived.
+    #[serde(rename = "originRequest", skip_serializing_if = "Option::is_none")]
     pub origin_request: Option<OriginRequest>,
 }
 
@@ -203,6 +209,35 @@ impl OriginRequest {
     }
 }
 
+impl IngressEntry {
+    /// Builds a hostname rule with optional origin tuning.
+    ///
+    /// An `OriginRequest` with nothing set is dropped rather than sent as
+    /// `originRequest: {}`, which Cloudflare would treat as a real (but
+    /// empty) override object instead of "no overrides".
+    pub fn hostname(
+        hostname: impl Into<String>,
+        service: impl Into<String>,
+        origin_request: Option<OriginRequest>,
+    ) -> Self {
+        let origin_request = origin_request.filter(|o| !o.is_empty());
+        Self {
+            hostname: Some(hostname.into()),
+            service: service.into(),
+            origin_request,
+        }
+    }
+
+    /// Builds the mandatory catch-all rule.
+    pub fn catch_all() -> Self {
+        Self {
+            hostname: None,
+            service: "http_status:404".to_string(),
+            origin_request: None,
+        }
+    }
+}
+
 /// Result of `GET /user/tokens/verify`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TokenStatus {
@@ -243,12 +278,6 @@ impl CloudflareApi {
         })
     }
 
-    /// Returns a reference to the inner `reqwest::Client` for advanced uses.
-    #[allow(dead_code)]
-    pub fn http(&self) -> &reqwest::Client {
-        &self.client
-    }
-
     /// Verifies the token (`GET /user/tokens/verify`).
     pub async fn verify_token(&self) -> Result<TokenStatus> {
         let status: TokenStatus = self
@@ -272,6 +301,24 @@ impl CloudflareApi {
             // Cloudflare normalises zone names to lowercase; compare
             // case-insensitively so `Example.com` still resolves.
             .find(|z| z.name.eq_ignore_ascii_case(domain)))
+    }
+
+    /// Finds a zone by its Cloudflare zone id.
+    pub async fn find_zone_by_id(&self, zone_id: &str) -> Result<Option<Zone>> {
+        Ok(self
+            .paginate(&format!("/zones/{zone_id}"), &[])
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Lists the zones owned by `account_id` that this token can reach.
+    pub async fn list_zones_in_account(&self, account_id: &str) -> Result<Vec<Zone>> {
+        let zones = self.list_zones().await?;
+        Ok(zones
+            .into_iter()
+            .filter(|z| z.account.as_ref().is_some_and(|a| a.id == account_id))
+            .collect())
     }
 
     /// Creates a named tunnel (`POST /accounts/{id}/tunnels`).
@@ -535,12 +582,17 @@ impl CloudflareApi {
         loop {
             match self.attempt(&method, path, body).await {
                 Ok(page) => return Ok(page),
-                Err(err) => {
+                Err((err, retry_after)) => {
                     if attempt >= MAX_RETRIES || !is_retryable(&err) {
                         return Err(err);
                     }
                     attempt += 1;
-                    let backoff = retry_backoff(attempt);
+                    // Cloudflare tells us how long to wait on a rate
+                    // limit; honour it when it is present and sane, and
+                    // fall back to our own ladder otherwise.
+                    let backoff = retry_after
+                        .filter(|d| !d.is_zero() && *d <= MAX_RETRY_AFTER)
+                        .unwrap_or_else(|| retry_backoff(attempt));
                     tracing::debug!(
                         "cloudflare request {path} failed ({err}); retry {attempt}/{MAX_RETRIES} in {backoff:?}"
                     );
@@ -550,12 +602,16 @@ impl CloudflareApi {
         }
     }
 
+    /// Issues one attempt.
+    ///
+    /// Returns the parsed response, or the error together with the
+    /// `Retry-After` hint when the server supplied one.
     async fn attempt<T: DeserializeOwned>(
         &self,
         method: &reqwest::Method,
         path: &str,
         body: Option<&serde_json::Value>,
-    ) -> Result<Page<T>> {
+    ) -> std::result::Result<Page<T>, (Error, Option<Duration>)> {
         let url = format!("{}{}", self.base, path);
         let mut req = self
             .client
@@ -567,17 +623,30 @@ impl CloudflareApi {
             req = req.json(body);
         }
 
-        let response = req.send().await.map_err(ApiError::Http)?;
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(e) => return Err((classify_transport(e).into(), None)),
+        };
+        let retry_after = parse_retry_after(response.headers());
         let status = response.status();
-        let text = response.text().await.map_err(ApiError::Http)?;
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => return Err((classify_transport(e).into(), retry_after)),
+        };
 
-        let envelope: CfResponse<T> = serde_json::from_str(&text).map_err(|_| {
-            let truncated = truncate(&text, 512);
-            ApiError::NonJson {
-                status: status.as_u16(),
-                body: truncated,
+        let envelope: CfResponse<T> = match serde_json::from_str(&text) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                return Err((
+                    ApiError::NonJson {
+                        status: status.as_u16(),
+                        body: truncate(&text, 512),
+                    }
+                    .into(),
+                    retry_after,
+                ))
             }
-        })?;
+        };
 
         if !status.is_success() || !envelope.success {
             let detail: ApiError = match envelope.errors.as_ref().and_then(|e| e.first()) {
@@ -603,7 +672,7 @@ impl CloudflareApi {
                     }
                 }
             };
-            return Err(detail.into());
+            return Err((detail.into(), retry_after));
         }
 
         Ok(Page {
@@ -618,6 +687,41 @@ impl CloudflareApi {
 struct Page<T> {
     items: Option<T>,
     info: Option<ResultInfo>,
+}
+
+/// Largest `Retry-After` we are willing to sit through. Beyond this we
+/// fail and let the caller decide — a server asking for an hour is not
+/// something to block a `cfp` invocation on.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Reads a `Retry-After` header, in either its delta-seconds or HTTP-date
+/// form. Unparseable or absurd values yield `None`.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // HTTP-date form: we cannot parse it without a date library, and the
+    // delta-seconds form is what Cloudflare actually sends, so an
+    // unrecognised value simply falls back to our own ladder.
+    None
+}
+
+/// Splits a transport failure into "the deadline expired" and everything
+/// else.
+///
+/// Without this, a timeout surfaced as a generic [`ApiError::Http`], so the
+/// CLI's "check your network/proxy settings" hint was unreachable and the
+/// `Timeout` variant existed only in the enum.
+fn classify_transport(err: reqwest::Error) -> ApiError {
+    if err.is_timeout() {
+        return ApiError::Timeout(REQUEST_TIMEOUT);
+    }
+    ApiError::Http(err)
 }
 
 /// Builds a path with a percent-encoded query string.
@@ -666,17 +770,10 @@ fn percent_encode(input: &str) -> String {
 fn is_retryable(err: &crate::Error) -> bool {
     match err {
         crate::Error::Cloudflare(ApiError::Http(_)) => true,
-        crate::Error::Cloudflare(ApiError::Api { kind, code, .. }) => match kind {
-            CloudflareErrorKind::RateLimited => true,
-            CloudflareErrorKind::ServerError => true,
-            // A bare 5xx with no envelope still carries the status in the
-            // message; treat any numeric server code as retryable.
-            CloudflareErrorKind::Other(code) => *code >= 500,
-            _ => {
-                let _ = code;
-                false
-            }
-        },
+        // A deadline that expired mid-request is a transient blip, so
+        // retrying is right — the client already gave it a full budget.
+        crate::Error::Cloudflare(ApiError::Timeout(_)) => true,
+        crate::Error::Cloudflare(ApiError::Api { kind, .. }) => kind.is_retryable(),
         // A gateway returning HTML is almost always a transient blip.
         crate::Error::Cloudflare(ApiError::NonJson { status, .. }) => *status >= 500,
         _ => false,
@@ -747,6 +844,35 @@ mod tests {
     }
 
     #[test]
+    fn timeout_is_classified_apart_from_other_transport_errors() {
+        // A reqwest timeout error is awkward to construct, so assert the
+        // decision function instead: the point is that `Timeout` is
+        // reachable and retryable, not that we can forge the error here.
+        let timeout = crate::Error::Cloudflare(ApiError::Timeout(REQUEST_TIMEOUT));
+        assert!(is_retryable(&timeout));
+
+        // And that the classification is what the CLI branches on.
+        let text = timeout.to_string();
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[test]
+    fn api_business_codes_are_not_mistaken_for_http_statuses() {
+        // `Other(7003)` is Cloudflare's "could not route to origin", a
+        // permanent condition. Comparing the code against 500 — as an
+        // earlier version did — classified it as retryable and replayed a
+        // request that could never succeed, three times.
+        for code in [1000u64, 7003, 81057, 1049] {
+            let err = crate::Error::from(ApiError::Api {
+                code: Some(code),
+                message: "permanent".into(),
+                kind: CloudflareErrorKind::Other(code),
+            });
+            assert!(!is_retryable(&err), "code {code} must not be retried");
+        }
+    }
+
+    #[test]
     fn retryable_classification() {
         let rate = crate::Error::from(ApiError::Api {
             code: Some(10429),
@@ -779,6 +905,45 @@ mod tests {
     }
 
     #[test]
+    fn origin_request_uses_cloudflares_exact_key_names() {
+        // These four strings are the whole contract with Cloudflare's
+        // tunnel-configuration API. A serde default here produces
+        // `origin_request` / `noTlsVerify`, which the API silently ignores —
+        // so `no_tls_verify` would appear to work and change nothing.
+        let entry = IngressEntry {
+            hostname: Some("a.example.com".into()),
+            service: "https://localhost:8443".into(),
+            origin_request: Some(OriginRequest {
+                no_tls_verify: Some(true),
+                http_host_header: Some("localhost:8443".into()),
+                connect_timeout: Some(9),
+                tcp_keep_alive: Some(90),
+                http2_origin: Some(false),
+                no_happy_eyeballs: Some(true),
+            }),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        for key in [
+            "\"originRequest\"",
+            "\"noTLSVerify\"",
+            "\"httpHostHeader\"",
+            "\"connectTimeout\"",
+            "\"tcpKeepAlive\"",
+            "\"http2Origin\"",
+            "\"noHappyEyeballs\"",
+        ] {
+            assert!(json.contains(key), "missing {key} in {json}");
+        }
+        for wrong in ["origin_request", "noTlsVerify", "httpHostheader"] {
+            assert!(!json.contains(wrong), "wrong key {wrong} in {json}");
+        }
+
+        // And it round-trips as the JSON Cloudflare would send back.
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["originRequest"]["noTLSVerify"].as_bool().unwrap());
+    }
+
+    #[test]
     fn origin_request_is_omitted_when_empty() {
         let entry = IngressEntry {
             hostname: Some("a.example.com".into()),
@@ -788,12 +953,43 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("originRequest"), "leaked: {json}");
 
-        let entry = IngressEntry {
-            origin_request: Some(OriginRequest::insecure()),
-            ..entry
-        };
-        let json = serde_json::to_string(&entry).unwrap();
+        // A default OriginRequest carries no settings, so the constructor
+        // drops it rather than sending `originRequest: {}` — Cloudflare
+        // would read that as a real (but empty) override object.
+        let empty = IngressEntry::hostname(
+            "a.example.com",
+            "http://localhost:8080",
+            Some(OriginRequest::default()),
+        );
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("originRequest"), "empty leaked: {json}");
+
+        let insecure = IngressEntry::hostname(
+            "a.example.com",
+            "https://localhost:8443",
+            Some(OriginRequest::insecure()),
+        );
+        let json = serde_json::to_string(&insecure).unwrap();
         assert!(json.contains("\"noTLSVerify\":true"), "missing: {json}");
+
+        let catch_all = IngressEntry::catch_all();
+        let json = serde_json::to_string(&catch_all).unwrap();
+        assert_eq!(json, r#"{"service":"http_status:404"}"#);
+        assert!(!json.contains("hostname"), "catch-all must omit hostname");
+    }
+
+    #[test]
+    fn is_empty_detects_an_unset_origin_request() {
+        assert!(OriginRequest::default().is_empty());
+        assert!(!OriginRequest::insecure().is_empty());
+        let explicitly_off = OriginRequest {
+            http2_origin: Some(false),
+            ..OriginRequest::default()
+        };
+        assert!(
+            !explicitly_off.is_empty(),
+            "Some(false) is a setting, not an absence"
+        );
     }
 
     #[test]

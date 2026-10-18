@@ -51,7 +51,8 @@ sudo mv cfp /usr/local/bin/
 
 ### Install with cargo (from git)
 
-Requires Rust 1.70+ and the `cloudflared` binary will be auto-downloaded on first use:
+Requires Rust 1.80+ (the floor is enforced by `rust-version` in
+`Cargo.toml`), and the `cloudflared` binary is auto-downloaded on first use:
 
 ```bash
 # Latest from main branch
@@ -137,7 +138,7 @@ cfp key <CF_API_TOKEN>
 
 # Expose localhost:8080 with a random subdomain (defaults to http)
 cfp 8080
-#   => https://user-1234.example.com
+#   => https://user-a7k2m9x.example.com
 
 # Use a specific subdomain
 cfp 8080 -s myapp
@@ -145,7 +146,7 @@ cfp 8080 -s myapp
 
 # Declare the local protocol explicitly (ngrok-style)
 cfp https 8443
-#   => https://user-1234.example.com   (local: https://localhost:8443)
+#   => https://user-a7k2m9x.example.com   (local: https://localhost:8443)
 
 # Expose an HTTPS dev server whose certificate is self-signed
 cfp https 8443 -s myapp --insecure

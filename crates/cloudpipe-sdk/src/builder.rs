@@ -5,11 +5,12 @@ use std::path::PathBuf;
 use tokio::sync::broadcast;
 
 use crate::binary;
+use crate::cleanup::CleanupReport;
 use crate::client::{CloudflareApi, OriginRequest};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::handle::Shutdown;
-use crate::protocol::{validate_subdomain, Protocol};
+use crate::protocol::{validate_domain, validate_subdomain, Protocol};
 use crate::session::{self, DispatchSlot, SessionConfig};
 
 /// Default local port when none is supplied. Matches the CLI default.
@@ -122,9 +123,13 @@ impl TunnelBuilder {
 
     /// Sets the Cloudflare account ID.
     ///
-    /// **Optional.** Override the value the SDK auto-discovers from the
-    /// token — useful when you've cached it (e.g. read from your own
-    /// config store) and want to skip the `list_zones` round-trip.
+    /// **Optional, and combinable with any other subset.** Supply it
+    /// alone and the SDK picks the account's first accessible zone; supply
+    /// it with a `domain` and the lookup is verified against it. Useful when
+    /// you've cached the id (e.g. from your own config store) and want to
+    /// skip a round-trip.
+    ///
+    /// See [`resolve_zone`](Self::resolve_zone) semantics in the type docs.
     pub fn account(mut self, account_id: impl Into<String>) -> Self {
         self.account_id = Some(account_id.into());
         self
@@ -132,8 +137,9 @@ impl TunnelBuilder {
 
     /// Sets the Cloudflare zone ID for the base domain.
     ///
-    /// **Optional.** See [`account`](Self::account) for why you'd supply
-    /// this manually.
+    /// **Optional, and combinable with any other subset.** Supply it alone
+    /// and the SDK reads the domain and account back from Cloudflare. See
+    /// [`account`](Self::account).
     pub fn zone(mut self, zone_id: impl Into<String>) -> Self {
         self.zone_id = Some(zone_id.into());
         self
@@ -249,6 +255,64 @@ impl TunnelBuilder {
         self
     }
 
+    /// Resolves the zone this token can reach and hands it to
+    /// [`cleanup_zone`](Self::cleanup_zone).
+    ///
+    /// The convenience counterpart to the free functions
+    /// [`cleanup`]/[`preview_cleanup`], which need the account, zone and
+    /// domain spelled out.
+    pub async fn cleanup_zone(&self) -> Result<CleanupReport> {
+        let api = match &self.api {
+            Some(api) => api.clone(),
+            None => CloudflareApi::new(
+                self.token
+                    .clone()
+                    .ok_or(Error::MissingCredential("Cloudflare API token"))?,
+            )?,
+        };
+        let (account, zone, domain) = resolve_zone(
+            &api,
+            self.account_id.clone(),
+            self.zone_id.clone(),
+            self.domain.clone(),
+        )
+        .await?;
+        self.cleanup_zone_with(&api, &account, &zone, &domain).await
+    }
+
+    /// Reclaims dead tunnels and orphaned DNS in one zone, without deleting
+    /// anything.
+    pub async fn preview_zone(&self) -> Result<CleanupReport> {
+        let api = match &self.api {
+            Some(api) => api.clone(),
+            None => CloudflareApi::new(
+                self.token
+                    .clone()
+                    .ok_or(Error::MissingCredential("Cloudflare API token"))?,
+            )?,
+        };
+        let (account, zone, domain) = resolve_zone(
+            &api,
+            self.account_id.clone(),
+            self.zone_id.clone(),
+            self.domain.clone(),
+        )
+        .await?;
+        crate::cleanup::preview_cleanup(&api, &account, &zone, &domain).await
+    }
+
+    /// Reclaims dead tunnels and orphaned DNS in one zone, given coordinates
+    /// the caller already has.
+    pub async fn cleanup_zone_with(
+        &self,
+        api: &CloudflareApi,
+        account: &str,
+        zone: &str,
+        domain: &str,
+    ) -> Result<CleanupReport> {
+        crate::cleanup::cleanup_with_report(api, account, zone, domain).await
+    }
+
     /// Overrides how aggressively the supervisor reconnects a crashed
     /// tunnel. Only consulted when [`auto_restart`](Self::auto_restart)
     /// is enabled.
@@ -334,6 +398,14 @@ where
         };
         validate_subdomain(&subdomain)
             .map_err(|e| Error::InvalidSubdomain(format!("\"{}\": {}", e.value, e.reason)))?;
+
+        // The base domain lands in the public hostname, so it gets the
+        // same up-front treatment — before any API call or download.
+        if let Some(domain) = &self.inner.domain {
+            let trimmed = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            validate_domain(&trimmed)?;
+            self.inner.domain = Some(trimmed);
+        }
 
         let api = match self.inner.api.take() {
             Some(api) => api,
@@ -449,54 +521,106 @@ async fn pick_available_subdomain(
 /// How many names a generated subdomain may try before giving up.
 const MAX_SUBDOMAIN_ATTEMPTS: u32 = 5;
 
-/// Fills in any missing zone/account/domain by asking the Cloudflare API.
+/// Fills in whatever the caller left out, by asking the Cloudflare API.
 ///
-/// - If all three are provided, returns them verbatim.
-/// - If only `domain` is provided, looks it up via `find_zone`.
-/// - If neither is provided, lists the token's accessible zones and picks
-///   the only one if there is exactly one; otherwise returns a descriptive
-///   error so the caller can disambiguate.
+/// Every partial combination is handled — the docs on
+/// [`TunnelBuilder::account`] and [`TunnelBuilder::zone`] describe both as
+/// optional overrides, which the previous all-or-nothing `match` did not
+/// deliver: supplying two of the three values returned an error telling
+/// you to supply all three.
+///
+/// | supplied | how the rest is found |
+/// |---|---|
+/// | all three | used verbatim, no API call |
+/// | `zone` only | `GET /zones/{id}` gives the domain and account |
+/// | `domain` only | [`CloudflareApi::find_zone`] gives zone + account |
+/// | `account` only | the first zone that account owns |
+/// | `account` + `domain` | the zone is looked up, and its account checked |
+/// | `zone` + `account` | the zone is looked up for the domain |
+/// | none | the only zone, or an error listing the choices |
+/// | `domain` + nothing else, not accessible | error naming the domain |
 async fn resolve_zone(
     api: &CloudflareApi,
     account_id: Option<String>,
     zone_id: Option<String>,
     domain: Option<String>,
 ) -> Result<(String, String, String)> {
-    match (account_id, zone_id, domain) {
-        (Some(a), Some(z), Some(d)) => Ok((a, z, d)),
-        (Some(_), Some(_), None) => Err(Error::Other(anyhow::anyhow!(
-            "account and zone provided but domain is missing — pass .domain(...)"
-        ))),
-        (None, None, Some(d)) => {
-            let zone = api.find_zone(&d).await?.ok_or_else(|| {
-                Error::Other(anyhow::anyhow!(
-                    "domain \"{d}\" is not accessible with this token"
-                ))
-            })?;
-            let account = zone.require_account_id()?;
-            Ok((account.to_string(), zone.id, zone.name))
-        }
-        (None, None, None) => {
-            let zones = api.list_zones().await?;
-            match zones.len() {
-                0 => Err(Error::Other(anyhow::anyhow!(
-                    "token is valid but has access to no zones"
-                ))),
-                1 => {
-                    let z = zones.into_iter().next().unwrap();
-                    let account = z.require_account_id()?;
-                    Ok((account.to_string(), z.id, z.name))
-                }
-                n => Err(Error::Other(anyhow::anyhow!(
-                    "token has access to {n} zones — pass .domain(\"...\"), \
-                     .account(...), and .zone(...) to disambiguate"
-                ))),
+    // Fast path: nothing to discover.
+    if let (Some(account), Some(zone), Some(domain)) = (&account_id, &zone_id, &domain) {
+        return Ok((account.clone(), zone.clone(), domain.clone()));
+    }
+
+    // A domain is the strongest key: it identifies exactly one zone.
+    if let Some(domain) = domain {
+        let zone = api.find_zone(&domain).await?.ok_or_else(|| {
+            Error::Other(anyhow::anyhow!(
+                "domain \"{domain}\" is not accessible with this token — \
+                     run `cfp domains` to list what you can reach"
+            ))
+        })?;
+        let zone_account = zone.require_account_id()?.to_string();
+        if let Some(expected) = &account_id {
+            if *expected != zone_account {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "domain \"{domain}\" belongs to account {zone_account}, \
+                     not {expected}"
+                )));
             }
         }
-        // Partial combinations — surface a friendly hint.
-        _ => Err(Error::Other(anyhow::anyhow!(
-            "account, zone and domain must be supplied together; \
-             pass .domain(\"...\") alone to auto-discover the rest"
+        return Ok((zone_account, zone.id, zone.name));
+    }
+
+    // A zone id is the next strongest key.
+    if let Some(zone_id) = zone_id {
+        let zone = api.find_zone_by_id(&zone_id).await?.ok_or_else(|| {
+            Error::Other(anyhow::anyhow!(
+                "zone {zone_id} is not accessible with this token"
+            ))
+        })?;
+        let zone_account = zone.require_account_id()?.to_string();
+        if let Some(expected) = &account_id {
+            if *expected != zone_account {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "zone {zone_id} belongs to account {zone_account}, not {expected}"
+                )));
+            }
+        }
+        return Ok((zone_account, zone.id, zone.name));
+    }
+
+    // An account alone: the first zone it owns.
+    if let Some(account) = account_id {
+        let zones = api.list_zones_in_account(&account).await?;
+        return match zones.len() {
+            0 => Err(Error::Other(anyhow::anyhow!(
+                "account {account} owns no zones accessible to this token"
+            ))),
+            1 => {
+                let z = &zones[0];
+                let z_account = z.require_account_id()?.to_string();
+                Ok((z_account, z.id.clone(), z.name.clone()))
+            }
+            n => Err(Error::Other(anyhow::anyhow!(
+                "account {account} owns {n} accessible zones — pass \
+                 .domain(\"...\") to choose one"
+            ))),
+        };
+    }
+
+    // Nothing supplied: the single-zone case is the common one.
+    let zones = api.list_zones().await?;
+    match zones.len() {
+        0 => Err(Error::Other(anyhow::anyhow!(
+            "token is valid but has access to no zones"
+        ))),
+        1 => {
+            let z = &zones[0];
+            let account = z.require_account_id()?.to_string();
+            Ok((account, z.id.clone(), z.name.clone()))
+        }
+        n => Err(Error::Other(anyhow::anyhow!(
+            "token has access to {n} zones — pass .domain(\"...\") to choose one, \
+             e.g. .domain(\"example.com\")"
         ))),
     }
 }

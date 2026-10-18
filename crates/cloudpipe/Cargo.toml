@@ -15,7 +15,7 @@ name = "cfp"
 path = "src/main.rs"
 
 [dependencies]
-cloudpipe-sdk = { path = "../cloudpipe-sdk" }
+cloudpipe-sdk = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }

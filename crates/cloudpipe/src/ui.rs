@@ -417,6 +417,7 @@ pub fn sdk_error_hint(err: &Error) -> Option<&'static str> {
             }
             _ => None,
         },
+        InvalidPort(_) => Some("Port 0 is not a valid local service; use 1-65535."),
         Cloudflare(cloudpipe_sdk::ApiError::Timeout(_)) => {
             Some("The request to Cloudflare timed out. Check network/proxy settings and retry.")
         }
@@ -429,6 +430,9 @@ pub fn sdk_error_hint(err: &Error) -> Option<&'static str> {
         InvalidSubdomain(_) => {
             Some("Subdomains must be 3-63 chars of a-z, 0-9 and dashes, not starting or ending with a dash.")
         }
+        InvalidDomain(_) => Some(
+            "The base domain must be a lowercase RFC 1123 name like `example.com` — no scheme, port, path or trailing dot.",
+        ),
         MissingCredential(_) => Some("Run `cfp key <CF_API_TOKEN>` first, or set CLOUDFLARE_API_TOKEN."),
         AlreadyShutDown => Some("This handle was already stopped; nothing left to do."),
         Cloudflared(_) => Some(

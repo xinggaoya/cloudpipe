@@ -1,0 +1,10 @@
+# Pinned toolchain for reproducible builds.
+#
+# `rustfmt` and `clippy` are components rather than separate CI installs so
+# that a local `cargo fmt` / `cargo clippy` run behaves exactly like CI.
+# `rust-version` in each Cargo.toml is the *minimum*; this file is what CI
+# and contributors actually use.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

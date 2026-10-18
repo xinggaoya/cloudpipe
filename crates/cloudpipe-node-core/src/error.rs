@@ -28,6 +28,8 @@ pub enum CloudpipeErrorCode {
     CloudflaredBinary,
     /// The provided subdomain violates the DNS label rules.
     InvalidSubdomain,
+    /// The provided base domain is not a usable RFC 1123 name.
+    InvalidDomain,
     /// A healthy tunnel with the same name already exists on Cloudflare.
     SubdomainInUse,
     /// `close()` (or its SDK equivalent) was called twice on a handle.
@@ -48,6 +50,7 @@ impl CloudpipeErrorCode {
             Self::CloudflareApi => "CLOUDFLARE_API",
             Self::CloudflaredBinary => "CLOUDFLARE_BINARY",
             Self::InvalidSubdomain => "INVALID_SUBDOMAIN",
+            Self::InvalidDomain => "INVALID_DOMAIN",
             Self::SubdomainInUse => "SUBDOMAIN_IN_USE",
             Self::AlreadyShutDown => "ALREADY_SHUT_DOWN",
             Self::Io => "IO",
@@ -102,6 +105,7 @@ pub fn classify(err: &cloudpipe_sdk::Error) -> (CloudpipeErrorCode, Option<Cloud
         }
         E::Cloudflared(_) => (CloudpipeErrorCode::CloudflaredBinary, None),
         E::InvalidSubdomain(_) => (CloudpipeErrorCode::InvalidSubdomain, None),
+        E::InvalidDomain(_) => (CloudpipeErrorCode::InvalidDomain, None),
         E::SubdomainInUse(_) => (CloudpipeErrorCode::SubdomainInUse, None),
         E::AlreadyShutDown => (CloudpipeErrorCode::AlreadyShutDown, None),
         E::Io(_) => (CloudpipeErrorCode::Io, None),
@@ -161,6 +165,7 @@ mod tests {
             CloudpipeErrorCode::InvalidSubdomain.as_str(),
             "INVALID_SUBDOMAIN"
         );
+        assert_eq!(CloudpipeErrorCode::InvalidDomain.as_str(), "INVALID_DOMAIN");
         assert_eq!(
             CloudpipeErrorCode::SubdomainInUse.as_str(),
             "SUBDOMAIN_IN_USE"

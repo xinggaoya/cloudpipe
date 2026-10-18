@@ -69,6 +69,12 @@ impl Shutdown {
     }
 }
 
+/// Ceiling on how long [`TunnelHandle::stop`] may spend tearing down.
+///
+/// Comfortably above the SDK's own 30 s HTTP deadline plus a SIGTERM grace
+/// period, so a healthy shutdown never trips it.
+pub const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// Holds the stderr pump task for the current session generation. The
 /// background task swaps this slot whenever it respawns `cloudflared`;
 /// [`TunnelHandle::wait`] / [`TunnelHandle::stop`] / `Drop` always await
@@ -269,15 +275,36 @@ impl TunnelHandle {
     /// the tunnel is already gone (e.g. `cloudflared` crashed and the
     /// background task finished on its own), `stop` still runs the
     /// Cloudflare-side cleanup best-effort.
+    ///
+    /// # Cancellation
+    ///
+    /// Every internal await is bounded by [`CLEANUP_TIMEOUT`]. The SDK's
+    /// own HTTP calls carry a request deadline, but a caller that wrapped
+    /// this in a `select!` against another branch would otherwise have no
+    /// upper bound at all — a shutdown that never returns is worse than one
+    /// that gives up, because it leaves the process running with a
+    /// half-released tunnel.
     pub async fn stop(&mut self) -> Result<()> {
+        self.stop_within(CLEANUP_TIMEOUT).await
+    }
+
+    /// [`stop`](Self::stop) with an explicit bound on how long teardown may
+    /// take.
+    pub async fn stop_within(&mut self, budget: std::time::Duration) -> Result<()> {
         if self.stopped {
             return Err(Error::AlreadyShutDown);
         }
         self.stopped = true;
         self.shutdown.trigger();
 
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+        let reap = async {
+            if let Some(task) = self.task.take() {
+                let _ = task.await;
+            }
+        };
+        if tokio::time::timeout(budget, reap).await.is_err() {
+            tracing::warn!("stop(): supervisor task did not finish within {budget:?}");
+            return Ok(());
         }
         if let Some(slot) = self.stderr_slot.take() {
             if let Some(task) = take_pump(&slot) {
@@ -291,7 +318,12 @@ impl TunnelHandle {
         // round-trips — `SessionState::purge` is internally idempotent, so
         // racing the supervisor's own purge is harmless.
         let snapshot = { self.state.lock().await.clone() };
-        snapshot.purge().await;
+        if tokio::time::timeout(budget, snapshot.purge())
+            .await
+            .is_err()
+        {
+            tracing::warn!("stop(): Cloudflare cleanup exceeded {budget:?}; run `cfp cleanup`");
+        }
         Ok(())
     }
 }

@@ -98,6 +98,86 @@ pub fn validate_subdomain(subdomain: &str) -> Result<(), InvalidSubdomain> {
     Ok(())
 }
 
+/// Validates a DNS name (RFC 1123): dot-separated labels of `a-z`, `0-9`
+/// and `-`, none starting or ending with a dash, 1..=63 chars per label,
+/// at least two labels, and no trailing dot.
+///
+/// The base domain goes straight into the public hostname
+/// (`{subdomain}.{domain}`), so an unchecked value would either produce a
+/// name Cloudflare rejects with an opaque error or, worse, one it accepts
+/// with the caller's own text embedded in it.
+pub fn validate_domain(domain: &str) -> Result<(), InvalidDomain> {
+    if domain.len() > 253 {
+        return Err(InvalidDomain::new(
+            domain,
+            format!("must be at most 253 characters (got {})", domain.len()),
+        ));
+    }
+    if domain.ends_with('.') {
+        return Err(InvalidDomain::new(
+            domain,
+            "must not end with a dot (pass `example.com`, not `example.com.`)",
+        ));
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2 {
+        return Err(InvalidDomain::new(
+            domain,
+            "must have at least two labels (e.g. `example.com`)",
+        ));
+    }
+    for label in &labels {
+        if label.is_empty() || label.len() > 63 {
+            return Err(InvalidDomain::new(
+                domain,
+                format!("label \"{label}\" must be 1..=63 characters"),
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(InvalidDomain::new(
+                domain,
+                format!("label \"{label}\" must not start or end with a dash"),
+            ));
+        }
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(InvalidDomain::new(
+                domain,
+                format!("label \"{label}\" must be lowercase letters, digits and dashes"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Error returned by [`validate_domain`].
+#[derive(Debug, thiserror::Error)]
+#[error("invalid domain \"{value}\": {reason}")]
+pub struct InvalidDomain {
+    /// The offending value.
+    pub value: String,
+    /// Human-readable reason.
+    pub reason: String,
+}
+
+impl InvalidDomain {
+    /// Constructs a new `InvalidDomain`.
+    pub fn new(value: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<InvalidDomain> for crate::Error {
+    fn from(err: InvalidDomain) -> Self {
+        crate::Error::InvalidDomain(format!("\"{}\": {}", err.value, err.reason))
+    }
+}
+
 /// Error returned by [`validate_subdomain`].
 #[derive(Debug, thiserror::Error)]
 #[error("invalid subdomain \"{value}\": {reason}")]
@@ -175,6 +255,45 @@ mod tests {
         assert!(validate_subdomain("ab").is_err());
         assert!(validate_subdomain(&"a".repeat(64)).is_err());
         assert!(validate_subdomain("my app").is_err());
+    }
+
+    #[test]
+    fn domain_validation_accepts_real_names() {
+        for domain in [
+            "example.com",
+            "sub.example.com",
+            "a.b.c.example.co.uk",
+            "xn--bcher-kva.example",
+            "example-1.com",
+        ] {
+            assert!(validate_domain(domain).is_ok(), "{domain}");
+        }
+    }
+
+    #[test]
+    fn domain_validation_rejects_malformed_names() {
+        for (domain, why) in [
+            ("example", "needs two labels"),
+            ("example.com.", "trailing dot"),
+            ("Example.com", "uppercase"),
+            ("-lead.com", "leading dash"),
+            ("trail-.com", "trailing dash"),
+            ("double..dot.com", "empty label"),
+            ("a.com/b", "slash"),
+            ("a.com:443", "port"),
+            ("ex ample.com", "space"),
+            (&"a".repeat(64), "label too long"),
+        ] {
+            let err = validate_domain(domain).unwrap_err();
+            assert!(!err.reason.is_empty(), "{domain} ({why}) had no reason");
+        }
+    }
+
+    #[test]
+    fn domain_error_carries_the_offending_value() {
+        let err = validate_domain("Example.com").unwrap_err();
+        assert_eq!(err.value, "Example.com");
+        assert!(err.to_string().contains("Example.com"));
     }
 
     #[test]

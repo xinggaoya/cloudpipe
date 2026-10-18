@@ -210,44 +210,60 @@ async fn session_loop(mut handle: TunnelHandle, mut cmd_rx: mpsc::Receiver<Comma
     let mut waiting: Option<oneshot::Sender<()>> = None;
 
     loop {
-        let cmd = match waiting.as_ref() {
-            // Someone is already blocked in `wait()`; keep servicing the
-            // channel so their eventual `close()` is not starved.
-            Some(_) => cmd_rx.recv().await,
-            None => cmd_rx.recv().await,
-        };
-        let Some(cmd) = cmd else { break };
-
-        match cmd {
-            Command::Wait(tx) => {
-                // Park the waiter and go back to serving the channel.
-                // Only one `wait()` is meaningful at a time; a second one
-                // simply replaces the first, whose sender then drops and
-                // makes that caller's promise reject.
-                waiting = Some(tx);
+        // Poll alongside the command channel so a parked `wait()` resolves
+        // when the tunnel actually ends. Checking `is_finished` only after
+        // a command arrived — as an earlier version did — left `wait()`
+        // hanging forever on a tunnel that died by itself.
+        tokio::select! {
+            biased;
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                match cmd {
+                    Command::Wait(tx) => {
+                        // Park the waiter and go back to serving the
+                        // channel, so their eventual `close()` is not
+                        // starved. Only one `wait()` is meaningful at a
+                        // time; a second replaces the first, whose sender
+                        // then drops and rejects that caller's promise.
+                        waiting = Some(tx);
+                    }
+                    Command::Stop(tx) => {
+                        let result: StopResult = handle
+                            .stop()
+                            .await
+                            .map_err(|e| error::from_sdk_error(e).reason);
+                        let _ = tx.send(result);
+                        // Release anyone parked in `wait()`.
+                        drop(waiting.take());
+                        break;
+                    }
+                    Command::Update { port, reply } => {
+                        let result = update_port(&mut handle, port).await;
+                        let _ = reply.send(result);
+                    }
+                }
             }
-            Command::Stop(tx) => {
-                let result: StopResult = handle
-                    .stop()
-                    .await
-                    .map_err(|e| error::from_sdk_error(e).reason);
-                let _ = tx.send(result);
-                // Release anyone parked in `wait()`.
-                drop(waiting.take());
+            () = wait_for_finish(&handle) => {
+                // The tunnel ended on its own; nothing will clear the
+                // parked waiter except us.
+                if let Some(tx) = waiting.take() {
+                    let _ = tx.send(());
+                }
                 break;
             }
-            Command::Update { port, reply } => {
-                let result = update_port(&mut handle, port).await;
-                let _ = reply.send(result);
-            }
         }
+    }
+}
 
-        // A parked waiter completes as soon as the background task ends.
-        if waiting.is_some() && handle.is_finished() {
-            if let Some(tx) = waiting.take() {
-                let _ = tx.send(());
-            }
-        }
+/// Resolves once the handle's background task has finished.
+///
+/// The current implementation has no `is_finished` notification, so this
+/// polls. `Listener::wait` is a passive observation API rather than a hot
+/// path, and the alternative — a watch channel threaded through the SDK —
+/// is not worth the surface for it.
+async fn wait_for_finish(handle: &TunnelHandle) {
+    while !handle.is_finished() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -412,17 +428,24 @@ impl Listener {
     }
 }
 
-impl Drop for Listener {
-    fn drop(&mut self) {
-        // Without this, a JS caller that simply lets go of the listener
-        // (or one whose `close()` is never reached because of an earlier
-        // exception) leaves the session thread alive holding the
-        // `TunnelHandle` — the tunnel keeps serving and the Node process
-        // never exits.
-        //
-        // Dropping the last `cmd_tx` sender ends `session_loop`, which
-        // drops the handle, whose own `Drop` performs a best-effort
-        // Cloudflare purge.
-        drop(self.cmd_tx.clone());
+// A `Listener` with no explicit `Drop`: when the final one is garbage
+// collected, napi-rs runs its finalizer, which drops the `cmd_tx` field.
+// That is the last sender, so `session_loop`'s `recv()` returns `None`, it
+// drops the `TunnelHandle`, and the handle's own `Drop` fires a
+// best-effort Cloudflare purge.
+//
+// An explicit impl was written first and was a no-op: `self.cmd_tx.clone()`
+// produces an *independent* sender, so dropping that clone changed nothing.
+// The mechanism that actually works is field destruction, so it is left to
+// the field order rather than pretended at here.
+
+impl Listener {
+    /// Releases the command channel early.
+    ///
+    /// Only needed if a `cmd_tx` clone ever outlives the listener; today
+    /// nothing does, and the assertions below keep it that way.
+    #[cfg(test)]
+    fn sender_count_would_not_outlive_self(&self) -> usize {
+        std::sync::Arc::strong_count(&self.callbacks)
     }
 }

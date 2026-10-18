@@ -34,6 +34,10 @@ pub enum Error {
     #[error("invalid subdomain: {0}")]
     InvalidSubdomain(String),
 
+    /// The provided base domain is not a usable RFC 1123 name.
+    #[error("invalid domain: {0}")]
+    InvalidDomain(String),
+
     /// A healthy tunnel with the same name already exists.
     #[error("subdomain already in use: {0}")]
     SubdomainInUse(String),
@@ -171,9 +175,12 @@ pub enum InstallError {
     /// The asset is not covered by this build's pinned digest table, so it
     /// cannot be installed safely.
     #[error(
-        "refusing to install {0} unverified — this build pins no SHA-256 for it. \
-         Install cloudflared yourself and put it on PATH, or pass an explicit \
-         binary path."
+        "refusing to install {0} unverified — this build pins no SHA-256 for it.\n\
+         \n  Options:\n    \
+         - set CFP_CLOUDFLARED_SHA256=<sha256> with a digest you verified yourself\n    \
+         - install cloudflared from https://github.com/cloudflare/cloudflared/releases \
+         and put it on PATH\n    \
+         - pass an explicit path via .cloudflared_path(...) / --cloudflared-path"
     )]
     UnverifiedAsset(String),
 

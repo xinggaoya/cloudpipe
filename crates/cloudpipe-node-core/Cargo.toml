@@ -12,5 +12,5 @@ name = "cloudpipe_node_core"
 path = "src/lib.rs"
 
 [dependencies]
-cloudpipe-sdk = { path = "../cloudpipe-sdk" }
+cloudpipe-sdk = { workspace = true }
 serde_json = { workspace = true }
