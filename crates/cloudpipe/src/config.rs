@@ -5,13 +5,37 @@
 //! with `0700` and the file with `0600` permissions on Unix, since it contains
 //! a secret token.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use cloudpipe_sdk::Zone;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Environment variable that overrides the token from the config file.
 pub const TOKEN_ENV_VAR: &str = "CLOUDFLARE_API_TOKEN";
+
+/// Environment variable that relocates the whole config directory.
+pub const CONFIG_DIR_ENV_VAR: &str = "CFP_CONFIG_DIR";
+
+/// The three values a tunnel needs on top of the token.
+///
+/// [`Config::require_tunnel_context`] is the single place that validates
+/// their presence, so every command reports the same "run `cfp key` first"
+/// guidance instead of each handler re-deriving it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelContext {
+    /// Cloudflare account ID.
+    pub account_id: String,
+    /// Cloudflare zone ID.
+    pub zone_id: String,
+    /// Base domain.
+    pub domain: String,
+}
+
+/// Error produced when a required field is missing from the config.
+fn missing(field: &str) -> anyhow::Error {
+    anyhow::anyhow!("{field} not configured — run `cfp key <token>` first")
+}
 
 /// User configuration persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -46,6 +70,38 @@ impl Config {
             && self.zone_id.is_some()
             && self.domain.is_some()
     }
+
+    /// Extracts the account/zone/domain trio, reporting whichever field is
+    /// missing with actionable guidance.
+    pub fn require_tunnel_context(&self) -> Result<TunnelContext> {
+        let account_id = self
+            .account_id
+            .clone()
+            .ok_or_else(|| missing("account"))?;
+        let zone_id = self.zone_id.clone().ok_or_else(|| missing("zone"))?;
+        let domain = self.domain.clone().ok_or_else(|| missing("domain"))?;
+        Ok(TunnelContext {
+            account_id,
+            zone_id,
+            domain,
+        })
+    }
+
+    /// Applies a zone's identity, replacing whatever was configured before.
+    ///
+    /// Returns an error when Cloudflare's zone listing omitted the account
+    /// reference, rather than silently writing an empty account id that
+    /// would fail confusingly on the next `cfp <port>` run.
+    pub fn apply_zone(&mut self, zone: &Zone) -> Result<()> {
+        let account_id = zone
+            .require_account_id()
+            .map_err(|e| anyhow!("{e:#}"))?
+            .to_string();
+        self.account_id = Some(account_id);
+        self.zone_id = Some(zone.id.clone());
+        self.domain = Some(zone.name.clone());
+        Ok(())
+    }
 }
 
 /// Handles reading/writing the config file at a fixed location.
@@ -55,8 +111,17 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
-    /// Store rooted at `~/.cfp`.
+    /// Store rooted at `~/.cfp`, or at `$CFP_CONFIG_DIR` when set.
+    ///
+    /// The env override exists so tests and parallel CLI invocations do not
+    /// have to touch the real user's credentials.
     pub fn default() -> Result<Self> {
+        if let Some(dir) = std::env::var_os(CONFIG_DIR_ENV_VAR) {
+            let dir = PathBuf::from(dir);
+            if !dir.as_os_str().is_empty() {
+                return Ok(Self::with_dir(dir));
+            }
+        }
         let home = dirs::home_dir().context("cannot determine home directory")?;
         Ok(Self::with_dir(home.join(".cfp")))
     }

@@ -2,15 +2,13 @@
 
 mod cli;
 mod config;
+mod logging;
 mod ui;
-
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use colored::Colorize;
 
-use cli::{Cli, Command, TunnelArgs};
+use cli::{CleanupArgs, Cli, Command, TunnelArgs};
 use cloudpipe_sdk::{CloudflareApi, TunnelBuilder};
 use config::{Config, ConfigStore};
 
@@ -18,10 +16,9 @@ use config::{Config, ConfigStore};
 /// is provided.
 pub const DEFAULT_PORT: u16 = 8080;
 
-static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-
 fn main() {
     let cli = Cli::parse();
+    logging::init(logging::LogSetting::resolve(cli.verbose));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -38,38 +35,25 @@ async fn run(cli: Cli) -> Result<()> {
         Some(Command::Key { token, clear }) => handle_key(token, clear).await,
         Some(Command::Domain { domain }) => handle_domain(domain).await,
         Some(Command::Domains) => handle_domains().await,
-        Some(Command::Cleanup) => handle_cleanup().await,
+        Some(Command::Cleanup(args)) => handle_cleanup(args).await,
         None => run_tunnel_command(cli.to_tunnel_args()?).await,
     }
 }
 
 async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
-    install_ctrlc_handler()?;
-
     let store = ConfigStore::default()?;
     let config = store.load();
     let Some(token) = config.effective_token() else {
         ui::no_token_guide();
         bail!("no Cloudflare API token configured");
     };
-    let account_id = config
-        .account_id
-        .clone()
-        .ok_or_else(|| anyhow!("account not configured — run `cfp key <token>` first"))?;
-    let zone_id = config
-        .zone_id
-        .clone()
-        .ok_or_else(|| anyhow!("zone not configured — run `cfp key <token>` first"))?;
-    let domain = config
-        .domain
-        .clone()
-        .ok_or_else(|| anyhow!("domain not configured — run `cfp key <token>` first"))?;
+    let ctx = config.require_tunnel_context()?;
 
     let mut handle = TunnelBuilder::new()
         .token(token)
-        .account(account_id)
-        .zone(zone_id)
-        .domain(domain)
+        .account(ctx.account_id)
+        .zone(ctx.zone_id)
+        .domain(ctx.domain)
         .protocol(args.protocol)
         .port(args.port)
         .subdomain(args.subdomain.unwrap_or_default())
@@ -77,7 +61,7 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
         .on_event(ui::render_event)
         .start()
         .await
-        .map_err(anyhow::Error::msg)?;
+        .map_err(ui::render_sdk_error)?;
 
     ui::tunnel_live(
         handle.url(),
@@ -88,13 +72,17 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
     );
 
     // Wait for either Ctrl+C or the tunnel to exit on its own.
+    //
     // `biased` polls the Ctrl+C branch first so that an immediate Ctrl+C
     // is observed even before `wait()` is armed, and so that `wait()`
     // never holds a borrow of the handle while we want to call `stop()`.
+    //
+    // Ctrl+C comes straight from tokio's signal driver — no `AtomicBool`
+    // plus 100 ms polling loop, so shutdown latency is bounded by how
+    // fast the OS delivers SIGINT rather than by a sleep interval.
     tokio::select! {
         biased;
-        _ = wait_for_ctrlc() => {
-            EXIT_REQUESTED.store(true, Ordering::SeqCst);
+        _ = tokio::signal::ctrl_c() => {
             if let Err(err) = handle.stop().await {
                 ui::error(&format!("cleanup failed: {err:#}"));
             }
@@ -102,22 +90,6 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
         _ = handle.wait() => {}
     }
     Ok(())
-}
-
-async fn wait_for_ctrlc() {
-    loop {
-        if EXIT_REQUESTED.load(Ordering::SeqCst) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
-fn install_ctrlc_handler() -> Result<()> {
-    ctrlc::set_handler(|| {
-        EXIT_REQUESTED.store(true, Ordering::SeqCst);
-    })
-    .map_err(|e| anyhow!("cannot install Ctrl+C handler: {e}"))
 }
 
 async fn handle_key(token: Option<String>, clear: bool) -> Result<()> {
@@ -141,7 +113,7 @@ async fn handle_key(token: Option<String>, clear: bool) -> Result<()> {
         bail!("empty token — pass a non-empty value");
     }
 
-    println!("  {}", "Verifying token with Cloudflare...".dimmed());
+    ui::step("Verifying token with Cloudflare...");
     let api = CloudflareApi::new(trimmed.to_string()).map_err(anyhow::Error::msg)?;
     let status = api
         .verify_token()
@@ -158,7 +130,7 @@ async fn handle_key(token: Option<String>, clear: bool) -> Result<()> {
         bail!("token is valid but has access to no zones — add a Zone:Read resource to the token");
     }
 
-    apply_zone(&mut config, &zones[0]);
+    config.apply_zone(&zones[0])?;
     config.token = Some(trimmed.to_string());
     store.save(&config)?;
     if zones.len() == 1 {
@@ -168,8 +140,7 @@ async fn handle_key(token: Option<String>, clear: bool) -> Result<()> {
         ));
         ui::key_status(&config);
     } else {
-        println!();
-        println!("{}", "Multiple zones are accessible:".bold());
+        ui::heading("Multiple zones are accessible:");
         ui::zones(&zones, config.domain.as_deref());
         ui::success(&format!(
             "Saved (default domain: {}). Switch with `cfp domain <name>`.",
@@ -179,20 +150,10 @@ async fn handle_key(token: Option<String>, clear: bool) -> Result<()> {
     Ok(())
 }
 
-fn apply_zone(config: &mut Config, zone: &cloudpipe_sdk::Zone) {
-    config.account_id = Some(zone.account.id.clone());
-    config.zone_id = Some(zone.id.clone());
-    config.domain = Some(zone.name.clone());
-}
-
 async fn handle_domain(domain: String) -> Result<()> {
     let store = ConfigStore::default()?;
     let mut config = store.load();
-    let token = config
-        .effective_token()
-        .ok_or_else(|| anyhow!("no token configured — run `cfp key <token>` first"))?;
-
-    let api = CloudflareApi::new(token).map_err(anyhow::Error::msg)?;
+    let api = load_api(&config)?;
     let zone = api
         .find_zone(&domain)
         .await
@@ -200,7 +161,7 @@ async fn handle_domain(domain: String) -> Result<()> {
         .with_context(|| format!("looking up zone \"{domain}\""))?
         .ok_or_else(|| anyhow!("zone \"{domain}\" is not accessible with the saved token"))?;
 
-    apply_zone(&mut config, &zone);
+    config.apply_zone(&zone)?;
     store.save(&config)?;
     ui::success(&format!("Switched to {domain}."));
     Ok(())
@@ -209,39 +170,34 @@ async fn handle_domain(domain: String) -> Result<()> {
 async fn handle_domains() -> Result<()> {
     let store = ConfigStore::default()?;
     let config = store.load();
-    let token = config
-        .effective_token()
-        .ok_or_else(|| anyhow!("no token configured — run `cfp key <token>` first"))?;
-
-    let api = CloudflareApi::new(token).map_err(anyhow::Error::msg)?;
+    let api = load_api(&config)?;
     let zones = api.list_zones().await.map_err(anyhow::Error::msg)?;
     ui::zones(&zones, config.domain.as_deref());
     Ok(())
 }
 
-async fn handle_cleanup() -> Result<()> {
+async fn handle_cleanup(args: CleanupArgs) -> Result<()> {
     let store = ConfigStore::default()?;
     let config = store.load();
+    let ctx = config.require_tunnel_context()?;
+    let api = load_api(&config)?;
+
+    let report = if args.dry_run {
+        cloudpipe_sdk::preview_cleanup(&api, &ctx.account_id, &ctx.zone_id, &ctx.domain).await
+    } else {
+        cloudpipe_sdk::cleanup_with_report(&api, &ctx.account_id, &ctx.zone_id, &ctx.domain).await
+    }
+    .map_err(ui::render_sdk_error)?;
+
+    ui::cleanup_summary(&report, args.dry_run, args.json);
+    Ok(())
+}
+
+/// Builds an API client from the effective token, reporting the standard
+/// "run `cfp key` first" guidance when none is configured.
+fn load_api(config: &Config) -> Result<CloudflareApi> {
     let token = config
         .effective_token()
         .ok_or_else(|| anyhow!("no token configured — run `cfp key <token>` first"))?;
-    let account_id = config
-        .account_id
-        .clone()
-        .ok_or_else(|| anyhow!("account not configured — run `cfp key <token>` first"))?;
-    let zone_id = config
-        .zone_id
-        .clone()
-        .ok_or_else(|| anyhow!("zone not configured — run `cfp key <token>` first"))?;
-    let domain = config
-        .domain
-        .clone()
-        .ok_or_else(|| anyhow!("domain not configured — run `cfp key <token>` first"))?;
-
-    let api = CloudflareApi::new(token).map_err(anyhow::Error::msg)?;
-    let removed = cloudpipe_sdk::cleanup(&api, &account_id, &zone_id, &domain)
-        .await
-        .map_err(anyhow::Error::msg)?;
-    ui::cleanup_summary(removed);
-    Ok(())
+    CloudflareApi::new(token).map_err(anyhow::Error::msg)
 }

@@ -18,11 +18,11 @@
 //! [`TunnelHandle::stop`] (or the corresponding `Drop`) on every code path
 //! you control so the Cloudflare tunnel and DNS record are released.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{broadcast, Mutex, Notify};
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
 use crate::event::Event;
@@ -74,6 +74,18 @@ impl Shutdown {
 /// the most recent task so we don't leak a generation's pump.
 pub(crate) type StderrSlot = Arc<StdMutex<Option<JoinHandle<()>>>>;
 
+/// Extracts the pump task from `slot` and releases the lock before the
+/// caller awaits it.
+///
+/// The slot is a `std::sync::Mutex` (not an async one) on purpose: it is
+/// only ever held for a `take()`, never across an `.await`. Routing the
+/// extraction through this helper keeps that invariant checkable by the
+/// compiler instead of by convention.
+pub(crate) fn take_pump(slot: &StderrSlot) -> Option<JoinHandle<()>> {
+    let mut guard = slot.lock().expect("stderr slot poisoned");
+    guard.take()
+}
+
 /// A live tunnel. Created by [`crate::TunnelBuilder::start`].
 ///
 /// `TunnelHandle` is `Send + Sync` so you can move it between tasks or share
@@ -87,7 +99,6 @@ pub struct TunnelHandle {
     events: broadcast::Receiver<Event>,
     task: Option<JoinHandle<()>>,
     stderr_slot: Option<StderrSlot>,
-    _connections: Arc<AtomicUsize>,
     dispatch: crate::session::DispatchSlot,
     stopped: bool,
 }
@@ -113,7 +124,6 @@ impl TunnelHandle {
         subdomain: String,
         task: JoinHandle<()>,
         stderr_slot: StderrSlot,
-        _connections: Arc<AtomicUsize>,
         dispatch: crate::session::DispatchSlot,
     ) -> Self {
         let url = format!("https://{full_name}");
@@ -126,7 +136,6 @@ impl TunnelHandle {
             events,
             task: Some(task),
             stderr_slot: Some(stderr_slot),
-            _connections,
             dispatch,
             stopped: false,
         }
@@ -179,7 +188,7 @@ impl TunnelHandle {
         // returning the background task has already finished, so the
         // slot will not be rewritten underneath us.
         if let Some(slot) = self.stderr_slot.take() {
-            if let Some(task) = slot.lock().expect("stderr slot poisoned").take() {
+            if let Some(task) = take_pump(&slot) {
                 let _ = task.await;
             }
         }
@@ -202,41 +211,19 @@ impl TunnelHandle {
             let _ = task.await;
         }
         if let Some(slot) = self.stderr_slot.take() {
-            if let Some(task) = slot.lock().expect("stderr slot poisoned").take() {
+            if let Some(task) = take_pump(&slot) {
                 let _ = task.await;
             }
         }
 
         // Belt-and-suspenders: if the background task somehow didn't clean up
-        // (it should have), do it here.
-        let mut guard = self.state.lock().await;
-        if !guard.cleaned {
-            // Mirror `session::cleanup` directly.
-            guard.cleaned = true;
-            if let Ok(Some(record)) = guard
-                .api
-                .find_dns_record(&guard.zone_id, &guard.full_name)
-                .await
-            {
-                let _ = guard
-                    .api
-                    .delete_dns_record(&guard.zone_id, &record.id)
-                    .await;
-            }
-            let _ = guard
-                .api
-                .cleanup_connections(&guard.account_id, &guard.tunnel_id)
-                .await;
-            let _ = guard
-                .api
-                .delete_tunnel(&guard.account_id, &guard.tunnel_id)
-                .await;
-        }
+        // (it should have), do it here. Snapshot the Cloudflare-side
+        // coordinates under a short lock and release it before the network
+        // round-trips — `SessionState::purge` is internally idempotent, so
+        // racing the supervisor's own purge is harmless.
+        let snapshot = { self.state.lock().await.clone() };
+        snapshot.purge().await;
         Ok(())
-    }
-
-    fn _parts(&mut self) {
-        // intentionally unused; kept for future field-extraction needs.
     }
 }
 
@@ -252,20 +239,10 @@ impl Drop for TunnelHandle {
             task.abort();
         }
         if let Some(slot) = self.stderr_slot.take() {
-            if let Some(task) = slot.lock().expect("stderr slot poisoned").take() {
+            if let Some(task) = take_pump(&slot) {
                 task.abort();
             }
         }
         self.dispatch.abort();
     }
-}
-
-// Silence "unused" warnings for fields only consumed inside `wait`.
-#[allow(dead_code)]
-fn _assert_send_sync<T: Send + Sync>() {}
-
-#[allow(dead_code)]
-fn _assert_handle_send_sync() {
-    _assert_send_sync::<TunnelHandle>();
-    _assert_send_sync::<JoinError>();
 }

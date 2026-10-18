@@ -1,83 +1,329 @@
-//! End-to-end integration test for [`cloudpipe_sdk`].
+//! End-to-end integration tests for [`cloudpipe_sdk`].
 //!
-//! Spins up a tiny in-process HTTP server that mocks the subset of the
-//! Cloudflare API the SDK talks to, then points the SDK at it via
-//! [`CloudflareApi::with_base`]. The "cloudflared binary" is a small shell
-//! script we write into a temp dir and tell the SDK to use via
-//! [`TunnelBuilder::cloudflared_path`].
+//! Each test spins up a tiny in-process HTTP server that mocks the subset
+//! of the Cloudflare API the SDK talks to, points the SDK at it via
+//! [`CloudflareApi::with_base`], and substitutes a shell script for the
+//! `cloudflared` binary via [`TunnelBuilder::cloudflared_path`]. Nothing
+//! here touches the network or a real Cloudflare account.
 //!
-//! The test asserts that:
-//!
-//! 1. The SDK creates the tunnel, ingress and DNS record on the mock API.
-//! 2. It spawns the fake cloudflared and reports edge connections.
-//! 3. `TunnelHandle::stop` cleans up all three resources.
-//! 4. The dispatch task is aborted on drop.
+//! Test isolation: every case gets its own [`tempfile::TempDir`] (which
+//! cleans itself up) and its own mock server on an ephemeral port. The
+//! earlier version derived temp paths from `process::id()`, which made
+//! cases running in the same process race for the same directory.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cloudpipe_sdk::{CloudflareApi, Protocol, TunnelBuilder};
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Map of created DNS records keyed by full name.
-type CreatedRecords = Arc<Mutex<HashMap<String, String>>>;
+/// A Cloudflare tunnel's CNAME target suffix.
+const CFARGO: &str = ".cfargotunnel.com";
 
-/// Map of created tunnels keyed by name.
-type CreatedTunnels = Arc<Mutex<HashMap<String, String>>>;
-
-/// State shared between every mock-server request handler.
-#[derive(Clone)]
+#[derive(Default)]
 struct MockState {
-    tunnels: CreatedTunnels,
-    records: CreatedRecords,
-    deleted_records: Arc<Mutex<Vec<String>>>,
-    deleted_tunnels: Arc<Mutex<Vec<String>>>,
-    /// Number of POST /accounts/{id}/tunnels calls — used by the
-    /// auto-restart test to assert the supervisor actually respawned the
-    /// tunnel after `cloudflared` crashed.
-    tunnel_creation_count: Arc<AtomicUsize>,
+    tunnels: Mutex<HashMap<String, String>>,
+    records: Mutex<HashMap<String, String>>,
+    deleted_records: Mutex<Vec<String>>,
+    deleted_tunnels: Mutex<Vec<String>>,
+    /// How many times a tunnel was created — lets a test assert that the
+    /// supervisor really did respawn rather than re-reporting the same
+    /// generation.
+    tunnel_creation_count: AtomicUsize,
+    /// Set to make `create_tunnel` fail N times, for retry-path tests.
+    fail_create_times: AtomicUsize,
+    /// Set to make `POST .../dns_records` fail, for rollback tests.
+    fail_dns_create: AtomicBool,
 }
 
 impl MockState {
-    fn new() -> Self {
-        Self {
-            tunnels: Arc::new(Mutex::new(HashMap::new())),
-            records: Arc::new(Mutex::new(HashMap::new())),
-            deleted_records: Arc::new(Mutex::new(Vec::new())),
-            deleted_tunnels: Arc::new(Mutex::new(Vec::new())),
-            tunnel_creation_count: Arc::new(AtomicUsize::new(0)),
-        }
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn tunnels(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.tunnels.lock().unwrap()
+    }
+
+    fn records(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.records.lock().unwrap()
+    }
+
+    fn deleted_tunnels(&self) -> MutexGuard<'_, Vec<String>> {
+        self.deleted_tunnels.lock().unwrap()
+    }
+
+    fn deleted_records(&self) -> MutexGuard<'_, Vec<String>> {
+        self.deleted_records.lock().unwrap()
+    }
+
+    /// Fails the next `n` tunnel creations, then succeeds.
+    fn fail_next_creations(&self, n: usize) {
+        self.fail_create_times.store(n, Ordering::SeqCst);
+    }
+
+    fn set_fail_dns_create(&self, fail: bool) {
+        self.fail_dns_create.store(fail, Ordering::SeqCst);
     }
 }
 
-/// Builds an HTTP responder that satisfies the SDK's calls. Returns the
-/// base URL (`http://127.0.0.1:<port>`).
-async fn spawn_mock_api(state: MockState) -> String {
+type MutexGuard<'a, T> = std::sync::MutexGuard<'a, T>;
+
+/// A parsed request as the mock sees it.
+struct Req {
+    method: String,
+    path: String,
+    query: HashMap<String, String>,
+    body: Value,
+}
+
+/// A parsed HTTP request: headers, then a body sized by `Content-Length`.
+///
+/// The previous mock did a single `read()` and treated whatever arrived as
+/// the whole message, so a request whose body straddled a packet boundary
+/// (or one larger than the buffer) silently parsed as garbage.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
+    let mut buf = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 4096];
+
+    // Headers first.
+    let head_end = loop {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buf.len() > 64 * 1024 {
+            return None;
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let mut lines = head.lines();
+    let mut request_line = lines.next().unwrap_or("").split_whitespace();
+    let method = request_line.next().unwrap_or("").to_string();
+    let target = request_line.next().unwrap_or("").to_string();
+
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+
+    // Then exactly `content_length` more bytes.
+    while buf.len() < head_end + content_length {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
+    let body = if content_length > 0 && buf.len() >= head_end + content_length {
+        serde_json::from_slice(&buf[head_end..head_end + content_length]).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+
+    let (path, raw_query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+    let query = raw_query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    Some(Req {
+        method,
+        path: path.to_string(),
+        query,
+        body,
+    })
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Routes a parsed request to a canned Cloudflare response.
+fn route(req: &Req, state: &MockState) -> (u16, Value) {
+    let ok = |result: Value| (200, json!({ "success": true, "result": result }));
+
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/user/tokens/verify") => {
+            return ok(json!({ "id": "tok", "status": "active" }))
+        }
+        ("GET", "/zones") => {
+            return ok(json!([{
+                "id": "zone-1",
+                "name": "example.com",
+                "account": { "id": "acc-1" },
+            }]))
+        }
+        _ => {}
+    }
+
+    if req.path.starts_with("/accounts/") {
+        if req.method == "POST" && req.path.ends_with("/tunnels") {
+            // Exhaust any pending failures before succeeding. `usize::MAX`
+            // is the "fail forever" sentinel: it decrements forever without
+            // ever wrapping.
+            let remaining = state.fail_create_times.load(Ordering::SeqCst);
+            if remaining > 0 {
+                state.fail_create_times.store(remaining - 1, Ordering::SeqCst);
+                return (
+                    500,
+                    json!({"success": false, "result": null,
+                           "errors": [{"code": 1000, "message": "transient"}]}),
+                );
+            }
+            let name = req
+                .body
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let id = format!("tun-{name}-{}", state.tunnel_creation_count.load(Ordering::SeqCst));
+            state
+                .tunnels()
+                .insert(name.clone(), id.clone());
+            state.tunnel_creation_count.fetch_add(1, Ordering::SeqCst);
+            return ok(json!({
+                "id": id, "name": name, "status": "healthy", "token": "fake-token"
+            }));
+        }
+
+        if req.method == "DELETE" {
+            // `/tunnels/{id}/connections` is the "kill live connections"
+            // call, not a tunnel deletion. It must not be counted as one,
+            // and it must not remove the tunnel from the live set.
+            if let Some(tid) = req.path.strip_suffix("/connections") {
+                let tid = tid.rsplit('/').next().unwrap_or("").to_string();
+                let _ = tid;
+                return ok(Value::Null);
+            }
+            let tid = req.path.rsplit('/').next().unwrap_or("").to_string();
+            state.tunnels().retain(|_, id| *id != tid);
+            state.deleted_tunnels().push(tid);
+            return ok(Value::Null);
+        }
+
+        if req.method == "PUT" && req.path.contains("/cfd_tunnel/") {
+            return ok(Value::Null);
+        }
+
+        if req.method == "GET" && req.path.ends_with("/tunnels") {
+            // Name/status filters are honoured so conflict resolution can
+            // be exercised.
+            let name = req.query.get("name").cloned();
+            let status = req.query.get("status").cloned();
+            let mut out = Vec::new();
+            for (tname, id) in state.tunnels().iter() {
+                if let Some(want) = &name {
+                    if tname != want {
+                        continue;
+                    }
+                }
+                if let Some(status) = &status {
+                    // Only `healthy` matches, which is what the SDK probes.
+                    if status != "healthy" {
+                        continue;
+                    }
+                }
+                out.push(json!({"id": id, "name": tname, "status": "healthy"}));
+            }
+            return ok(Value::Array(out));
+        }
+
+        if req.method == "GET" && req.path.contains("/tunnels/") {
+            let tid = req.path.rsplit('/').next().unwrap_or("");
+            if state.tunnels().values().any(|id| id == tid) {
+                return ok(json!({"id": tid, "name": "x", "status": "healthy"}));
+            }
+            return (
+                404,
+                json!({"success": false, "result": null,
+                       "errors": [{"code": 0, "message": "not found"}]}),
+            );
+        }
+    }
+
+    if req.path.starts_with("/zones/") && req.path.contains("/dns_records") {
+        if req.method == "GET" {
+            let want = req.query.get("name");
+            let out: Vec<Value> = state
+                .records()
+                .iter()
+                .filter(|(name, _)| want.as_ref().is_none_or(|w| name == w))
+                .map(|(name, id)| {
+                    json!({"id": id, "name": name, "content": "tun-x.cfargotunnel.com"})
+                })
+                .collect();
+            return ok(Value::Array(out));
+        }
+        if req.method == "POST" {
+            if state.fail_dns_create.load(Ordering::SeqCst) {
+                return (
+                    400,
+                    json!({"success": false, "result": null,
+                           "errors": [{"code": 81057, "message": "record invalid"}]}),
+                );
+            }
+            let name = req
+                .body
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let id = format!("rec-{}", state.records().len());
+            state.records().insert(name.clone(), id.clone());
+            return ok(json!({"id": id, "name": name, "content": "tun-x.cfargotunnel.com"}));
+        }
+        if req.method == "DELETE" {
+            let rid = req.path.rsplit('/').next().unwrap_or("").to_string();
+            state.records().retain(|_, id| *id != rid);
+            state.deleted_records().push(rid);
+            return ok(Value::Null);
+        }
+    }
+
+    (
+        404,
+        json!({"success": false, "result": null,
+               "errors": [{"code": 0,
+                           "message": format!("unmocked: {} {}", req.method, req.path)}]}),
+    )
+}
+
+/// Starts the mock API and returns its base URL.
+async fn spawn_mock_api(state: Arc<MockState>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => break,
-            };
-            let state = state.clone();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let state = Arc::clone(&state);
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 16 * 1024];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                let first_line = request.lines().next().unwrap_or("");
-                let method = first_line.split_whitespace().next().unwrap_or("");
-                let path = first_line.split_whitespace().nth(1).unwrap_or("");
-                let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-                let body = &request[body_start..];
-
-                let (status, json) = route(method, path, body, &state);
-                let payload = serde_json::to_string(&json).unwrap();
+                let Some(req) = read_request(&mut stream).await else {
+                    return;
+                };
+                let (status, body) = route(&req, &state);
+                let payload = body.to_string();
                 let response = format!(
-                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                     payload.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
@@ -87,445 +333,485 @@ async fn spawn_mock_api(state: MockState) -> String {
     format!("http://{addr}")
 }
 
-fn route(method: &str, path: &str, body: &str, state: &MockState) -> (u16, serde_json::Value) {
-    // /user/tokens/verify
-    if path == "/user/tokens/verify" && method == "GET" {
-        return (
-            200,
-            serde_json::json!({"success": true, "result": {"id": "tok", "status": "active"}}),
-        );
-    }
-
-    // POST /accounts/{id}/tunnels — create
-    if method == "POST" && path.starts_with("/accounts/") && path.ends_with("/tunnels") {
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-        let name = parsed
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let id = format!("tun-{name}");
-        state
-            .tunnels
-            .lock()
-            .unwrap()
-            .insert(name.clone(), id.clone());
-        state.tunnel_creation_count.fetch_add(1, Ordering::SeqCst);
-        return (
-            200,
-            serde_json::json!({
-                "success": true,
-                "result": {
-                    "id": id,
-                    "name": name,
-                    "status": "healthy",
-                    "token": "fake-token",
-                }
-            }),
-        );
-    }
-
-    // DELETE /accounts/{id}/tunnels/{tid} — delete
-    if method == "DELETE" && path.contains("/tunnels/") && !path.ends_with("/connections") {
-        let parts: Vec<&str> = path.split('/').collect();
-        if let Some(tid) = parts.last() {
-            state.deleted_tunnels.lock().unwrap().push(tid.to_string());
-        }
-        return (200, serde_json::json!({"success": true, "result": null}));
-    }
-
-    // DELETE /accounts/{id}/tunnels/{tid}/connections — cleanup
-    if method == "DELETE" && path.ends_with("/connections") {
-        return (200, serde_json::json!({"success": true, "result": null}));
-    }
-
-    // PUT /accounts/{id}/cfd_tunnel/{tid}/configurations — ingress
-    if method == "PUT" && path.contains("/cfd_tunnel/") {
-        return (200, serde_json::json!({"success": true, "result": null}));
-    }
-
-    // GET /zones/{id}/dns_records?name=...
-    if method == "GET" && path.starts_with("/zones/") && path.contains("/dns_records") {
-        let records = state.records.lock().unwrap();
-        let list: Vec<_> = records
-            .iter()
-            .map(|(name, id)| {
-                serde_json::json!({
-                    "id": id,
-                    "name": name,
-                    "content": "tun-x.cfargotunnel.com",
-                })
-            })
-            .collect();
-        return (200, serde_json::json!({"success": true, "result": list}));
-    }
-
-    // POST /zones/{id}/dns_records — create
-    if method == "POST" && path.starts_with("/zones/") && path.contains("/dns_records") {
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-        let name = parsed
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let id = format!("rec-{}", state.records.lock().unwrap().len());
-        state
-            .records
-            .lock()
-            .unwrap()
-            .insert(name.clone(), id.clone());
-        return (
-            200,
-            serde_json::json!({
-                "success": true,
-                "result": {
-                    "id": id,
-                    "name": name,
-                    "content": "tun-x.cfargotunnel.com",
-                }
-            }),
-        );
-    }
-
-    // DELETE /zones/{id}/dns_records/{rid}
-    if method == "DELETE" && path.starts_with("/zones/") && path.contains("/dns_records/") {
-        let rid = path.rsplit('/').next().unwrap_or("").to_string();
-        state.deleted_records.lock().unwrap().push(rid);
-        return (200, serde_json::json!({"success": true, "result": null}));
-    }
-
-    // GET /zones — list accessible zones (used by `find_zone` and `list_zones`).
-    if method == "GET" && (path == "/zones" || path.starts_with("/zones?")) {
-        return (
-            200,
-            serde_json::json!({
-                "success": true,
-                "result": [
-                    {
-                        "id": "zone-1",
-                        "name": "example.com",
-                        "account": {"id": "acc-1"},
-                    }
-                ]
-            }),
-        );
-    }
-
-    // GET /accounts/{id}/tunnels?... — find/list
-    if method == "GET" && path.starts_with("/accounts/") && path.contains("/tunnels") {
-        return (200, serde_json::json!({"success": true, "result": []}));
-    }
-
-    (
-        404,
-        serde_json::json!({
-            "success": false,
-            "result": null,
-            "errors": [{"code": 0, "message": format!("unmocked path: {method} {path}")}],
-        }),
-    )
-}
-
-/// Writes a fake `cloudflared` shell script and chmods it executable.
-/// The script prints one "registered tunnel connection" line and then
-/// loops sleeping so it stays alive long enough for the test to observe
-/// edge events. A SIGTERM trap makes the script exit cleanly so that the
-/// SDK's stderr pump observes EOF immediately when the process is
-/// killed (no zombie children holding the stderr write end open).
-async fn write_fake_cloudflared(dir: &std::path::Path) -> std::path::PathBuf {
-    let path = dir.join("cloudflared");
-    let script = "\
-#!/bin/sh
-trap 'exit 0' TERM INT
-echo \"2025-01-01 Registered tunnel connection connIndex=0\"
-while true; do sleep 1; done
-";
-    tokio::fs::write(&path, script).await.unwrap();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = tokio::fs::metadata(&path).await.unwrap().permissions();
-        perms.set_mode(0o755);
-        tokio::fs::set_permissions(&path, perms).await.unwrap();
-    }
-    path
-}
-
-/// Writes a "one-shot" fake `cloudflared`: the **first** invocation
-/// prints the connection line and exits cleanly (status 0), forcing the
-/// SDK's supervisor to respawn it; the **second** invocation runs
-/// forever so the test has time to call `stop()`. The invocation count
-/// is persisted to `counter_file` so the test can assert that both
-/// generations ran.
-async fn write_oneshot_cloudflared(
-    dir: &std::path::Path,
-    counter_file: &std::path::Path,
+/// Writes a `cloudflared` stand-in that announces one edge connection and
+/// then idles until it is signalled.
+///
+/// The `term_marker` file is touched from a TERM trap, which lets a test
+/// assert that shutdown signals the process *before* the SDK starts
+/// deleting Cloudflare resources.
+async fn write_fake_cloudflared(
+    dir: &Path,
+    markers: Option<(&Path, &Path)>,
 ) -> std::path::PathBuf {
     let path = dir.join("cloudflared");
-    let counter = counter_file.display().to_string();
-    let script = format!(
-        "\
-#!/bin/sh
-trap 'exit 0' TERM INT
-COUNTER_FILE=\"{counter}\"
-count=$(cat \"$COUNTER_FILE\" 2>/dev/null || echo 0)
-count=$((count + 1))
-echo \"$count\" > \"$COUNTER_FILE\"
-echo \"2025-01-01 Registered tunnel connection connIndex=0\"
-if [ \"$count\" = \"1\" ]; then
-  exit 0
-fi
-while true; do sleep 1; done
-"
-    );
-    tokio::fs::write(&path, script).await.unwrap();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = tokio::fs::metadata(&path).await.unwrap().permissions();
-        perms.set_mode(0o755);
-        tokio::fs::set_permissions(&path, perms).await.unwrap();
-    }
+    let script = match markers {
+        Some((ready, term)) => format!(
+            "#!/bin/sh\ntrap 'echo terminated > \"{term}\"; exit 0' TERM INT\n\
+             echo \"2025-01-01 Registered tunnel connection connIndex=0\"\n\
+             echo up > \"{ready}\"\n\
+             while true; do sleep 0.05; done\n",
+            term = term.display(),
+            ready = ready.display()
+        ),
+        None => "#!/bin/sh\ntrap 'exit 0' TERM INT\n\
+                  echo \"2025-01-01 Registered tunnel connection connIndex=0\"\n\
+                  while true; do sleep 0.05; done\n"
+            .to_string(),
+    };
+    write_script(&path, &script).await;
     path
 }
 
+/// A `cloudflared` stand-in whose first invocation exits immediately (a
+/// simulated crash) and later ones idle forever.
+async fn write_crashing_cloudflared(
+    dir: &Path,
+    counter_file: &Path,
+) -> std::path::PathBuf {
+    let path = dir.join("cloudflared");
+    let script = format!(
+        "#!/bin/sh\ntrap 'exit 0' TERM INT\nCOUNTER_FILE=\"{}\"\n\
+         count=$(cat \"$COUNTER_FILE\" 2>/dev/null || echo 0)\n\
+         count=$((count + 1))\necho \"$count\" > \"$COUNTER_FILE\"\n\
+         echo \"2025-01-01 Registered tunnel connection connIndex=0\"\n\
+         if [ \"$count\" = \"1\" ]; then exit 1; fi\n\
+         while true; do sleep 0.05; done\n",
+        counter_file.display()
+    );
+    write_script(&path, &script).await;
+    path
+}
+
+async fn write_script(path: &Path, script: &str) {
+    tokio::fs::write(path, script).await.unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = tokio::fs::metadata(path).await.unwrap().permissions();
+        perms.set_mode(0o755);
+        tokio::fs::set_permissions(path, perms).await.unwrap();
+    }
+}
+
+fn api_for(base: &str) -> CloudflareApi {
+    CloudflareApi::with_base("test-token", base).unwrap()
+}
+
+async fn wait_until(mut predicate: impl FnMut() -> bool, budget: Duration, what: &str) {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+// ---------------------------------------------------------------------------
+// API surface against the mock
+// ---------------------------------------------------------------------------
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_lifecycle_with_mock_api() {
-    // Mock API server.
+async fn cloudflare_api_round_trips_against_mock() {
     let state = MockState::new();
     let base = spawn_mock_api(state.clone()).await;
+    let api = api_for(&base);
 
-    // Fake cloudflared binary.
-    let tmp = std::env::temp_dir().join(format!("cfp-test-{}", std::process::id()));
-    let _ = tokio::fs::remove_dir_all(&tmp).await;
-    tokio::fs::create_dir_all(&tmp).await.unwrap();
-    let binary = write_fake_cloudflared(&tmp).await;
-
-    // Patch the SDK's API base URL by building the CloudflareApi manually and
-    // passing it via TunnelBuilder. We don't expose a custom base on the
-    // builder directly, but we can build the api ourselves and feed the rest
-    // of the pipeline via tunnel.handle. For simplicity here we use a small
-    // standalone helper: build the CloudflareApi with the mock base and then
-    // call TunnelBuilder::start — since TunnelBuilder::new creates its own
-    // api from the token, we instead validate behaviour by exercising
-    // CloudflareApi directly against the mock.
-
-    // Verify token via the mock.
-    let api = CloudflareApi::with_base("test-token", base.clone()).unwrap();
     let status = api.verify_token().await.unwrap();
     assert_eq!(status.status, "active");
 
-    // Create a tunnel through the mock.
+    let zone = api.find_zone("example.com").await.unwrap().expect("zone");
+    assert_eq!(zone.require_account_id().unwrap(), "acc-1");
+
     let tunnel = api.create_tunnel("acc-1", "myapp").await.unwrap();
     assert_eq!(tunnel.name, "myapp");
-    assert_eq!(state.tunnels.lock().unwrap().get("myapp"), Some(&tunnel.id));
+    assert_eq!(state.tunnels().get("myapp"), Some(&tunnel.id));
 
-    // Set ingress.
     let ingress = vec![
         cloudpipe_sdk::IngressEntry {
             hostname: Some("myapp.example.com".into()),
             service: "http://localhost:8080".into(),
+            origin_request: Some(cloudpipe_sdk::OriginRequest::insecure()),
         },
         cloudpipe_sdk::IngressEntry {
             hostname: None,
             service: "http_status:404".into(),
+            origin_request: None,
         },
     ];
     api.set_tunnel_ingress("acc-1", &tunnel.id, &ingress)
         .await
         .unwrap();
 
-    // Create a DNS record.
-    let rec = api
+    let record = api
         .create_dns_record(
             "zone-1",
             "myapp.example.com",
-            &format!("{}.cfargotunnel.com", tunnel.id),
+            &format!("{}{CFARGO}", tunnel.id),
         )
         .await
         .unwrap();
-    assert_eq!(rec.name, "myapp.example.com");
-    assert!(state
-        .records
-        .lock()
-        .unwrap()
-        .contains_key("myapp.example.com"));
-
-    // Lookup should find it.
-    let found = api
+    assert!(state.records().contains_key("myapp.example.com"));
+    assert!(api
         .find_dns_record("zone-1", "myapp.example.com")
         .await
-        .unwrap();
-    assert!(found.is_some());
+        .unwrap()
+        .is_some());
 
-    // Cleanup.
-    api.delete_dns_record("zone-1", &rec.id).await.unwrap();
+    api.delete_dns_record("zone-1", &record.id).await.unwrap();
     api.cleanup_connections("acc-1", &tunnel.id).await.unwrap();
     api.delete_tunnel("acc-1", &tunnel.id).await.unwrap();
 
-    assert!(state.deleted_records.lock().unwrap().contains(&rec.id));
-    assert!(state.deleted_tunnels.lock().unwrap().contains(&tunnel.id));
-
-    // Use the fake binary path so the spawn attempt doesn't hit the network.
-    TunnelBuilder::new()
-        .token("test-token")
-        .account("acc-1")
-        .zone("zone-1")
-        .domain("example.com")
-        .protocol(Protocol::Http)
-        .port(8080)
-        .subdomain("unreachable-in-this-test")
-        .cloudflared_path(binary)
-        .validate()
-        .unwrap();
+    assert!(state.deleted_records().contains(&record.id));
+    assert!(state.deleted_tunnels().contains(&tunnel.id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn builder_validate_rejects_missing_credentials() {
-    // No fields set.
-    let err = TunnelBuilder::new().validate().unwrap_err();
-    assert!(matches!(
-        err,
-        cloudpipe_sdk::Error::MissingCredential("Cloudflare API token")
-    ));
+async fn null_list_result_is_an_error_not_an_empty_list() {
+    // Regression guard for the old `T: Default` design, which turned
+    // `result: null` into an empty vec and reported "token is valid but has
+    // access to no zones".
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _ = read_request(&mut stream).await;
+                let body = r#"{"success":true,"result":null}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
 
-    // Token alone is enough — account/zone/domain are auto-discovered.
-    TunnelBuilder::new().token("t").validate().unwrap();
+    let api = CloudflareApi::with_base("t", format!("http://{addr}")).unwrap();
+    let err = api.list_zones().await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("null result"),
+        "expected an explicit null-result error, got: {err:#}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn event_stream_observed_via_subscribe() {
-    // Set up a minimal "successful" mock that returns canned responses and
-    // verify that events flow through. We do NOT start a tunnel here — we
-    // only verify the broadcast pipeline wires up correctly.
-    let (tx, _rx) = tokio::sync::broadcast::channel::<cloudpipe_sdk::Event>(16);
-    let mut rx = tx.subscribe();
-    tx.send(cloudpipe_sdk::Event::Banner).unwrap();
-    let event = rx.recv().await.unwrap();
-    assert!(matches!(event, cloudpipe_sdk::Event::Banner));
+async fn pagination_collects_every_page() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Some(req) = read_request(&mut stream).await else {
+                    return;
+                };
+                let page: u32 = req
+                    .query
+                    .get("page")
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(1);
+                let body = json!({
+                    "success": true,
+                    "result": [
+                        {"id": format!("z{page}a"), "name": format!("a{page}.test"),
+                         "account": {"id": "acc-1"}},
+                        {"id": format!("z{page}b"), "name": format!("b{page}.test"),
+                         "account": {"id": "acc-1"}},
+                    ],
+                    "result_info": {"page": page, "per_page": 2, "total_pages": 3},
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let api = CloudflareApi::with_base("t", format!("http://{addr}")).unwrap();
+    let zones = api.list_zones().await.unwrap();
+    assert_eq!(zones.len(), 6, "3 pages × 2 rows");
+    assert_eq!(zones[0].name, "a1.test");
+    assert_eq!(zones[5].name, "b3.test");
 }
 
-/// Smoke test: ensure a tunnel builder serialises / clones properly.
-#[test]
-fn builder_clone_is_safe() {
-    let b = TunnelBuilder::new()
-        .token("t")
-        .account("a")
-        .zone("z")
-        .domain("example.com");
-    let _b2 = b.clone();
-}
-
-/// Regression test for the `wait()` bug where calling it would immediately
-/// trigger shutdown, killing the tunnel right after it came up.
-///
-/// `wait()` is now a passive block: it must not signal shutdown on its own.
-/// Only an explicit `stop()` (or another path that triggers shutdown) should
-/// drive the background task into cleanup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wait_does_not_signal_shutdown() {
-    // Mock API server.
+async fn rate_limits_are_retried_transparently() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_task = Arc::clone(&calls);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let n = calls_for_task.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = read_request(&mut stream).await;
+                let (status_line, body) = if n < 2 {
+                    (
+                        "429 Too Many Requests",
+                        r#"{"success":false,"result":null,"errors":[{"code":10429,"message":"slow down"}]}"#,
+                    )
+                } else {
+                    ("200 OK", r#"{"success":true,"result":[]}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let api = CloudflareApi::with_base("t", format!("http://{addr}")).unwrap();
+    let zones = api.list_zones().await.unwrap();
+    assert!(zones.is_empty());
+    assert!(
+        calls.load(Ordering::SeqCst) >= 3,
+        "expected at least one retry, saw {} calls",
+        calls.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permanent_failures_are_not_retried() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_task = Arc::clone(&calls);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            calls_for_task.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = read_request(&mut stream).await;
+                let body =
+                    r#"{"success":false,"result":null,"errors":[{"code":10001,"message":"bad auth"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let api = CloudflareApi::with_base("t", format!("http://{addr}")).unwrap();
+    let err = api.list_zones().await.unwrap_err();
+    assert!(format!("{err:#}").contains("bad auth"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a 4xx must not be replayed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_lifecycle_creates_then_cleans_up() {
     let state = MockState::new();
     let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = write_fake_cloudflared(tmp.path(), None).await;
 
-    // Fake cloudflared: print one "registered tunnel connection" line so
-    // the SDK emits `EdgeConnected`, then sleep long enough that the test
-    // can prove wait() doesn't kill it.
-    let tmp = std::env::temp_dir().join(format!("cfp-wait-test-{}", std::process::id()));
-    let _ = tokio::fs::remove_dir_all(&tmp).await;
-    tokio::fs::create_dir_all(&tmp).await.unwrap();
-    let binary = write_fake_cloudflared(&tmp).await;
-
-    // Start the tunnel through the builder, pointing at the mock API.
     let mut handle = TunnelBuilder::new()
-        .api(CloudflareApi::with_base("test-token", base).unwrap())
+        .api(api_for(&base))
         .account("acc-1")
         .zone("zone-1")
         .domain("example.com")
         .protocol(Protocol::Http)
         .port(8080)
-        .subdomain("wait-passive")
+        .subdomain("lifecycle")
         .cloudflared_path(binary)
         .start()
         .await
         .expect("start should succeed");
 
-    // After start, the tunnel and DNS record exist on the mock.
-    assert_eq!(state.tunnels.lock().unwrap().len(), 1);
-    assert_eq!(state.records.lock().unwrap().len(), 1);
-    assert!(
-        state.deleted_tunnels.lock().unwrap().is_empty(),
-        "no cleanup should have happened yet"
-    );
-    assert!(
-        state.deleted_records.lock().unwrap().is_empty(),
-        "no cleanup should have happened yet"
-    );
+    assert_eq!(handle.url(), "https://lifecycle.example.com");
+    assert_eq!(handle.subdomain(), "lifecycle");
+    assert_eq!(handle.full_name(), "lifecycle.example.com");
 
-    // `wait(&mut self)` must NOT signal shutdown. The fake cloudflared
-    // sleeps 60s, so a properly-passive wait will block past our short
-    // timeout. With the old bug, wait() would trigger shutdown and the
-    // background task would have run cleanup long before the timeout.
-    let timed_out = tokio::time::timeout(std::time::Duration::from_millis(500), handle.wait())
-        .await
-        .is_err();
-    assert!(
-        timed_out,
-        "wait() must remain pending while the tunnel is alive"
-    );
+    assert_eq!(state.tunnels().len(), 1);
+    assert_eq!(state.records().len(), 1);
+    assert!(state.deleted_tunnels().is_empty());
+    assert!(state.deleted_records().is_empty());
 
-    // Nothing was cleaned up during the wait.
-    assert!(
-        state.deleted_tunnels.lock().unwrap().is_empty(),
-        "wait() must not delete the tunnel"
-    );
-    assert!(
-        state.deleted_records.lock().unwrap().is_empty(),
-        "wait() must not delete the DNS record"
-    );
-
-    // An explicit `stop()` is what drives cleanup.
     handle.stop().await.expect("stop should succeed");
-    assert!(
-        !state.deleted_tunnels.lock().unwrap().is_empty(),
-        "stop() should have deleted the tunnel"
-    );
-    assert!(
-        !state.deleted_records.lock().unwrap().is_empty(),
-        "stop() should have deleted the DNS record"
-    );
 
-    // After stop, calling stop again reports the handle is shut down.
+    assert!(
+        !state.deleted_tunnels().is_empty(),
+        "the tunnel must be deleted"
+    );
+    assert!(
+        !state.deleted_records().is_empty(),
+        "the DNS record must be deleted"
+    );
+    // The real invariant: nothing may survive on the account. Counting the
+    // DELETE calls exactly would instead pin the number of round-trips,
+    // which is an implementation detail — `purge` collapses concurrent
+    // callers via a shared flag and that must stay free to change.
+    assert!(state.tunnels().is_empty(), "no tunnel may be left behind");
+    assert!(state.records().is_empty(), "no DNS record may be left behind");
+
     let err = handle.stop().await.unwrap_err();
     assert!(matches!(err, cloudpipe_sdk::Error::AlreadyShutDown));
 }
 
-/// With `auto_restart` enabled, a `cloudflared` crash must be recovered:
-/// the SDK respawns `cloudflared` on the same subdomain (so the public
-/// URL is stable) and re-emits the tunnel-create lifecycle events. A
-/// user-initiated `stop()` still tears everything down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_signals_cloudflared_before_touching_cloudflare() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let ready = tmp.path().join("ready-marker");
+    let term = tmp.path().join("term-marker");
+    let binary = write_fake_cloudflared(tmp.path(), Some((&ready, &term))).await;
+
+    let mut handle = TunnelBuilder::new()
+        .api(api_for(&base))
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .subdomain("order")
+        .cloudflared_path(binary)
+        .start()
+        .await
+        .expect("start should succeed");
+
+    wait_until(
+        || ready.exists(),
+        Duration::from_secs(5),
+        "cloudflared to start",
+    )
+    .await;
+    assert!(!term.exists(), "the TERM trap must not have run yet");
+    assert!(state.deleted_tunnels().is_empty());
+
+    handle.stop().await.expect("stop should succeed");
+
+    // The TERM trap ran, i.e. the process was signalled. The SDK used to
+    // delete the DNS record and the tunnel first, failing every in-flight
+    // request; this asserts the ordering.
+    assert!(
+        term.exists(),
+        "cloudflared must receive a termination signal during shutdown"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_failure_after_dns_creation_rolls_everything_back() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    // A `cloudflared` path that does not exist makes the spawn step fail —
+    // the step that used to leak both a tunnel and a DNS record.
+    let missing = tmp.path().join("definitely-not-here");
+
+    let err = TunnelBuilder::new()
+        .api(api_for(&base))
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .subdomain("rollback")
+        .cloudflared_path(missing)
+        .start()
+        .await
+        .expect_err("spawning a nonexistent binary must fail");
+
+    assert!(
+        format!("{err:#}").to_lowercase().contains("spawn"),
+        "unexpected error: {err:#}"
+    );
+
+    assert_eq!(
+        state.deleted_tunnels().len(),
+        1,
+        "the tunnel created before the failure must be rolled back"
+    );
+    assert_eq!(
+        state.deleted_records().len(),
+        1,
+        "the DNS record created before the failure must be rolled back"
+    );
+    assert!(state.tunnels().is_empty());
+    assert!(state.records().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_creation_failure_removes_the_new_tunnel() {
+    let state = MockState::new();
+    state.set_fail_dns_create(true);
+    let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = write_fake_cloudflared(tmp.path(), None).await;
+
+    TunnelBuilder::new()
+        .api(api_for(&base))
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .subdomain("dnsfail")
+        .cloudflared_path(binary)
+        .start()
+        .await
+        .expect_err("DNS creation was made to fail");
+
+    assert_eq!(state.deleted_tunnels().len(), 1);
+    assert!(state.tunnels().is_empty());
+    assert!(state.records().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_subdomain_is_rejected_before_any_side_effect() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+
+    // No `cloudflared_path`: had validation run late, this would have
+    // reached `ensure_installed` and tried a ~30 MB download first.
+    let err = TunnelBuilder::new()
+        .api(api_for(&base))
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .subdomain("Not Valid")
+        .start()
+        .await
+        .expect_err("an invalid subdomain must be rejected");
+
+    assert!(matches!(err, cloudpipe_sdk::Error::InvalidSubdomain(_)));
+    assert_eq!(
+        state.tunnel_creation_count.load(Ordering::SeqCst),
+        0,
+        "no tunnel may be created for an invalid subdomain"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auto-restart
+// ---------------------------------------------------------------------------
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_restart_respawns_after_cloudflared_crash() {
     let state = MockState::new();
     let base = spawn_mock_api(state.clone()).await;
-
-    // One-shot fake cloudflared: first invocation exits immediately to
-    // simulate a crash, second invocation sleeps forever.
-    let tmp = std::env::temp_dir().join(format!("cfp-restart-test-{}", std::process::id()));
-    let _ = tokio::fs::remove_dir_all(&tmp).await;
-    tokio::fs::create_dir_all(&tmp).await.unwrap();
-    let counter_file = tmp.join("counter");
-    let binary = write_oneshot_cloudflared(&tmp, &counter_file).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let counter = tmp.path().join("counter");
+    let binary = write_crashing_cloudflared(tmp.path(), &counter).await;
 
     let mut handle = TunnelBuilder::new()
-        .api(CloudflareApi::with_base("test-token", base).unwrap())
+        .api(api_for(&base))
         .account("acc-1")
         .zone("zone-1")
         .domain("example.com")
-        .protocol(Protocol::Http)
-        .port(8080)
         .subdomain("restart-test")
         .auto_restart(true)
         .cloudflared_path(binary)
@@ -533,63 +819,48 @@ async fn auto_restart_respawns_after_cloudflared_crash() {
         .await
         .expect("start should succeed");
 
-    // The URL is stable across the restart — same subdomain, same domain.
     assert_eq!(handle.full_name(), "restart-test.example.com");
 
-    // Wait for the respawn: a fresh tunnel object must appear on the
-    // mock within a few seconds. We poll the creation counter instead of
-    // the event stream so the test isn't coupled to broadcast delivery
-    // ordering.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if state.tunnel_creation_count.load(Ordering::SeqCst) >= 2 {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!(
-                "auto-restart never fired; tunnel_creation_count={}",
-                state.tunnel_creation_count.load(Ordering::SeqCst)
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    wait_until(
+        || {
+            state.tunnel_creation_count.load(Ordering::SeqCst) >= 2
+                && std::fs::read_to_string(&counter)
+                    .map(|c| c.trim().parse::<u32>().unwrap_or(0) >= 2)
+                    .unwrap_or(false)
+        },
+        Duration::from_secs(10),
+        "auto-restart to respawn",
+    )
+    .await;
 
-    // The cloudflared stub itself ran twice — initial crashed and the
-    // respawned long-lived one.
-    let counter = std::fs::read_to_string(&counter_file).unwrap();
-    assert!(
-        counter.trim().parse::<u32>().unwrap() >= 2,
-        "expected cloudflared to have been respawned; counter={counter}"
-    );
+    let runs = std::fs::read_to_string(&counter)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert!(runs >= 2, "cloudflared should have been respawned: {runs}");
 
-    // User-initiated stop should still tear down the live tunnel and DNS.
     handle.stop().await.expect("stop should succeed");
     assert!(
-        !state.deleted_tunnels.lock().unwrap().is_empty(),
-        "stop should have cleaned up the live tunnel"
+        !state.deleted_tunnels().is_empty(),
+        "stop() must clean up the live tunnel"
     );
+    assert!(state.tunnels().is_empty(), "no tunnel may survive stop()");
 }
 
-/// Without `auto_restart`, a `cloudflared` crash must end the session —
-/// the supervisor must NOT respawn the child and `wait()` must return.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_restart_off_terminates_on_crash() {
     let state = MockState::new();
     let base = spawn_mock_api(state.clone()).await;
-
-    let tmp = std::env::temp_dir().join(format!("cfp-norestart-test-{}", std::process::id()));
-    let _ = tokio::fs::remove_dir_all(&tmp).await;
-    tokio::fs::create_dir_all(&tmp).await.unwrap();
-    let counter_file = tmp.join("counter");
-    let binary = write_oneshot_cloudflared(&tmp, &counter_file).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let counter = tmp.path().join("counter");
+    let binary = write_crashing_cloudflared(tmp.path(), &counter).await;
 
     let mut handle = TunnelBuilder::new()
-        .api(CloudflareApi::with_base("test-token", base).unwrap())
+        .api(api_for(&base))
         .account("acc-1")
         .zone("zone-1")
         .domain("example.com")
-        .protocol(Protocol::Http)
-        .port(8080)
         .subdomain("no-restart")
         .auto_restart(false)
         .cloudflared_path(binary)
@@ -597,18 +868,134 @@ async fn auto_restart_off_terminates_on_crash() {
         .await
         .expect("start should succeed");
 
-    // `wait()` must observe the crash and return within a few seconds.
-    // With auto_restart=true this would block forever.
-    tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
+    tokio::time::timeout(Duration::from_secs(10), handle.wait())
         .await
-        .expect("wait should return promptly after cloudflared exits");
+        .expect("wait should return after cloudflared exits");
 
-    // Exactly one tunnel was created — no respawn.
     assert_eq!(
         state.tunnel_creation_count.load(Ordering::SeqCst),
         1,
-        "no respawn should have occurred with auto_restart=false"
+        "no respawn should occur with auto_restart=false"
     );
-    let counter = std::fs::read_to_string(&counter_file).unwrap();
-    assert_eq!(counter.trim(), "1", "cloudflared ran exactly once");
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().trim(),
+        "1",
+        "cloudflared ran exactly once"
+    );
+    assert!(
+        state.tunnels().is_empty(),
+        "the crashed generation's tunnel must be reclaimed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_restart_gives_up_after_repeated_bootstrap_failures() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // The first generation must crash, otherwise the supervisor sits in
+    // `wait_for_exit` and never reaches the retry ladder at all.
+    let counter = tmp.path().join("counter");
+    let binary = write_crashing_cloudflared(tmp.path(), &counter).await;
+
+    let mut handle = TunnelBuilder::new()
+        .api(api_for(&base))
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .subdomain("giveup")
+        .auto_restart(true)
+        // Millisecond ladder so the test observes the give-up path without
+        // waiting out the production backoff.
+        .restart_policy(cloudpipe_sdk::RestartPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(40),
+        })
+        .cloudflared_path(binary)
+        .start()
+        .await
+        .expect("the initial bootstrap succeeds");
+
+    // Now make every reconnect attempt fail. The supervisor must give up
+    // rather than retrying (and burning the token's quota) forever.
+    state.fail_next_creations(usize::MAX);
+
+    // The loop must terminate on its own rather than spinning forever.
+    tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("the supervisor must give up rather than retry forever");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_is_passive_and_does_not_clean_up() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = write_fake_cloudflared(tmp.path(), None).await;
+
+    let mut handle = TunnelBuilder::new()
+        .api(api_for(&base))
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .subdomain("wait-passive")
+        .cloudflared_path(binary)
+        .start()
+        .await
+        .expect("start should succeed");
+
+    assert_eq!(state.tunnels().len(), 1);
+    assert_eq!(state.records().len(), 1);
+
+    // The fake cloudflared idles forever, so a passive `wait()` stays
+    // pending. An active one would tear the tunnel down immediately.
+    let timed_out = tokio::time::timeout(Duration::from_millis(500), handle.wait())
+        .await
+        .is_err();
+    assert!(timed_out, "wait() must not signal shutdown");
+
+    assert!(state.deleted_tunnels().is_empty(), "wait() deleted the tunnel");
+    assert!(state.deleted_records().is_empty(), "wait() deleted the DNS");
+
+    handle.stop().await.expect("stop should succeed");
+    assert!(!state.deleted_tunnels().is_empty());
+    assert!(!state.deleted_records().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Builder-level checks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn builder_validate_rejects_missing_credentials() {
+    let err = TunnelBuilder::new().validate().unwrap_err();
+    assert!(matches!(
+        err,
+        cloudpipe_sdk::Error::MissingCredential("Cloudflare API token")
+    ));
+    TunnelBuilder::new().token("t").validate().unwrap();
+}
+
+#[test]
+fn builder_clone_is_safe() {
+    let b = TunnelBuilder::new()
+        .token("t")
+        .account("a")
+        .zone("z")
+        .domain("example.com");
+    let _clone = b.clone();
+}
+
+#[test]
+fn origin_request_builders_compose() {
+    let b = TunnelBuilder::new()
+        .token("t")
+        .no_tls_verify(true)
+        .origin_connect_timeout(5)
+        .origin_host_header("localhost");
+    let debug = format!("{b:?}");
+    assert!(debug.contains("no_tls_verify"), "{debug}");
+    assert!(debug.contains("connect_timeout"), "{debug}");
+    assert!(debug.contains("http_host_header"), "{debug}");
 }

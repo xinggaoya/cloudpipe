@@ -38,6 +38,13 @@ pub struct Cli {
     #[arg(long)]
     pub no_restart: bool,
 
+    /// Print the SDK's internal trace to stderr.
+    ///
+    /// Equivalent to `CFP_LOG=debug`. Use it to see the retry/backoff
+    /// decisions the supervisor makes when a tunnel is flapping.
+    #[arg(long, short = 'v', global = true)]
+    pub verbose: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -54,7 +61,19 @@ pub enum Command {
         domain: String,
     },
     Domains,
-    Cleanup,
+    Cleanup(CleanupArgs),
+}
+
+/// Options for `cfp cleanup`.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct CleanupArgs {
+    /// List what would be removed without deleting anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit a machine-readable JSON report instead of human output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Normalized tunnel command arguments.
@@ -104,6 +123,7 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("cfp").chain(args.iter().copied())).unwrap()
@@ -150,5 +170,45 @@ mod tests {
             }
             _ => panic!("expected Key command"),
         }
+    }
+
+    #[test]
+    fn cleanup_flags_default_to_off() {
+        let cli = parse(&["cleanup"]);
+        match cli.command.unwrap() {
+            Command::Cleanup(args) => {
+                assert!(!args.dry_run);
+                assert!(!args.json);
+            }
+            _ => panic!("expected Cleanup command"),
+        }
+    }
+
+    #[test]
+    fn cleanup_flags_parse() {
+        let cli = parse(&["cleanup", "--dry-run", "--json"]);
+        match cli.command.unwrap() {
+            Command::Cleanup(args) => {
+                assert!(args.dry_run);
+                assert!(args.json);
+            }
+            _ => panic!("expected Cleanup command"),
+        }
+    }
+
+    #[test]
+    fn verbose_flag_parses() {
+        assert!(parse(&["8080", "-v"]).verbose);
+        assert!(parse(&["8080", "--verbose"]).verbose);
+        assert!(!parse(&["8080"]).verbose);
+    }
+
+    #[test]
+    fn version_flag_is_advertised_in_help() {
+        // The README used to promise `cfp -v`; clap only provides
+        // `-V`/`--version`. Keep this test so docs and binary cannot drift
+        // apart silently again.
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--version"), "help must mention --version");
     }
 }

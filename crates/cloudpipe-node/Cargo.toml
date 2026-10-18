@@ -9,6 +9,9 @@ description = "Node.js bindings for cloudpipe — serverless Cloudflare tunnels 
 keywords = ["cloudflare", "tunnel", "napi", "nodejs", "ngrok-alternative"]
 categories = ["api-bindings", "network-programming"]
 links = "cloudpipe"
+# NOTE: `cdylib` only — this crate is a Node addon, not something a Rust
+# consumer links against. All testable logic lives in `cloudpipe-node-core`
+# precisely because a cdylib's test harness cannot link napi symbols.
 
 [lib]
 name = "cloudpipe_node"
@@ -16,12 +19,14 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-cloudpipe-sdk = { path = "../cloudpipe-sdk" }
-napi = { version = "3", default-features = false, features = ["napi4", "serde-json", "async", "tokio_rt"] }
-napi-derive = "3"
-once_cell = "1"
-serde_json.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "rt"] }
+cloudpipe-sdk = { workspace = true }
+cloudpipe-node-core = { path = "../cloudpipe-node-core", version = "0.1.1" }
+napi = { workspace = true }
+napi-derive = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 
 [build-dependencies]
-napi-build = "2"
+napi-build = { workspace = true }
+
+[lints]
+workspace = true

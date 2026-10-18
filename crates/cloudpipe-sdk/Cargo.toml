@@ -1,11 +1,11 @@
 [package]
 name = "cloudpipe-sdk"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 description = "Async Rust SDK for serverless Cloudflare tunnels (no backend service)"
-license = "MIT"
-repository = "https://github.com/xinggaoya/cloudpipe"
-homepage = "https://github.com/xinggaoya/cloudpipe"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords = ["cloudflare", "tunnel", "localhost", "cloudflared", "ngrok-alternative", "sdk"]
 categories = ["api-bindings", "network-programming", "asynchronous"]
@@ -15,16 +15,23 @@ name = "cloudpipe_sdk"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1"
-dirs = "6"
-flate2 = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tar = "0.4"
-thiserror = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "fs", "time", "signal"] }
-tracing = "0.1"
+anyhow = { workspace = true }
+dirs = { workspace = true }
+flate2 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+# `tempfile` gives each test its own self-cleaning directory. The previous
+# `std::env::temp_dir().join(format!("cfp-test-{}", process::id()))` scheme
+# made cases in the same test binary collide.
+tempfile = "3"
+tokio = { workspace = true, features = ["rt"] }
+
+[lints]
+workspace = true

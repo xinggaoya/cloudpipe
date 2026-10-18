@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use tokio::sync::broadcast;
 
 use crate::binary;
-use crate::client::CloudflareApi;
+use crate::client::{CloudflareApi, OriginRequest};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::handle::Shutdown;
-use crate::protocol::Protocol;
+use crate::protocol::{validate_subdomain, Protocol};
 use crate::session::{self, DispatchSlot, SessionConfig};
 
 /// Default local port when none is supplied. Matches the CLI default.
@@ -58,9 +58,11 @@ pub struct TunnelBuilder {
     port: u16,
     subdomain: Option<String>,
     binary_path: Option<PathBuf>,
+    origin_request: Option<OriginRequest>,
     config_dir: Option<PathBuf>,
     github_proxy: Option<String>,
     auto_restart: bool,
+    restart_policy: crate::session::RestartPolicy,
 }
 
 impl Default for TunnelBuilder {
@@ -83,9 +85,11 @@ impl TunnelBuilder {
             port: DEFAULT_PORT,
             subdomain: None,
             binary_path: None,
+            origin_request: None,
             config_dir: None,
             github_proxy: None,
             auto_restart: false,
+            restart_policy: crate::session::RestartPolicy::default(),
         }
     }
 
@@ -159,6 +163,59 @@ impl TunnelBuilder {
         self
     }
 
+    /// Skips TLS verification when the origin is `https://` with a
+    /// self-signed certificate.
+    ///
+    /// This is what makes exposing a local dev server over HTTPS possible
+    /// at all: `cloudflared` validates the origin certificate, and a
+    /// `localhost` dev server almost never has a CA-signed one.
+    pub fn no_tls_verify(mut self, enabled: bool) -> Self {
+        let origin = self.origin_request.get_or_insert_with(OriginRequest::default);
+        origin.no_tls_verify = Some(enabled);
+        self
+    }
+
+    /// Sends `Host: <value>` to the origin instead of the public hostname.
+    ///
+    /// Needed whenever the local service routes on its own hostname — a
+    /// virtual-host setup such as `*.test` or a framework that validates
+    /// the `Host` header.
+    pub fn origin_host_header(mut self, value: impl Into<String>) -> Self {
+        self.origin_request
+            .get_or_insert_with(OriginRequest::default)
+            .http_host_header = Some(value.into());
+        self
+    }
+
+    /// Overrides the origin TCP connect timeout, in seconds.
+    pub fn origin_connect_timeout(mut self, seconds: u64) -> Self {
+        self.origin_request
+            .get_or_insert_with(OriginRequest::default)
+            .connect_timeout = Some(seconds);
+        self
+    }
+
+    /// Disables HTTP/2 to the origin.
+    ///
+    /// `cloudflared` negotiates h2 by default; a few dev servers (older
+    /// Python/Node handlers, some gRPC-over-plaintext setups) only speak
+    /// HTTP/1.1 and fail the connection outright rather than negotiating
+    /// down.
+    pub fn http2_origin(mut self, enabled: bool) -> Self {
+        self.origin_request
+            .get_or_insert_with(OriginRequest::default)
+            .http2_origin = Some(enabled);
+        self
+    }
+
+    /// Sets the complete origin configuration at once, overriding any
+    /// individual [`no_tls_verify`](Self::no_tls_verify) /
+    /// [`origin_host_header`](Self::origin_host_header) / … calls.
+    pub fn origin_request(mut self, request: OriginRequest) -> Self {
+        self.origin_request = Some(request);
+        self
+    }
+
     /// Root directory for SDK-managed files (where `cloudflared` is
     /// downloaded to when not found on `PATH`). Defaults to `~/.cfp`.
     pub fn config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -190,6 +247,18 @@ impl TunnelBuilder {
         self
     }
 
+    /// Overrides how aggressively the supervisor reconnects a crashed
+    /// tunnel. Only consulted when [`auto_restart`](Self::auto_restart)
+    /// is enabled.
+    ///
+    /// The defaults (5 attempts, 500 ms doubling to a 8 s cap) suit a
+    /// developer exposing a dev server. Widen `max_delay` for a
+    /// long-lived tunnel that should ride out a Cloudflare incident.
+    pub fn restart_policy(mut self, policy: crate::session::RestartPolicy) -> Self {
+        self.restart_policy = policy;
+        self
+    }
+
     /// Validates that all required credentials are present. Mainly useful
     /// for dry-run preflight checks.
     ///
@@ -212,6 +281,7 @@ impl TunnelBuilder {
             inner: self,
             handler: Some(on_event),
             dispatch: DispatchSlot::default(),
+            completed: false,
         }
     }
 
@@ -224,11 +294,24 @@ impl TunnelBuilder {
 /// Intermediate builder returned by [`TunnelBuilder::on_event`]. Holds the
 /// user-supplied closure plus a dispatch slot that the resulting
 /// [`crate::TunnelHandle`] will abort on `Drop`.
+///
+/// If [`StartedBuilder::start`] fails, the `Drop` impl aborts the event
+/// dispatch task that `start` spawned — otherwise the task would outlive
+/// the builder, hold the broadcast sender alive and never terminate.
 #[must_use = "call .start() to launch the tunnel"]
 pub struct StartedBuilder<F> {
     inner: TunnelBuilder,
     handler: Option<F>,
     dispatch: DispatchSlot,
+    completed: bool,
+}
+
+impl<F> Drop for StartedBuilder<F> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.dispatch.abort();
+        }
+    }
 }
 
 impl<F> StartedBuilder<F>
@@ -237,6 +320,18 @@ where
 {
     /// Launches the tunnel.
     pub async fn start(mut self) -> Result<crate::TunnelHandle> {
+        // Resolve and validate the subdomain first. It is the cheapest
+        // possible failure (pure local check) and validating it after
+        // zone discovery / `cloudflared` download would mean a typo costs
+        // the user an API round-trip and a ~30 MB download before the
+        // error surfaces.
+        let subdomain = match self.inner.subdomain.take() {
+            Some(s) if !s.is_empty() => s.to_ascii_lowercase(),
+            _ => crate::session::random_subdomain(),
+        };
+        validate_subdomain(&subdomain)
+            .map_err(|e| Error::InvalidSubdomain(format!("\"{}\": {}", e.value, e.reason)))?;
+
         let api = match self.inner.api.take() {
             Some(api) => api,
             None => {
@@ -257,16 +352,11 @@ where
         //   multiple, surface a clear error so the caller can pick.
         let (account_id, zone_id, domain) = resolve_zone(
             &api,
-            self.inner.account_id,
-            self.inner.zone_id,
-            self.inner.domain,
+            self.inner.account_id.take(),
+            self.inner.zone_id.take(),
+            self.inner.domain.take(),
         )
         .await?;
-
-        let subdomain = match self.inner.subdomain.take() {
-            Some(s) if !s.is_empty() => s.to_ascii_lowercase(),
-            _ => crate::session::random_subdomain(),
-        };
 
         let binary_path = match self.inner.binary_path.take() {
             Some(p) => p,
@@ -301,13 +391,19 @@ where
             port: self.inner.port,
             subdomain,
             binary_path,
+            origin_request: self.inner.origin_request.take(),
             event_tx,
             shutdown: Shutdown::new(),
-            dispatch: self.dispatch,
+            dispatch: self.dispatch.clone(),
             auto_restart: self.inner.auto_restart,
+            restart_policy: self.inner.restart_policy,
         };
 
-        session::start(cfg).await
+        let handle = session::start(cfg).await?;
+        // Ownership of the dispatch task transfers to `TunnelHandle`;
+        // suppress the `Drop` abort so the handler keeps running.
+        self.completed = true;
+        Ok(handle)
     }
 }
 
@@ -335,7 +431,8 @@ async fn resolve_zone(
                     "domain \"{d}\" is not accessible with this token"
                 ))
             })?;
-            Ok((zone.account.id, zone.id, zone.name))
+            let account = zone.require_account_id()?;
+            Ok((account.to_string(), zone.id, zone.name))
         }
         (None, None, None) => {
             let zones = api.list_zones().await?;
@@ -345,7 +442,8 @@ async fn resolve_zone(
                 ))),
                 1 => {
                     let z = zones.into_iter().next().unwrap();
-                    Ok((z.account.id, z.id, z.name))
+                    let account = z.require_account_id()?;
+                    Ok((account.to_string(), z.id, z.name))
                 }
                 n => Err(Error::Other(anyhow::anyhow!(
                     "token has access to {n} zones — pass .domain(\"...\"), \

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cloudpipe",
     "crates/cloudpipe-sdk",
+    "crates/cloudpipe-node-core",
     "crates/cloudpipe-node",
 ]
 
@@ -12,20 +13,37 @@ license = "MIT"
 repository = "https://github.com/xinggaoya/cloudpipe"
 homepage = "https://github.com/xinggaoya/cloudpipe"
 
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Guards a class of bug this codebase has already hit once: holding a lock
+# guard across an `.await`. Rust's std `Mutex` in particular must never be
+# held that way — see `handle::take_pump`.
+await_holding_lock = "deny"
+
 [workspace.dependencies]
 anyhow = "1"
+cloudpipe-sdk = { path = "crates/cloudpipe-sdk", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 colored = "3"
-ctrlc = "3"
 dirs = "6"
 flate2 = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# NOTE: no `blocking` feature — nothing in the workspace uses the blocking
+# client, and enabling it pulls in an extra runtime path for no benefit.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "fs", "time", "signal"] }
 tracing = "0.1"
+
+# Node addon bindings. Kept here so the version is decided once for the
+# workspace rather than drifting between the binding and its helpers.
+napi = { version = "3", default-features = false, features = ["napi4", "serde-json", "async", "tokio_rt"] }
+napi-derive = "3"
+napi-build = "2"
 
 [profile.release]
 strip = true

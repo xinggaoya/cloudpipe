@@ -60,6 +60,19 @@ pub enum Event {
         attempt: u32,
     },
 
+    /// A reconnection attempt failed *before* `cloudflared` was running
+    /// again — a Cloudflare API error, a `cloudflared` spawn failure, or a
+    /// name conflict. Distinct from [`Event::Restarting`]: the public URL
+    /// is currently down and stays down for this iteration.
+    ///
+    /// Only emitted when auto-restart is enabled.
+    BootstrapFailed {
+        /// 1-based attempt number that just failed.
+        attempt: u32,
+        /// Human-readable reason, already formatted for display.
+        error: String,
+    },
+
     /// The auto-restart loop has exhausted its retry budget (consecutive
     /// bootstrap failures) and is giving up. The session is about to
     /// enter normal shutdown. Only emitted when auto-restart is enabled.

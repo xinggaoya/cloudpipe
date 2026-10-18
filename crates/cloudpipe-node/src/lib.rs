@@ -1,33 +1,36 @@
 //! napi-rs bindings for the cloudpipe Rust SDK.
 //!
 //! Exposes a single `connect()` entry point returning a [`Listener`] that
-//! wraps `cloudpipe_sdk::TunnelHandle`. See `../README.md` for the user-facing
-//! API and examples.
+//! wraps `cloudpipe_sdk::TunnelHandle`. See `../README.md` for the
+//! user-facing API and examples.
+//!
+//! # Where the logic lives
+//!
+//! This crate is a `cdylib`, so a `cargo test` harness for it cannot link
+//! (the `napi_*` symbols only resolve inside a Node.js process). Anything
+//! worth testing therefore lives in the napi-free `cloudpipe-node-core`
+//! crate, and this file holds only the `#[napi]`-annotated shells that
+//! delegate to it.
 
 #![deny(missing_docs)]
 #![warn(rust_2018_idioms)]
 
 mod error;
-mod event;
 mod listener;
 
-use std::sync::Arc;
-
-use cloudpipe_sdk::Protocol;
-use napi::bindgen_prelude::*;
-use napi_derive::napi;
-use once_cell::sync::Lazy;
+use cloudpipe_node_core::{CloudflareApiKind, CloudpipeErrorCode};
 use tokio::runtime::Runtime;
 
-pub use error::CloudpipeErrorCode;
 pub use listener::Listener;
+
+use napi::bindgen_prelude::*;
+use napi_derive::napi;
 
 /// Single shared tokio runtime for every async operation in this binding.
 ///
-/// Mirrors the `ngrok-js` approach: napi callbacks are already running on
-/// libuv worker threads, but `cloudpipe-sdk` needs a tokio runtime for its
-/// async tasks (Cloudflare API calls, `cloudflared` process supervision).
-static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+/// napi callbacks already run on libuv worker threads, but the SDK needs a
+/// tokio runtime for its Cloudflare calls and `cloudflared` supervision.
+static RUNTIME: std::sync::LazyLock<Runtime> = std::sync::LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(4)
@@ -83,16 +86,6 @@ pub struct ConnectOptions {
     pub github_proxy: Option<String>,
 }
 
-impl ConnectOptions {
-    /// Parses the protocol string into the SDK enum, returning a plain
-    /// `&'static str` so this function is unit-testable without linking
-    /// the napi native symbols.
-    fn protocol_enum(&self) -> std::result::Result<Protocol, &'static str> {
-        let raw = self.protocol.as_deref().unwrap_or("http");
-        Protocol::parse(raw).map_err(|_| "invalid protocol — supported: http, https, tcp, udp, ssh")
-    }
-}
-
 /// Opens a new tunnel and returns a handle to it.
 ///
 /// ```text
@@ -116,6 +109,16 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Every event name the SDK may emit, in the order documented on the
+/// package README. Lets JS callers validate a name before registering.
+#[napi]
+pub fn event_names() -> Vec<String> {
+    cloudpipe_node_core::event::EVENT_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 /// Extracts the `[CODE]` prefix from a cloudpipe error message.
 ///
 /// Cloudpipe surfaces its error taxonomy as a `[CODE]` prefix on
@@ -131,109 +134,38 @@ pub fn version() -> &'static str {
 /// - or `null` when no `[CODE]` prefix is present.
 #[napi]
 pub fn parse_error_code(message: String) -> Option<String> {
-    use crate::error::{CloudflareApiKind, CloudpipeErrorCode};
-    let raw = message.strip_prefix('[')?;
-    let end = raw.find(']')?;
-    let inner = &raw[..end];
-    let mut parts = inner.splitn(2, ':');
-    let parent = parts.next()?;
-
-    // Validate against the typed enum so a future code rename/refactor
-    // surfaces as a Rust compile error instead of a silent JS-side
-    // string drift.
-    let parent_code = match parent {
-        "MISSING_CREDENTIAL" => CloudpipeErrorCode::MissingCredential,
-        "CLOUDFLARE_API" => CloudpipeErrorCode::CloudflareApi,
-        "CLOUDFLARE_BINARY" => CloudpipeErrorCode::CloudflaredBinary,
-        "INVALID_SUBDOMAIN" => CloudpipeErrorCode::InvalidSubdomain,
-        "SUBDOMAIN_IN_USE" => CloudpipeErrorCode::SubdomainInUse,
-        "ALREADY_SHUT_DOWN" => CloudpipeErrorCode::AlreadyShutDown,
-        "IO" => CloudpipeErrorCode::Io,
-        "OTHER" => CloudpipeErrorCode::Other,
-        // Unknown parent — fall through and return the raw text. We
-        // deliberately don't fail so forward-compat works both ways:
-        // newer SDK emits an unknown parent -> older JS helper still
-        // gets a string back, not an exception.
-        _ => return Some(parent.to_string()),
-    };
-    let _ = parent_code;
-
-    // For CloudflareApi, surface the parent + kind verbatim. Other
-    // codes don't carry a sub-kind.
-    let suffix = match parts.next() {
-        Some(s) => s,
-        None => return Some(parent.to_string()),
-    };
-    // Validate the sub-kind against the typed enum; if it doesn't match,
-    // return the raw text (forward compat again).
-    let suffix_code = match suffix {
-        "RATE_LIMITED" => CloudflareApiKind::RateLimited,
-        "DNS_EXISTS" => CloudflareApiKind::DnsExists,
-        "AUTH_FAILED" => CloudflareApiKind::AuthFailed,
-        "INVALID_TOKEN" => CloudflareApiKind::InvalidToken,
-        "OTHER" => CloudflareApiKind::Other,
-        _ => return Some(format!("{parent}:{suffix}")),
-    };
-    let _ = suffix_code;
-    Some(format!("{parent}:{suffix}"))
+    cloudpipe_node_core::extract_code(&message)
 }
 
-// Silence unused-Arc warning while we wire things up incrementally.
-#[allow(dead_code)]
-fn _arc<T>(t: T) -> Arc<T> {
-    Arc::new(t)
+/// The complete list of top-level cloudpipe error codes.
+#[napi]
+pub fn error_codes() -> Vec<String> {
+    [
+        CloudpipeErrorCode::MissingCredential,
+        CloudpipeErrorCode::CloudflareApi,
+        CloudpipeErrorCode::CloudflaredBinary,
+        CloudpipeErrorCode::InvalidSubdomain,
+        CloudpipeErrorCode::SubdomainInUse,
+        CloudpipeErrorCode::AlreadyShutDown,
+        CloudpipeErrorCode::Io,
+        CloudpipeErrorCode::Other,
+    ]
+    .iter()
+    .map(|c| c.as_str().to_string())
+    .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_error_code;
-
-    #[test]
-    fn parses_simple_code() {
-        assert_eq!(
-            parse_error_code("[MISSING_CREDENTIAL] need a token".into()),
-            Some("MISSING_CREDENTIAL".to_string())
-        );
-    }
-
-    #[test]
-    fn parses_compound_kind() {
-        assert_eq!(
-            parse_error_code("[CLOUDFLARE_API:RATE_LIMITED] too many".into()),
-            Some("CLOUDFLARE_API:RATE_LIMITED".to_string())
-        );
-    }
-
-    #[test]
-    fn returns_null_on_plain_message() {
-        assert_eq!(parse_error_code("no prefix here".into()), None);
-    }
-
-    #[test]
-    fn returns_null_on_malformed_prefix() {
-        assert_eq!(parse_error_code("[not closed here".into()), None);
-    }
-
-    #[test]
-    fn unknown_code_passes_through() {
-        // Forward-compat: a future SDK version emits a brand-new code
-        // that this helper doesn't know about -> return it verbatim
-        // instead of throwing.
-        assert_eq!(
-            parse_error_code("[FUTURE_CODE] blah".into()),
-            Some("FUTURE_CODE".to_string())
-        );
-        assert_eq!(
-            parse_error_code("[FUTURE_CODE:NEXT_KIND] blah".into()),
-            Some("FUTURE_CODE:NEXT_KIND".to_string())
-        );
-    }
-
-    #[test]
-    fn known_parent_with_unknown_subkind_passes_through() {
-        assert_eq!(
-            parse_error_code("[CLOUDFLARE_API:RATE_LIMITED_EXTENDED] blah".into()),
-            Some("CLOUDFLARE_API:RATE_LIMITED_EXTENDED".to_string())
-        );
-    }
+/// The sub-kind catalog that may follow `CLOUDFLARE_API:`.
+#[napi]
+pub fn cloudflare_error_kinds() -> Vec<String> {
+    [
+        CloudflareApiKind::RateLimited,
+        CloudflareApiKind::DnsExists,
+        CloudflareApiKind::AuthFailed,
+        CloudflareApiKind::InvalidToken,
+        CloudflareApiKind::Other,
+    ]
+    .iter()
+    .map(|k| k.as_str().to_string())
+    .collect()
 }

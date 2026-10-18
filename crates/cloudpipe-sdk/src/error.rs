@@ -4,6 +4,8 @@
 //! one of the variants of [`Error`]. Callers can `match` on it without
 //! resorting to string parsing.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Convenience alias for `std::result::Result<T, Error>`.
@@ -56,6 +58,10 @@ pub enum ApiError {
     #[error("http transport: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// A request exceeded the client's connect or overall deadline.
+    #[error("request timed out after {0:?}")]
+    Timeout(Duration),
+
     /// The server responded with a non-JSON body.
     #[error("non-JSON response (HTTP {status}): {body}")]
     NonJson {
@@ -90,6 +96,9 @@ pub enum CloudflareErrorKind {
     AuthFailed,
     /// Token itself is invalid (1038).
     InvalidToken,
+    /// The server returned 5xx or an HTTP 429 with no structured body.
+    /// Worth retrying — the request never took effect.
+    ServerError,
     /// Any other code. Use [`CloudflareErrorKind::code`] to inspect it.
     Other(u64),
 }
@@ -102,8 +111,14 @@ impl CloudflareErrorKind {
             Self::DnsExists => Some(81053),
             Self::AuthFailed => None,
             Self::InvalidToken => Some(1038),
+            Self::ServerError => None,
             Self::Other(code) => Some(*code),
         }
+    }
+
+    /// Whether replaying the request could plausibly succeed.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::RateLimited | Self::ServerError)
     }
 }
 
@@ -141,6 +156,7 @@ pub(crate) fn classify_error_code(code: u64) -> CloudflareErrorKind {
         81053 => CloudflareErrorKind::DnsExists,
         10001 | 10000 | 9109 => CloudflareErrorKind::AuthFailed,
         1038 => CloudflareErrorKind::InvalidToken,
+        c if (500..=599).contains(&c) => CloudflareErrorKind::ServerError,
         other => CloudflareErrorKind::Other(other),
     }
 }
@@ -157,6 +173,23 @@ mod tests {
         assert_eq!(classify_error_code(9109), CloudflareErrorKind::AuthFailed);
         assert_eq!(classify_error_code(1038), CloudflareErrorKind::InvalidToken);
         assert_eq!(classify_error_code(1234), CloudflareErrorKind::Other(1234));
+    }
+
+    #[test]
+    fn server_errors_are_classified_separately() {
+        for code in [500, 502, 503] {
+            assert_eq!(classify_error_code(code), CloudflareErrorKind::ServerError);
+        }
+    }
+
+    #[test]
+    fn only_transient_kinds_are_retryable() {
+        assert!(CloudflareErrorKind::RateLimited.is_retryable());
+        assert!(CloudflareErrorKind::ServerError.is_retryable());
+        assert!(!CloudflareErrorKind::AuthFailed.is_retryable());
+        assert!(!CloudflareErrorKind::InvalidToken.is_retryable());
+        assert!(!CloudflareErrorKind::DnsExists.is_retryable());
+        assert!(!CloudflareErrorKind::Other(1234).is_retryable());
     }
 
     #[test]

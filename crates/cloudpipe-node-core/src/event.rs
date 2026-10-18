@@ -1,5 +1,5 @@
-//! Maps Rust SDK `cloudpipe_sdk::Event` values into JS-friendly
-//! `(eventName, payload)` pairs. Each Event variant gets a stable
+//! Maps Rust SDK [`cloudpipe_sdk::Event`] values into JS-friendly
+//! `(eventName, payload)` pairs. Each `Event` variant gets a stable
 //! camelCase event name; the body is serialized as a JSON string so the
 //! JS side can `JSON.parse` it inside an `EventEmitter` handler without
 //! needing a custom marshaler per variant.
@@ -11,10 +11,10 @@
 //! handful of fields each event carries, and it makes the JS contract
 //! stable across SDK event additions.
 
-use cloudpipe_sdk::{CloudflareErrorKind, Event, LogLevel, Protocol, ShutdownReason};
+use cloudpipe_sdk::{Event, LogLevel, Protocol, ShutdownReason};
 use serde_json::{json, Value};
 
-/// Convert an SDK [`Event`] into the `(eventName, payload)` pair we hand
+/// Converts an SDK [`Event`] into the `(eventName, payload)` pair we hand
 /// to JS. The payload is a JSON-encoded string; `eventName` is
 /// camelCase and stable across SDK versions.
 pub fn event_to_payload(event: &Event) -> (&'static str, String) {
@@ -53,12 +53,7 @@ pub fn event_to_payload(event: &Event) -> (&'static str, String) {
         }
         Event::Cleaned => ("cleaned", json!({})),
         // Forward-compatibility for future event variants.
-        other => {
-            // Returns a generic event rather than panicking on an
-            // unknown variant — JS callers should treat it as opaque.
-            let _ = other;
-            ("unknown", json!({}))
-        }
+        _ => ("unknown", json!({})),
     };
     (name, value.to_string())
 }
@@ -81,23 +76,29 @@ fn reason_to_value(reason: &ShutdownReason) -> Value {
     }
 }
 
-/// Reserved for future use — kept here to avoid an unused-import lint
-/// in builds that haven't yet needed the helper.
-#[allow(dead_code)]
-fn _cf_kind_name(kind: CloudflareErrorKind) -> &'static str {
-    match kind {
-        CloudflareErrorKind::RateLimited => "rateLimited",
-        CloudflareErrorKind::DnsExists => "dnsExists",
-        CloudflareErrorKind::AuthFailed => "authFailed",
-        CloudflareErrorKind::InvalidToken => "invalidToken",
-        CloudflareErrorKind::Other(_) => "other",
-    }
-}
+/// Every event name [`event_to_payload`] can return, in the same order the
+/// `index.d.ts` `ListenerEventName` union lists them. Used by the binding
+/// to validate handler registrations.
+pub const EVENT_NAMES: &[&str] = &[
+    "banner",
+    "resolvingConflicts",
+    "creatingTunnel",
+    "ingressConfigured",
+    "dnsCreated",
+    "cloudflaredStarted",
+    "restarting",
+    "restarted",
+    "restartGivingUp",
+    "edgeConnected",
+    "cloudflaredLog",
+    "shuttingDown",
+    "cleaned",
+];
 
-/// Reserved for future use — kept here to avoid an unused-import lint.
-#[allow(dead_code)]
-fn _protocol_str(p: Protocol) -> &'static str {
-    p.as_str()
+/// Convenience accessor so the binding crate can name a protocol without
+/// importing `cloudpipe_sdk` directly.
+pub fn protocol_name(protocol: Protocol) -> &'static str {
+    protocol.as_str()
 }
 
 #[cfg(test)]
@@ -135,6 +136,17 @@ mod tests {
     }
 
     #[test]
+    fn dns_created_uses_camelcase_fields() {
+        let event = Event::DnsCreated {
+            full_name: "a.example.com".into(),
+        };
+        let (name, payload) = event_to_payload(&event);
+        assert_eq!(name, "dnsCreated");
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["fullName"], "a.example.com");
+    }
+
+    #[test]
     fn edge_connected_uses_camelcase_fields() {
         let event = Event::EdgeConnected {
             conn_index: 1,
@@ -161,20 +173,96 @@ mod tests {
     }
 
     #[test]
-    fn every_named_variant_is_covered() {
-        // Smoke-test that each documented Event variant maps to a
-        // distinct, non-empty camelCase event name. Adding a new
-        // variant without updating this list should panic the test.
+    fn restarting_carries_structured_reason() {
+        let event = Event::Restarting {
+            reason: ShutdownReason::Error("boom".into()),
+            attempt: 3,
+        };
+        let (name, payload) = event_to_payload(&event);
+        assert_eq!(name, "restarting");
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["attempt"], 3);
+        assert_eq!(value["reason"]["kind"], "error");
+        assert_eq!(value["reason"]["message"], "boom");
+    }
+
+    #[test]
+    fn every_documented_event_name_is_reachable() {
         let cases = [
             (Event::Banner, "banner"),
             (Event::ResolvingConflicts, "resolvingConflicts"),
+            (
+                Event::CreatingTunnel {
+                    name: "n".into(),
+                },
+                "creatingTunnel",
+            ),
+            (
+                Event::IngressConfigured {
+                    protocol: Protocol::Tcp,
+                    port: 22,
+                },
+                "ingressConfigured",
+            ),
+            (
+                Event::DnsCreated {
+                    full_name: "f".into(),
+                },
+                "dnsCreated",
+            ),
             (Event::CloudflaredStarted, "cloudflaredStarted"),
-            (Event::Restarted { attempt: 1 }, "restarted"),
+            (
+                Event::Restarting {
+                    reason: ShutdownReason::ChildExited,
+                    attempt: 2,
+                },
+                "restarting",
+            ),
+            (Event::Restarted { attempt: 2 }, "restarted"),
+            (
+                Event::RestartGivingUp {
+                    attempts: 5,
+                    last_error: "e".into(),
+                },
+                "restartGivingUp",
+            ),
+            (
+                Event::EdgeConnected {
+                    conn_index: 0,
+                    total: 1,
+                },
+                "edgeConnected",
+            ),
+            (
+                Event::CloudflaredLog {
+                    level: LogLevel::Warn,
+                    line: "l".into(),
+                },
+                "cloudflaredLog",
+            ),
+            (
+                Event::ShuttingDown {
+                    reason: ShutdownReason::UserRequested,
+                },
+                "shuttingDown",
+            ),
             (Event::Cleaned, "cleaned"),
         ];
+        assert_eq!(cases.len(), EVENT_NAMES.len());
         for (event, expected) in cases {
-            let (name, _) = event_to_payload(&event);
+            let (name, payload) = event_to_payload(&event);
             assert_eq!(name, expected);
+            assert!(!payload.is_empty());
+            assert!(
+                EVENT_NAMES.contains(&name),
+                "{name} missing from EVENT_NAMES catalog"
+            );
         }
+    }
+
+    #[test]
+    fn protocol_name_matches_sdk() {
+        assert_eq!(protocol_name(Protocol::Ssh), "ssh");
+        assert_eq!(protocol_name(Protocol::Udp), "udp");
     }
 }

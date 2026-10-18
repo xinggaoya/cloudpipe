@@ -1,0 +1,16 @@
+[package]
+name = "cloudpipe-node-core"
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Napi-free logic shared by the cloudpipe Node.js bindings (event mapping, error codes, option parsing)"
+
+[lib]
+name = "cloudpipe_node_core"
+path = "src/lib.rs"
+
+[dependencies]
+cloudpipe-sdk = { path = "../cloudpipe-sdk" }
+serde_json = { workspace = true }

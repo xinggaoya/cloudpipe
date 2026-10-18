@@ -34,7 +34,6 @@ use napi_derive::napi;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
 use crate::error;
-use crate::event::event_to_payload;
 use crate::{runtime, ConnectOptions};
 
 /// String-typed result carried by the Stop command channel. The session
@@ -72,8 +71,9 @@ pub struct Listener {
 impl Listener {
     /// Boots the tunnel with the supplied options.
     pub async fn start(options: ConnectOptions) -> Result<Self> {
-        let protocol = options.protocol_enum().map_err(error::invalid_arg)?;
-        let port = port_u16(options.port).map_err(error::invalid_arg)?;
+        let protocol = cloudpipe_node_core::parse_protocol(options.protocol.as_deref())
+            .map_err(error::invalid_arg)?;
+        let port = cloudpipe_node_core::parse_port(options.port).map_err(error::invalid_arg)?;
 
         let mut builder = TunnelBuilder::new()
             .token(options.token)
@@ -100,7 +100,7 @@ impl Listener {
         let callbacks_for_pump = callbacks.clone();
 
         let builder = builder.on_event(move |event: Event| {
-            let (name, payload) = event_to_payload(&event);
+            let (name, payload) = cloudpipe_node_core::event_to_payload(&event);
             // Use `try_send` rather than `blocking_send` — the
             // closure now runs inside the napi-rs multi-thread
             // tokio runtime, where blocking the current thread
@@ -203,18 +203,6 @@ async fn event_pump(
         for cb in snapshot {
             let _ = cb.call(Ok(payload.clone()), ThreadsafeFunctionCallMode::NonBlocking);
         }
-    }
-}
-
-/// Coerces the JS-side `Option<u32>` to a `u16` port.
-///
-/// Returns a plain `String` error so the function can be unit-tested
-/// without linking the napi native symbols (which only resolve at
-/// Node.js runtime). The call site wraps the message into `napi::Error`.
-pub(crate) fn port_u16(value: Option<u32>) -> std::result::Result<u16, String> {
-    match value {
-        None => Ok(8080),
-        Some(p) => u16::try_from(p).map_err(|_| format!("port {p} is out of range")),
     }
 }
 

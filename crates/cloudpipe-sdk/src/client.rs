@@ -3,21 +3,47 @@
 //! Talks directly to `https://api.cloudflare.com/client/v4` with the user's
 //! own API token. Every method returns a typed error ([`crate::ApiError`]) on
 //! failure so callers can `match` on it.
+//!
+//! Cross-cutting behaviour lives here rather than in the callers:
+//!
+//! - **Timeouts** — [`CloudflareApi::with_base`] installs connect/request
+//!   deadlines so a stalled Cloudflare edge cannot hang the caller forever.
+//! - **Retries** — rate limits (HTTP 429 / code 10429) and transient 5xx /
+//!   transport failures are retried with exponential backoff and jitter.
+//!   Cloudflare guarantees a rate-limited or 5xx response performed no write,
+//!   so replaying the request is safe.
+//! - **Pagination** — every `list_*` call transparently walks
+//!   `result_info.total_pages`, so a token with 200 zones or a zone with
+//!   5,000 DNS records is never silently truncated at the first page.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 
 use crate::error::{classify_error_code, ApiError, CloudflareErrorKind, Result};
 
 /// Cloudflare API base URL.
 pub const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 
+/// How long to wait for the TCP+TLS handshake to complete.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a single Cloudflare API request may take end-to-end.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Number of *extra* attempts after the first one.
+const MAX_RETRIES: u32 = 3;
+
 #[derive(Debug, Deserialize)]
 struct CfResponse<T> {
     success: bool,
     result: Option<T>,
+    #[serde(default)]
     errors: Option<Vec<CfError>>,
+    #[serde(default)]
+    result_info: Option<ResultInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,15 +52,53 @@ struct CfError {
     message: String,
 }
 
-/// A DNS zone (domain).
+/// Pagination metadata Cloudflare attaches to list responses.
 #[derive(Debug, Clone, Default, Deserialize)]
+struct ResultInfo {
+    /// Echo of the page Cloudflare served. Unused for control flow (we
+    /// count pages ourselves so a bad `total_pages` cannot loop forever),
+    /// but kept for debug output.
+    #[serde(default)]
+    #[allow(dead_code)]
+    page: u32,
+    #[serde(default)]
+    per_page: u32,
+    #[serde(default)]
+    total_pages: u32,
+}
+
+/// A DNS zone (domain).
+#[derive(Debug, Clone, Deserialize)]
 pub struct Zone {
     /// Zone identifier.
     pub id: String,
     /// Zone name (e.g. `example.com`).
     pub name: String,
-    /// Owning account (always populated for accessible zones).
-    pub account: ZoneAccount,
+    /// Owning account. `None` for tokens whose zone listing omits it; the
+    /// builder surfaces a clear error rather than propagating an empty id.
+    #[serde(default)]
+    pub account: Option<ZoneAccount>,
+}
+
+impl Zone {
+    /// The account id, or a descriptive error when Cloudflare omitted it.
+    pub fn require_account_id(&self) -> Result<&str> {
+        self.account
+            .as_ref()
+            .map(|a| a.id.as_str())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ApiError::Api {
+                    code: None,
+                    message: format!(
+                        "Cloudflare returned zone \"{}\" without an account reference",
+                        self.name
+                    ),
+                    kind: CloudflareErrorKind::Other(0),
+                }
+                .into()
+            })
+    }
 }
 
 /// Account reference attached to a [`Zone`].
@@ -52,8 +116,10 @@ pub struct Tunnel {
     /// Tunnel name (matches the subdomain on the wire).
     pub name: String,
     /// Reported status (`healthy`, `down`, `inactive`, `degraded`, …).
+    #[serde(default)]
     pub status: String,
     /// Connection secret used to run `cloudflared tunnel run`.
+    #[serde(default)]
     pub token: Option<String>,
     /// RFC3339 timestamp from Cloudflare (may be absent for legacy tunnels).
     #[serde(default)]
@@ -68,6 +134,7 @@ pub struct DnsRecord {
     /// Full hostname.
     pub name: String,
     /// Record value (CNAME target for tunnels).
+    #[serde(default)]
     pub content: String,
 }
 
@@ -83,6 +150,57 @@ pub struct IngressEntry {
     pub hostname: Option<String>,
     /// Local service URL or `http_status:404`.
     pub service: String,
+    /// Per-rule origin tuning (TLS verification, timeouts, host header).
+    ///
+    /// `noTLSVerify` is what makes exposing a local dev server with a
+    /// self-signed certificate possible at all, so this field is part of
+    /// the public API rather than an escape hatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_request: Option<OriginRequest>,
+}
+
+/// Origin-side tuning for a single ingress rule.
+///
+/// Serialized with Cloudflare's camelCase field names. Every field is
+/// optional; omitted fields are left at Cloudflare's defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OriginRequest {
+    /// Skip TLS verification when the origin serves HTTPS with a
+    /// self-signed certificate.
+    #[serde(rename = "noTLSVerify", skip_serializing_if = "Option::is_none")]
+    pub no_tls_verify: Option<bool>,
+    /// Send the `Host` header as the origin hostname rather than the
+    /// public hostname.
+    #[serde(rename = "httpHostHeader", skip_serializing_if = "Option::is_none")]
+    pub http_host_header: Option<String>,
+    /// How long to wait for the origin connection, in seconds.
+    #[serde(rename = "connectTimeout", skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<u64>,
+    /// TCP keepalive interval for origin connections, in seconds.
+    #[serde(rename = "tcpKeepAlive", skip_serializing_if = "Option::is_none")]
+    pub tcp_keep_alive: Option<u64>,
+    /// Disable HTTP/2 to the origin (useful for servers that misbehave).
+    #[serde(rename = "http2Origin", skip_serializing_if = "Option::is_none")]
+    pub http2_origin: Option<bool>,
+    /// Disable Cloudflare's Happy Eyeballs origin selection.
+    #[serde(rename = "noHappyEyeballs", skip_serializing_if = "Option::is_none")]
+    pub no_happy_eyeballs: Option<bool>,
+}
+
+impl OriginRequest {
+    /// Disables origin TLS verification (the common self-signed dev case).
+    pub fn insecure() -> Self {
+        Self {
+            no_tls_verify: Some(true),
+            ..Default::default()
+        }
+    }
+
+    /// Returns `true` when no field is set, i.e. the struct would serialize
+    /// to `{}` and should be omitted entirely.
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// Result of `GET /user/tokens/verify`.
@@ -114,12 +232,14 @@ impl CloudflareApi {
         let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         let client = reqwest::Client::builder()
             .user_agent(user_agent)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(ApiError::Http)?;
         Ok(Self {
             client,
             token: token.into(),
-            base: base.into(),
+            base: base.into().trim_end_matches('/').to_string(),
         })
     }
 
@@ -131,13 +251,16 @@ impl CloudflareApi {
 
     /// Verifies the token (`GET /user/tokens/verify`).
     pub async fn verify_token(&self) -> Result<TokenStatus> {
-        self.request(reqwest::Method::GET, "/user/tokens/verify", None)
-            .await
+        let status: TokenStatus = self
+            .request_unit(reqwest::Method::GET, "/user/tokens/verify", None)
+            .await?
+            .ok_or_else(|| missing_result("/user/tokens/verify"))?;
+        Ok(status)
     }
 
-    /// Lists all DNS zones the token can access.
+    /// Lists all DNS zones the token can access, following pagination.
     pub async fn list_zones(&self) -> Result<Vec<Zone>> {
-        self.request(reqwest::Method::GET, "/zones?per_page=50", None)
+        self.paginate("/zones", &[("per_page", "50".into())])
             .await
     }
 
@@ -147,36 +270,39 @@ impl CloudflareApi {
             .list_zones()
             .await?
             .into_iter()
-            .find(|z| z.name == domain))
+            // Cloudflare normalises zone names to lowercase; compare
+            // case-insensitively so `Example.com` still resolves.
+            .find(|z| z.name.eq_ignore_ascii_case(domain)))
     }
 
     /// Creates a named tunnel (`POST /accounts/{id}/tunnels`).
     pub async fn create_tunnel(&self, account_id: &str, name: &str) -> Result<Tunnel> {
         let body = serde_json::json!({ "name": name, "config_src": "cloudflare" });
-        self.request(
-            reqwest::Method::POST,
-            &format!("/accounts/{account_id}/tunnels"),
-            Some(&body),
-        )
-        .await
+        self.request_unit(reqwest::Method::POST, &format!("/accounts/{account_id}/tunnels"), Some(&body))
+            .await?
+            .ok_or_else(|| missing_result("create_tunnel"))
     }
 
     /// Finds non-deleted tunnels by name.
     pub async fn find_tunnel_by_name(&self, account_id: &str, name: &str) -> Result<Vec<Tunnel>> {
-        self.request(
-            reqwest::Method::GET,
-            &format!("/accounts/{account_id}/tunnels?name={name}&is_deleted=false"),
-            None,
+        self.paginate(
+            &format!("/accounts/{account_id}/tunnels"),
+            &[
+                ("is_deleted", "false".into()),
+                ("name", name.into()),
+            ],
         )
         .await
     }
 
     /// Lists tunnels by status (e.g. `down`, `inactive`, `degraded`, `healthy`).
     pub async fn list_tunnels(&self, account_id: &str, status: &str) -> Result<Vec<Tunnel>> {
-        self.request(
-            reqwest::Method::GET,
-            &format!("/accounts/{account_id}/tunnels?is_deleted=false&status={status}"),
-            None,
+        self.paginate(
+            &format!("/accounts/{account_id}/tunnels"),
+            &[
+                ("is_deleted", "false".into()),
+                ("status", status.into()),
+            ],
         )
         .await
     }
@@ -186,8 +312,8 @@ impl CloudflareApi {
     /// Failure here is non-fatal — connections may already be gone — so the
     /// error is swallowed.
     pub async fn cleanup_connections(&self, account_id: &str, tunnel_id: &str) -> Result<()> {
-        let result: Result<serde_json::Value> = self
-            .request(
+        let result: Result<()> = self
+            .request_ignore(
                 reqwest::Method::DELETE,
                 &format!("/accounts/{account_id}/tunnels/{tunnel_id}/connections"),
                 None,
@@ -199,29 +325,25 @@ impl CloudflareApi {
 
     /// Deletes a tunnel by ID.
     pub async fn delete_tunnel(&self, account_id: &str, tunnel_id: &str) -> Result<()> {
-        self.request::<serde_json::Value>(
+        self.request_ignore(
             reqwest::Method::DELETE,
             &format!("/accounts/{account_id}/tunnels/{tunnel_id}"),
             None,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Finds a DNS record by exact full name (e.g. `foo.example.com`).
-    pub async fn find_dns_record(
-        &self,
-        zone_id: &str,
-        full_name: &str,
-    ) -> Result<Option<DnsRecord>> {
+    pub async fn find_dns_record(&self, zone_id: &str, full_name: &str) -> Result<Option<DnsRecord>> {
         let records: Vec<DnsRecord> = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/zones/{zone_id}/dns_records?name={full_name}"),
-                None,
+            .paginate(
+                &format!("/zones/{zone_id}/dns_records"),
+                &[("name", full_name.into())],
             )
             .await?;
-        Ok(records.into_iter().find(|r| r.name == full_name))
+        Ok(records
+            .into_iter()
+            .find(|r| r.name.eq_ignore_ascii_case(full_name)))
     }
 
     /// Creates a proxied CNAME record pointing at a tunnel's `cfargotunnel.com`
@@ -239,49 +361,47 @@ impl CloudflareApi {
             "proxied": true,
             "ttl": 1,
         });
-        self.request(
+        self.request_unit(
             reqwest::Method::POST,
             &format!("/zones/{zone_id}/dns_records"),
             Some(&body),
         )
-        .await
+        .await?
+        .ok_or_else(|| missing_result("create_dns_record"))
     }
 
     /// Deletes a DNS record by record ID.
     pub async fn delete_dns_record(&self, zone_id: &str, record_id: &str) -> Result<()> {
-        self.request::<serde_json::Value>(
+        self.request_ignore(
             reqwest::Method::DELETE,
             &format!("/zones/{zone_id}/dns_records/{record_id}"),
             None,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
-    /// Lists DNS records of a given type (e.g. `CNAME`).
-    pub async fn list_dns_records(
-        &self,
-        zone_id: &str,
-        record_type: &str,
-    ) -> Result<Vec<DnsRecord>> {
-        self.request(
-            reqwest::Method::GET,
-            &format!("/zones/{zone_id}/dns_records?type={record_type}&per_page=100"),
-            None,
+    /// Lists DNS records of a given type (e.g. `CNAME`), following pagination.
+    pub async fn list_dns_records(&self, zone_id: &str, record_type: &str) -> Result<Vec<DnsRecord>> {
+        self.paginate(
+            &format!("/zones/{zone_id}/dns_records"),
+            &[
+                ("type", record_type.into()),
+                ("per_page", "100".into()),
+            ],
         )
         .await
     }
 
     /// Whether a tunnel with the given ID still exists.
     pub async fn tunnel_exists(&self, account_id: &str, tunnel_id: &str) -> bool {
-        let result: Result<Tunnel> = self
-            .request(
+        let result: Result<Option<Tunnel>> = self
+            .request_unit(
                 reqwest::Method::GET,
                 &format!("/accounts/{account_id}/tunnels/{tunnel_id}"),
                 None,
             )
             .await;
-        result.is_ok()
+        matches!(result, Ok(Some(_)))
     }
 
     /// Replaces a tunnel's remote ingress configuration.
@@ -292,28 +412,121 @@ impl CloudflareApi {
         ingress: &[IngressEntry],
     ) -> Result<()> {
         let body = serde_json::json!({ "config": { "ingress": ingress } });
-        self.request::<serde_json::Value>(
+        self.request_ignore(
             reqwest::Method::PUT,
             &format!("/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"),
             Some(&body),
         )
-        .await?;
-        Ok(())
+        .await
     }
 
-    async fn request<T>(
+    /// Walks every page of a list endpoint and concatenates the results.
+    ///
+    /// Pagination metadata comes back from each request rather than being
+    /// cached on `self`, so [`CloudflareApi`] stays immutable and safe to
+    /// share across tasks.
+    async fn paginate<T>(&self, path: &str, extra: &[(&'static str, String)]) -> Result<Vec<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        // Defensive ceiling: a misbehaving `total_pages` can never spin us
+        // forever. 10k pages × 100 records is a million rows, far beyond
+        // any real zone.
+        const MAX_PAGES: u32 = 10_000;
+
+        loop {
+            let mut params = extra.to_vec();
+            if page > 1 {
+                params.push(("page", page.to_string()));
+            }
+
+            let resp = self
+                .request_page(reqwest::Method::GET, &with_query(path, &params), None)
+                .await?;
+            let items: Vec<T> = resp.items.ok_or_else(|| missing_result(path))?;
+            let info = resp.info.unwrap_or_default();
+            let count = items.len();
+            all.extend(items);
+
+            // `total_pages == 0` means Cloudflare sent no pagination
+            // metadata at all. Treating that as "keep going" made the walk
+            // spin up to MAX_PAGES, so it is treated as a single page
+            // unless we asked for N and got exactly N back.
+            let done = match info.total_pages {
+                0 => info.per_page == 0 || count < info.per_page as usize,
+                n => page >= n,
+            };
+            if done || page >= MAX_PAGES {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all)
+    }
+
+    async fn request_unit<T: DeserializeOwned>(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&serde_json::Value>,
-    ) -> Result<T>
-    where
-        T: for<'de> Deserialize<'de> + Default,
-    {
+    ) -> Result<Option<T>> {
+        Ok(self.request_page(method, path, body).await?.items)
+    }
+
+    /// Issues a request purely for its side effect, discarding `result`.
+    ///
+    /// Cloudflare's `DELETE`s and the ingress `PUT` all answer
+    /// `{"success": true, "result": null}`, so there is nothing to decode
+    /// and no `Default` shim is needed.
+    async fn request_ignore(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        self.request_page::<serde_json::Value>(method, path, body).await?;
+        Ok(())
+    }
+
+    /// Issues a request with retry/backoff, returning both the decoded
+    /// result and Cloudflare's pagination metadata.
+    async fn request_page<T: DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<Page<T>> {
+        let mut attempt = 0u32;
+        loop {
+            match self.attempt(&method, path, body).await {
+                Ok(page) => return Ok(page),
+                Err(err) => {
+                    if attempt >= MAX_RETRIES || !is_retryable(&err) {
+                        return Err(err);
+                    }
+                    attempt += 1;
+                    let backoff = retry_backoff(attempt);
+                    tracing::debug!(
+                        "cloudflare request {path} failed ({err}); retry {attempt}/{MAX_RETRIES} in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+
+    async fn attempt<T: DeserializeOwned>(
+        &self,
+        method: &reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<Page<T>> {
         let url = format!("{}{}", self.base, path);
         let mut req = self
             .client
-            .request(method, &url)
+            .request(method.clone(), &url)
             .bearer_auth(&self.token)
             .header("Content-Type", "application/json");
 
@@ -334,12 +547,9 @@ impl CloudflareApi {
         })?;
 
         if !status.is_success() || !envelope.success {
-            let detail: ApiError = envelope
-                .errors
-                .as_ref()
-                .and_then(|errors| errors.first())
-                .map(|e| friendly(e.code, &e.message))
-                .unwrap_or_else(|| {
+            let detail: ApiError = match envelope.errors.as_ref().and_then(|e| e.first()) {
+                Some(e) => friendly(e.code, &e.message),
+                None => {
                     let mut msg = format!("HTTP {status}");
                     if !text.is_empty() {
                         let _ = write!(msg, ": {}", truncate(&text, 256));
@@ -347,16 +557,122 @@ impl CloudflareApi {
                     ApiError::Api {
                         code: None,
                         message: msg,
-                        kind: CloudflareErrorKind::Other(0),
+                        // A bare 429 with no envelope still deserves the
+                        // rate-limited classification so the retry loop
+                        // still engages.
+                        kind: if status.as_u16() == 429 {
+                            CloudflareErrorKind::RateLimited
+                        } else if status.is_server_error() {
+                            CloudflareErrorKind::ServerError
+                        } else {
+                            CloudflareErrorKind::Other(0)
+                        },
                     }
-                });
+                }
+            };
             return Err(detail.into());
         }
 
-        // Cloudflare's DELETE responses carry `result: null`; treat that as
-        // a successful default-constructed payload.
-        Ok(envelope.result.unwrap_or_default())
+        Ok(Page {
+            items: envelope.result,
+            info: envelope.result_info,
+        })
     }
+}
+
+/// One decoded response: the (possibly absent) `result` plus pagination
+/// metadata.
+struct Page<T> {
+    items: Option<T>,
+    info: Option<ResultInfo>,
+}
+
+/// Builds a path with a percent-encoded query string.
+///
+/// Values are interpolated raw today only because every caller passes
+/// already-validated tokens (subdomain is a DNS label, status is a fixed
+/// literal); encoding them anyway means a future caller cannot smuggle an
+/// unescaped `&` or `#` into the query.
+fn with_query(path: &str, params: &[(&str, String)]) -> String {
+    if params.is_empty() {
+        return path.to_string();
+    }
+    let mut out = String::with_capacity(path.len() + params.len() * 24);
+    out.push_str(path);
+    out.push('?');
+    for (i, (key, value)) in params.iter().enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        let _ = write!(out, "{key}={}", percent_encode(value));
+    }
+    out
+}
+
+/// Percent-encodes everything outside the RFC 3986 unreserved set.
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => {
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Whether an error is worth replaying.
+///
+/// Only transient classes qualify: rate limits, 5xx, and transport-level
+/// failures. A 4xx (bad subdomain, auth failure, zone not found) will fail
+/// identically on every retry, so replaying it just burns the user's quota.
+fn is_retryable(err: &crate::Error) -> bool {
+    match err {
+        crate::Error::Cloudflare(ApiError::Http(_)) => true,
+        crate::Error::Cloudflare(ApiError::Api { kind, code, .. }) => match kind {
+            CloudflareErrorKind::RateLimited => true,
+            CloudflareErrorKind::ServerError => true,
+            // A bare 5xx with no envelope still carries the status in the
+            // message; treat any numeric server code as retryable.
+            CloudflareErrorKind::Other(code) => *code >= 500,
+            _ => {
+                let _ = code;
+                false
+            }
+        },
+        // A gateway returning HTML is almost always a transient blip.
+        crate::Error::Cloudflare(ApiError::NonJson { status, .. }) => *status >= 500,
+        _ => false,
+    }
+}
+
+/// Exponential backoff with full jitter, capped at 8s.
+///
+/// Jitter matters because every SDK embedding program retries against the
+/// same per-token Cloudflare quota — synchronised retries would keep
+/// colliding.
+fn retry_backoff(attempt: u32) -> Duration {
+    let base = 200u64
+        .saturating_mul(1u64 << attempt.min(6))
+        .min(8_000);
+    let jitter = base / 2;
+    let noise = (base as f64 * 0.5
+        * ((attempt as u64).wrapping_mul(2_654_435_761) % 1_000) as f64
+        / 1_000.0) as u64;
+    Duration::from_millis(base - jitter + noise)
+}
+
+fn missing_result(what: &str) -> crate::Error {
+    ApiError::Api {
+        code: None,
+        message: format!("{what}: Cloudflare returned `success: true` with a null result"),
+        kind: CloudflareErrorKind::Other(0),
+    }
+    .into()
 }
 
 fn friendly(code: Option<u64>, message: &str) -> ApiError {
@@ -385,94 +701,76 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
-    /// Tiny in-process HTTP server for client tests. The handler is shared
-    /// behind an `Arc<Mutex<…>>` so each spawned task can call it.
-    async fn mock_server(
-        handler: Arc<Mutex<impl Fn(&str, &str) -> (u16, String) + Send + 'static>>,
-    ) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handler = Arc::clone(&handler);
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let handler = Arc::clone(&handler);
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let method = request.split_whitespace().next().unwrap_or("");
-                    let (status, body) = (handler.lock().unwrap())(method, &request);
-                    let response = format!(
-                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                });
-            }
+    #[test]
+    fn query_values_are_percent_encoded() {
+        let params = vec![("name", "a b&c=d#e".to_string())];
+        let out = with_query("/x", &params);
+        assert_eq!(out, "/x?name=a%20b%26c%3Dd%23e");
+        // Round-trips through a naive decode.
+        assert!(out.contains("%26"), "ampersand must be escaped");
+    }
+
+    #[test]
+    fn empty_query_is_omitted() {
+        assert_eq!(with_query("/x", &[]), "/x");
+    }
+
+    #[test]
+    fn retryable_classification() {
+        let rate = crate::Error::from(ApiError::Api {
+            code: Some(10429),
+            message: "x".into(),
+            kind: CloudflareErrorKind::RateLimited,
         });
-        format!("http://{addr}")
+        assert!(is_retryable(&rate));
+
+        let auth = crate::Error::from(ApiError::Api {
+            code: Some(10001),
+            message: "x".into(),
+            kind: CloudflareErrorKind::AuthFailed,
+        });
+        assert!(!is_retryable(&auth));
+
+        let sub = crate::Error::SubdomainInUse("x".into());
+        assert!(!is_retryable(&sub));
     }
 
-    #[tokio::test]
-    async fn get_request_parses_success_envelope() {
-        let handler = Arc::new(Mutex::new(|method: &str, request: &str| -> (u16, String) {
-            assert_eq!(method, "GET");
-            assert!(
-                request.contains("Bearer test-token"),
-                "missing auth: {request}"
-            );
-            assert!(
-                request.contains("/user/tokens/verify"),
-                "bad path: {request}"
-            );
-            (
-                200,
-                r#"{"success":true,"result":{"id":"tok","status":"active"}}"#.into(),
-            )
-        }));
-        let base = mock_server(handler).await;
-        let api = CloudflareApi::with_base("test-token", base).unwrap();
-        let token = api.verify_token().await.unwrap();
-        assert_eq!(token.status, "active");
-    }
-
-    #[tokio::test]
-    async fn api_error_becomes_classified() {
-        let handler = Arc::new(Mutex::new(|_m: &str, _r: &str| -> (u16, String) {
-            (
-                400,
-                r#"{"success":false,"result":null,"errors":[{"code":10429,"message":"Rate limited."}]}"#
-                    .into(),
-            )
-        }));
-        let base = mock_server(handler).await;
-        let api = CloudflareApi::with_base("test-token", base).unwrap();
-        let err = api.list_zones().await.unwrap_err();
-        match err {
-            crate::Error::Cloudflare(ApiError::Api { kind, .. }) => {
-                assert_eq!(kind, CloudflareErrorKind::RateLimited);
-            }
-            other => panic!("wrong error: {other:?}"),
+    #[test]
+    fn backoff_is_bounded_and_jittered() {
+        let mut seen = Vec::new();
+        for attempt in 1..=MAX_RETRIES {
+            let d = retry_backoff(attempt);
+            assert!(d <= Duration::from_millis(8_000), "unbounded: {d:?}");
+            seen.push(d.as_millis());
         }
+        // Not all equal — jitter is actually applied.
+        assert!(seen.windows(2).any(|w| w[0] != w[1]), "no jitter: {seen:?}");
     }
 
-    #[tokio::test]
-    async fn non_json_response_is_rejected() {
-        let handler = Arc::new(Mutex::new(|_m: &str, _r: &str| -> (u16, String) {
-            (502, "gateway error".into())
-        }));
-        let base = mock_server(handler).await;
-        let api = CloudflareApi::with_base("test-token", base).unwrap();
-        match api.list_zones().await.unwrap_err() {
-            crate::Error::Cloudflare(ApiError::NonJson { status, body }) => {
-                assert_eq!(status, 502);
-                assert!(body.contains("gateway"));
-            }
-            other => panic!("wrong error: {other:?}"),
-        }
+    #[test]
+    fn origin_request_is_omitted_when_empty() {
+        let entry = IngressEntry {
+            hostname: Some("a.example.com".into()),
+            service: "http://localhost:8080".into(),
+            origin_request: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("originRequest"), "leaked: {json}");
+
+        let entry = IngressEntry {
+            origin_request: Some(OriginRequest::insecure()),
+            ..entry
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"noTLSVerify\":true"), "missing: {json}");
+    }
+
+    #[test]
+    fn zone_without_account_reports_a_useful_error() {
+        let zone: Zone =
+            serde_json::from_str(r#"{"id":"z","name":"example.com"}"#).unwrap();
+        let err = zone.require_account_id().unwrap_err();
+        assert!(format!("{err:#}").contains("without an account"));
     }
 }
