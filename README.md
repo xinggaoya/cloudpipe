@@ -8,11 +8,13 @@
 
 - 🪶 **Single static binary** — Rust, `rustls` TLS (no system OpenSSL), ~4 MB
 - 🪪 **Bring your own token** — your Cloudflare account, your zone, your rate-limit quota
-- 🔒 **Local-only credentials** — token stored in `~/.cfp/config.json` with mode `0600`
+- 🔒 **Local-only credentials** — token stored in `~/.cfp/config.json`, created `0600`
 - 🌐 **Custom subdomains** — pick `-s myapp` or get a random one
 - 🛣️ **Five protocols** — `http`, `https`, `tcp`, `udp`, `ssh` (Cloudflare edge always serves HTTPS publicly)
-- 🧹 **Clean exit** — Ctrl+C deletes the tunnel and DNS record automatically; no orphans
-- ♻️ **Auto-restart** — `cloudflared` crashes are recovered on the same URL; the tunnel stays live indefinitely
+- 🔐 **Self-signed HTTPS works** — `--insecure` skips origin certificate validation for local dev servers
+- 🧹 **Clean exit** — Ctrl+C stops `cloudflared` *first*, then deletes the tunnel and DNS record
+- ♻️ **Auto-restart** — `cloudflared` crashes are recovered on the same URL with jittered backoff
+- 🧯 **Self-healing** — every Cloudflare resource created during startup is rolled back if a later step fails
 - 🪂 **Standalone** — works offline, air-gapped, behind NAT
 
 ## Install
@@ -94,6 +96,19 @@ back to `github.com` if the mirror is unreachable. Override the prefix with
 the `CFP_GITHUB_PROXY` env var (e.g. `CFP_GITHUB_PROXY=https://ghfast.top/`);
 set it to an empty string to disable mirroring entirely.
 
+### How `cloudflared` is installed
+
+`cfp` first looks for `cloudflared` on your `PATH`; if it is not there it
+downloads a **pinned** version to `~/.cfp/bin/cloudflared`. Before the
+download is made executable its SHA-256 is verified against a digest
+compiled into the binary, and an asset with no pinned digest is refused
+rather than installed unverified. Writes are staged and renamed atomically,
+so two concurrent `cfp` runs cannot end up with a half-written executable.
+
+The tunnel token is passed to `cloudflared` through a `0600` file rather than
+the command line — argv is readable by every local user through
+`/proc/<pid>/cmdline` and `ps`.
+
 ### Build from source
 
 ```bash
@@ -132,6 +147,13 @@ cfp 8080 -s myapp
 cfp https 8443
 #   => https://user-1234.example.com   (local: https://localhost:8443)
 
+# Expose an HTTPS dev server whose certificate is self-signed
+cfp https 8443 -s myapp --insecure
+#   => skips origin certificate validation, which would otherwise fail
+
+# Move a live tunnel to a different local port (public URL unchanged)
+# (also available as TunnelBuilder::update_port in the SDK)
+
 # Expose a TCP service (e.g. SSH, Postgres, Redis — anything L4)
 cfp tcp 22 -s ssh-tunnel
 #   Reach it at ssh-tunnel.example.com (TCP)
@@ -149,15 +171,30 @@ cfp domain another.example.com
 # List all zones the token can access
 cfp domains
 
-# Clean up dead tunnels and orphaned DNS records
+# Preview what cleanup would remove, then do it
+cfp cleanup --dry-run
+cfp cleanup --json        # machine-readable report
 cfp cleanup
 ```
 
-The config file lives at `~/.cfp/config.json` (mode `0600`). You can also pass the token via env var for one-off use (overrides the file):
+The config file lives at `~/.cfp/config.json` (created `0600`). Writes are
+atomic, so an interrupted save cannot corrupt it. You can also pass the
+token via env var for one-off use (overrides the file):
 
 ```bash
 CLOUDFLARE_API_TOKEN=... cfp 8080
 ```
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | Overrides the token in the config file. |
+| `CFP_CONFIG_DIR` | Relocates the config directory (default `~/.cfp`). |
+| `CFP_GITHUB_PROXY` | Mirror prefix for the `cloudflared` download. Empty disables it. |
+| `CFP_LOG` | `trace`/`debug`/`info`/`warn`/`error`/`off`. Unset or `off` is silent. |
+| `CFP_ASCII` | Force ASCII output for terminals without Unicode box drawing. |
+| `NO_COLOR` | Disable colour (also auto-disabled when stdout is not a TTY). |
 
 ### Connecting to non-HTTP tunnels
 
@@ -182,12 +219,16 @@ For `udp`, reach the service by pointing your client at `myhost.example.com:5182
 
 | Command | Description |
 |---|---|
-| `cfp [http\|https\|tcp\|udp\|ssh] <port> [-s <subdomain>]` | Start a tunnel. Protocol selects the local scheme (`http` is the default). Add `--no-restart` to disable auto-restart. |
+| `cfp [http\|https\|tcp\|udp\|ssh] <port> [-s <subdomain>]` | Start a tunnel. Protocol selects the local scheme (`http` is the default). |
+| `cfp ... --insecure` | Skip origin TLS verification (self-signed HTTPS origins). |
+| `cfp ... --origin-host-header <host>` | Send a specific `Host` header to the origin. |
+| `cfp ... --no-restart` | Exit the first time `cloudflared` dies instead of restarting it. |
+| `cfp ... -v / --verbose` | Print the SDK's internal trace to stderr. |
 | `cfp key [TOKEN] [--clear]` | Save, show or clear the Cloudflare token. Saving auto-discovers account/zone. |
 | `cfp domain <example.com>` | Switch the base domain to a different accessible zone. |
 | `cfp domains` | List zones accessible with the saved token. |
-| `cfp cleanup` | Remove dead tunnels, their DNS records and orphaned CNAMEs. |
-| `cfp -v / --version` | Show version. |
+| `cfp cleanup [--dry-run] [--json]` | Remove dead tunnels, their DNS records and orphaned CNAMEs. |
+| `cfp -V / --version` | Show version. |
 
 ## As a Rust library
 
@@ -261,16 +302,19 @@ listener.on('dnsCreated', (json) => {
 
 console.log(`live at ${listener.url}`);
 
+// Move to another local port; the public URL is unchanged.
+await listener.update(9090);
+
 process.on('SIGINT', async () => {
   await listener.close();
   process.exit(0);
 });
 ```
 
-Prebuilt binaries are shipped for macOS (arm64 + x64), Linux
-(x64-gnu, x64-musl, aarch64-gnu), and Windows (x64-msvc). No separate
-`cloudflared` install required — the SDK downloads it on first use,
-with a GitHub mirror default for users behind the GFW.
+Prebuilt binaries are shipped for macOS (arm64 + x64), Linux (x64-gnu) and
+Windows (x64-msvc). No separate `cloudflared` install required — the SDK
+downloads a pinned, checksum-verified build on first use, with a GitHub
+mirror default for users behind the GFW.
 
 See [`crates/cloudpipe-node/README.md`](./crates/cloudpipe-node/) and the
 [`quickstart`](./crates/cloudpipe-node/examples/quickstart.js) /
@@ -284,10 +328,16 @@ and exits non-zero if anything regresses in the next publish.
 
 ```
 crates/
-├── cloudpipe-sdk/        # pure async Rust SDK (no CLI / UI deps)
-├── cloudpipe/            # `cfp` CLI binary — uses the SDK
-└── cloudpipe-node/       # napi-rs Node.js bindings — uses the SDK
+├── cloudpipe-sdk/           # pure async Rust SDK (no CLI / UI deps)
+├── cloudpipe/               # `cfp` CLI binary — uses the SDK
+├── cloudpipe-node-core/     # napi-free logic: event mapping, error codes
+└── cloudpipe-node/          # napi-rs Node.js bindings — thin `#[napi]` shell
 ```
+
+`cloudpipe-node` is a `cdylib`, so a `cargo test` harness for it cannot
+link (the `napi_*` symbols only resolve inside a Node.js process).
+Everything worth testing therefore lives in `cloudpipe-node-core`; the
+addon crate holds only the annotated shell.
 
 ## How it works
 
@@ -314,15 +364,22 @@ All five protocols (`http`/`https`/`tcp`/`udp`/`ssh`) are configured the same wa
 
 Conflict handling:
 - **Same-name tunnel exists and is healthy** → refuse, suggest a different name.
+- **A generated name collides** → transparently redraw it (an explicitly requested `-s name` is never silently renamed).
 - **Same-name tunnel exists but is down/inactive/degraded** → reclaim it (delete DNS, kill connections, delete tunnel, then create fresh).
 - **Orphaned DNS record** → remove before creating.
-- **Cloudflare API errors** → translated to actionable text (10429 rate limit, 81053 DNS exists, 10001 auth).
+- **Cloudflare API errors** → matched on the real error variant and rendered with an actionable next step (10429 rate limit, 81053 DNS exists, 10001 auth, invalid subdomain, …).
+
+Other guarantees worth knowing about:
+- A DNS-creation or `cloudflared`-spawn failure **unwinds** the tunnel that was just created, instead of leaving it orphaned.
+- `drop(handle)` detaches a best-effort Cloudflare purge; `cloudpipe_sdk::cleanup` reclaims anything a hard kill leaves.
+- Generated subdomains draw from 32^7 values (the previous 10,000 made `SubdomainInUse` routine).
 
 ## Limitations
 
 - You need a domain managed by Cloudflare (any plan, including free).
-- Cloudflare's API rate limits apply per token — heavy usage may need `cfp cleanup` if a previous run was interrupted.
-- The `cloudflared` binary is downloaded on first use and stored at `~/.cfp/bin/cloudflared` (~30 MB).
+- Cloudflare's API rate limits apply per token. The SDK retries transient failures automatically; sustained heavy use may still need `cfp cleanup`.
+- The `cloudflared` binary is downloaded on first use and stored at `~/.cfp/bin/cloudflared` (~40 MB). Its version is pinned, so upgrading `cfp` to pick up a newer `cloudflared` is deliberate.
+- Auto-restart uses a bounded retry budget (5 attempts, 500 ms doubling to an 8 s cap). Beyond that the session ends and reports why, rather than reconnecting forever.
 
 ## License
 

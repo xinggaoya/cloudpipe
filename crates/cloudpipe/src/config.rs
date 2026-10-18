@@ -113,10 +113,7 @@ impl Config {
     /// Extracts the account/zone/domain trio, reporting whichever field is
     /// missing with actionable guidance.
     pub fn require_tunnel_context(&self) -> Result<TunnelContext> {
-        let account_id = self
-            .account_id
-            .clone()
-            .ok_or_else(|| missing("account"))?;
+        let account_id = self.account_id.clone().ok_or_else(|| missing("account"))?;
         let zone_id = self.zone_id.clone().ok_or_else(|| missing("zone"))?;
         let domain = self.domain.clone().ok_or_else(|| missing("domain"))?;
         Ok(TunnelContext {

@@ -170,7 +170,9 @@ impl TunnelBuilder {
     /// at all: `cloudflared` validates the origin certificate, and a
     /// `localhost` dev server almost never has a CA-signed one.
     pub fn no_tls_verify(mut self, enabled: bool) -> Self {
-        let origin = self.origin_request.get_or_insert_with(OriginRequest::default);
+        let origin = self
+            .origin_request
+            .get_or_insert_with(OriginRequest::default);
         origin.no_tls_verify = Some(enabled);
         self
     }
@@ -340,6 +342,8 @@ where
                     .inner
                     .token
                     .clone()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
                     .ok_or(Error::MissingCredential("Cloudflare API token"))?;
                 CloudflareApi::new(token)?
             }
@@ -366,9 +370,7 @@ where
         // worse than an error.
         let subdomain = match requested {
             Some(_) => subdomain,
-            None => {
-                pick_available_subdomain(&api, &account_id, &zone_id, &domain).await?
-            }
+            None => pick_available_subdomain(&api, &account_id, &zone_id, &domain).await?,
         };
 
         let binary_path = match self.inner.binary_path.take() {

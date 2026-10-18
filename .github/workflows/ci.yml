@@ -9,7 +9,22 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
 
+# `cloudpipe-node` is a cdylib. A `cargo test --all-targets` harness for it
+# fails to link, because the `napi_*` symbols only resolve inside a Node.js
+# process — so it is excluded from the test/clippy matrix and covered by
+# `cloudpipe-node-core` (the napi-free crate holding the testable logic)
+# plus the `test:examples` job in `npm.yml`.
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -20,22 +35,69 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/cloudpipe-sdk crates/cloudpipe -> target
-      - name: Format check
-        run: cargo fmt --all -- --check
       - name: Build workspace
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --exclude cloudpipe-node --all-targets
       - name: Run tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --exclude cloudpipe-node --all-targets
+      - name: Run doc tests
+        run: cargo test --workspace --exclude cloudpipe-node --doc
+      - name: Build the Node addon (lib only)
+        run: cargo build -p cloudpipe-node --lib
       - name: Build SDK without CLI deps
         run: |
-          cargo tree -p cloudpipe-sdk | grep -iE 'colored|clap|ctrlc' \
-            && (echo "SDK pulls in CLI-only deps" && exit 1) \
+          cargo tree -p cloudpipe-sdk | grep -iE 'colored|clap|ctrlc|napi' \
+            && (echo "SDK pulls in CLI/binding-only deps" && exit 1) \
             || echo "SDK is dependency-clean"
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --exclude cloudpipe-node --all-targets -- -D warnings
+          cargo clippy -p cloudpipe-node --lib -- -D warnings
+
+  audit:
+    name: Supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - name: cargo-audit
+        run: cargo install cargo-audit --locked && cargo audit
+      - name: Semver check (public SDK)
+        run: |
+          cargo install cargo-semver-checks --locked
+          cargo semver-checks check-release --baseline-rev origin/main || \
+            echo "::warning::public API of cloudpipe-sdk changed (see job summary)"
+
+  fmt-check-docs:
+    name: Docs match the code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check every documented CLI flag exists
+        # The README promises a specific flag set. A typo there is
+        # invisible until a user copies it into a shell.
+        run: |
+          set -euo pipefail
+          cargo build -p cfp
+          BIN=target/debug/cfp
+          for flag in --verbose --no-restart --version --subdomain; do
+            "$BIN" --help 2>&1 | grep -q -- "$flag" \
+              || { echo "::error::README documents $flag but \`cfp --help\` lacks it"; exit 1; }
+          done
+          for flag in --dry-run --json; do
+            "$BIN" cleanup --help 2>&1 | grep -q -- "$flag" \
+              || { echo "::error::README documents \`cfp cleanup $flag\` but the subcommand lacks it"; exit 1; }
+          done
+          # `-v` is the log flag; `-V` is clap's version flag.
+          "$BIN" -v --help 2>&1 | grep -q -- "--verbose" \
+            || { echo "::error::cfp -v must map to --verbose"; exit 1; }
+          # The SDK's install path pins cloudflared and verifies its digest;
+          # assert the pin is present so it cannot be reverted silently.
+          grep -q 'CLOUDFLARED_VERSION' crates/cloudpipe-sdk/src/session/../binary.rs \
+            || { echo "::error::the pinned cloudflared version is gone"; exit 1; }

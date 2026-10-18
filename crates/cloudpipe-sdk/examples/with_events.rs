@@ -41,7 +41,10 @@ fn render_event(event: Event) {
             println!("restarting (attempt #{attempt}): {}", describe(&reason))
         }
         Event::Restarted { attempt } => println!("✓ resumed on the same URL (attempt #{attempt})"),
-        Event::RestartGivingUp { attempts, last_error } => {
+        Event::RestartGivingUp {
+            attempts,
+            last_error,
+        } => {
             eprintln!("auto-restart giving up after {attempts} attempts: {last_error}")
         }
         Event::EdgeConnected { conn_index, total } => {

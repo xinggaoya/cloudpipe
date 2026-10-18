@@ -49,7 +49,7 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
     };
     let ctx = config.require_tunnel_context()?;
 
-    let mut handle = TunnelBuilder::new()
+    let mut builder = TunnelBuilder::new()
         .token(token)
         .account(ctx.account_id)
         .zone(ctx.zone_id)
@@ -57,7 +57,19 @@ async fn run_tunnel_command(args: TunnelArgs) -> Result<()> {
         .protocol(args.protocol)
         .port(args.port)
         .subdomain(args.subdomain.unwrap_or_default())
-        .auto_restart(args.auto_restart)
+        .auto_restart(args.auto_restart);
+
+    if args.insecure {
+        builder = builder.no_tls_verify(true);
+    }
+    if let Some(host) = args.origin_host_header {
+        builder = builder.origin_host_header(host);
+    }
+    if let Some(timeout) = args.origin_connect_timeout {
+        builder = builder.origin_connect_timeout(timeout);
+    }
+
+    let mut handle = builder
         .on_event(ui::render_event)
         .start()
         .await

@@ -46,15 +46,15 @@ pub(crate) use state::{DispatchSlot, SessionState};
 
 use supervisor::Supervisor;
 
-
 /// Boots a tunnel end-to-end, then keeps it running until the user calls
 /// [`TunnelHandle::stop`].
 ///
 /// The subdomain is validated before any network call, so a typo never
 /// costs a zone lookup or a `cloudflared` download.
 pub(crate) async fn start(cfg: SessionConfig) -> Result<TunnelHandle> {
-    validate_subdomain(&cfg.subdomain)
-        .map_err(|e| crate::error::Error::InvalidSubdomain(format!("\"{}\": {}", e.value, e.reason)))?;
+    validate_subdomain(&cfg.subdomain).map_err(|e| {
+        crate::error::Error::InvalidSubdomain(format!("\"{}\": {}", e.value, e.reason))
+    })?;
 
     let full_name = format!("{}.{}", cfg.subdomain, cfg.domain);
 

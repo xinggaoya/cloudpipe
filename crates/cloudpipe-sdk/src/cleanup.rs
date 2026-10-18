@@ -162,7 +162,9 @@ async fn cleanup_inner(
                 if dry_run {
                     report.record(action, true);
                 } else if let Err(err) = api.delete_dns_record(zone_id, &record.id).await {
-                    report.errors.push(format!("deleting dns {}: {err}", record.id));
+                    report
+                        .errors
+                        .push(format!("deleting dns {}: {err}", record.id));
                 } else {
                     report.record(action, false);
                 }
@@ -177,7 +179,9 @@ async fn cleanup_inner(
             }
             let _ = api.cleanup_connections(account_id, &tunnel.id).await;
             if let Err(err) = api.delete_tunnel(account_id, &tunnel.id).await {
-                report.errors.push(format!("deleting tunnel {}: {err}", tunnel.id));
+                report
+                    .errors
+                    .push(format!("deleting tunnel {}: {err}", tunnel.id));
             } else {
                 report.record(action, false);
             }
@@ -200,7 +204,9 @@ async fn cleanup_inner(
         if dry_run {
             report.record(action, true);
         } else if let Err(err) = api.delete_dns_record(zone_id, &record.id).await {
-            report.errors.push(format!("deleting orphaned dns {}: {err}", record.id));
+            report
+                .errors
+                .push(format!("deleting orphaned dns {}: {err}", record.id));
         } else {
             report.record(action, false);
         }
@@ -284,6 +290,9 @@ mod tests {
             Some("abc")
         );
         assert_eq!("example.com".strip_suffix(TUNNEL_CNAME_SUFFIX), None);
-        assert_eq!("abc.cfargotunnel.com.evil.net".strip_suffix(TUNNEL_CNAME_SUFFIX), None);
+        assert_eq!(
+            "abc.cfargotunnel.com.evil.net".strip_suffix(TUNNEL_CNAME_SUFFIX),
+            None
+        );
     }
 }

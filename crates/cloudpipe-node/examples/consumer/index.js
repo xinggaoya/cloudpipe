@@ -12,7 +12,8 @@
 //      - `parseErrorCode(message)` extracts the [CODE] prefix
 //   3. Error paths: connect() against empty / bad tokens surfaces
 //      a `[CODE]`-prefixed message and `parseErrorCode` round-trips
-//      it correctly.
+//      it correctly. Invalid arguments (port 0, unknown protocol)
+//      must fail locally without a network round-trip.
 //   4. Real-path end-to-end: if CLOUDFLARE_API_TOKEN is set AND a
 //      CLOUDFLARE_DOMAIN is set, spin up a local HTTP server, expose
 //      it via a tunnel, and curl the public URL.
@@ -32,7 +33,15 @@ try {
   loadError = err;
 }
 
-const REQUIRED_EXPORTS = ['connect', 'Listener', 'version', 'parseErrorCode'];
+const REQUIRED_EXPORTS = [
+  'connect',
+  'Listener',
+  'version',
+  'parseErrorCode',
+  'eventNames',
+  'errorCodes',
+  'cloudflareErrorKinds',
+];
 
 const checks = [];
 function check(name, fn) {
@@ -92,6 +101,7 @@ async function main() {
       ['[SUBDOMAIN_IN_USE] foo.example.com', 'SUBDOMAIN_IN_USE'],
       ['[INVALID_SUBDOMAIN] x.y', 'INVALID_SUBDOMAIN'],
       ['[IO] eperm', 'IO'],
+      ['[INVALID_ARGUMENT] port must be 1-65535', 'INVALID_ARGUMENT'],
       ['plain text no prefix', null],
       ['', null],
       ['[unclosed', null],
@@ -128,10 +138,16 @@ async function main() {
     if (!subdomain || typeof subdomain.get !== 'function') {
       throw new Error('Listener.prototype.subdomain getter missing');
     }
-    if (typeof proto.on !== 'function') throw new Error('Listener.prototype.on missing');
-    if (typeof proto.wait !== 'function') throw new Error('Listener.prototype.wait missing');
-    if (typeof proto.close !== 'function') throw new Error('Listener.prototype.close missing');
-    return 'all 6 members present';
+    const port = Object.getOwnPropertyDescriptor(proto, 'port');
+    if (!port || typeof port.get !== 'function') {
+      throw new Error('Listener.prototype.port getter missing');
+    }
+    for (const method of ['on', 'off', 'removeAllListeners', 'wait', 'update', 'close']) {
+      if (typeof proto[method] !== 'function') {
+        throw new Error(`Listener.prototype.${method} missing`);
+      }
+    }
+    return 'all 9 members present';
   });
 
   // --- 6. Negative path: connect() with no token ---
@@ -175,6 +191,33 @@ async function main() {
         }
       }
       return code || 'null';
+    }
+  });
+
+  // --- 7b. Argument validation must fail locally, without a network call ---
+  await check('port 0 is rejected with a code', async () => {
+    try {
+      await cloudpipe.connect({ token: 'placeholder', domain: 'example.com', port: 0 });
+      throw new Error('connect() accepted port 0');
+    } catch (err) {
+      const code = cloudpipe.parseErrorCode((err && err.message) || '');
+      if (code !== 'INVALID_ARGUMENT') {
+        throw new Error(`expected INVALID_ARGUMENT, got ${code ?? 'null'}`);
+      }
+      return code;
+    }
+  });
+
+  await check('empty token is rejected locally', async () => {
+    try {
+      await cloudpipe.connect({ token: '', domain: 'example.com' });
+      throw new Error('connect() accepted an empty token');
+    } catch (err) {
+      const code = cloudpipe.parseErrorCode((err && err.message) || '');
+      if (code !== 'MISSING_CREDENTIAL') {
+        throw new Error(`expected MISSING_CREDENTIAL, got ${code ?? 'null'}`);
+      }
+      return code;
     }
   });
 
@@ -284,6 +327,19 @@ async function runRealTunnel(cloudpipe, token, domain) {
       await new Promise((r) => setTimeout(r, backoff[attempt]));
     }
     throw lastErr || new Error('fetch failed after retries');
+  });
+
+  await check('real tunnel — update(port) keeps the URL', async () => {
+    const before = listener.url;
+    await Promise.race([
+      listener.update(port + 1),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('update() did not return in 15s')), 15_000),
+      ),
+    ]);
+    if (listener.url !== before) throw new Error(`url changed: ${listener.url}`);
+    if (listener.port !== port + 1) throw new Error(`port not updated: ${listener.port}`);
+    return `still ${listener.url}, now :${listener.port}`;
   });
 
   await check('real tunnel — close shuts down cleanly', async () => {

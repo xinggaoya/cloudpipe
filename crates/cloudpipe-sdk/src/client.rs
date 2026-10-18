@@ -19,8 +19,8 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{classify_error_code, ApiError, CloudflareErrorKind, Result};
 
@@ -260,8 +260,7 @@ impl CloudflareApi {
 
     /// Lists all DNS zones the token can access, following pagination.
     pub async fn list_zones(&self) -> Result<Vec<Zone>> {
-        self.paginate("/zones", &[("per_page", "50".into())])
-            .await
+        self.paginate("/zones", &[("per_page", "50".into())]).await
     }
 
     /// Finds a zone by exact domain name.
@@ -278,19 +277,20 @@ impl CloudflareApi {
     /// Creates a named tunnel (`POST /accounts/{id}/tunnels`).
     pub async fn create_tunnel(&self, account_id: &str, name: &str) -> Result<Tunnel> {
         let body = serde_json::json!({ "name": name, "config_src": "cloudflare" });
-        self.request_unit(reqwest::Method::POST, &format!("/accounts/{account_id}/tunnels"), Some(&body))
-            .await?
-            .ok_or_else(|| missing_result("create_tunnel"))
+        self.request_unit(
+            reqwest::Method::POST,
+            &format!("/accounts/{account_id}/tunnels"),
+            Some(&body),
+        )
+        .await?
+        .ok_or_else(|| missing_result("create_tunnel"))
     }
 
     /// Finds non-deleted tunnels by name.
     pub async fn find_tunnel_by_name(&self, account_id: &str, name: &str) -> Result<Vec<Tunnel>> {
         self.paginate(
             &format!("/accounts/{account_id}/tunnels"),
-            &[
-                ("is_deleted", "false".into()),
-                ("name", name.into()),
-            ],
+            &[("is_deleted", "false".into()), ("name", name.into())],
         )
         .await
     }
@@ -299,10 +299,7 @@ impl CloudflareApi {
     pub async fn list_tunnels(&self, account_id: &str, status: &str) -> Result<Vec<Tunnel>> {
         self.paginate(
             &format!("/accounts/{account_id}/tunnels"),
-            &[
-                ("is_deleted", "false".into()),
-                ("status", status.into()),
-            ],
+            &[("is_deleted", "false".into()), ("status", status.into())],
         )
         .await
     }
@@ -334,7 +331,11 @@ impl CloudflareApi {
     }
 
     /// Finds a DNS record by exact full name (e.g. `foo.example.com`).
-    pub async fn find_dns_record(&self, zone_id: &str, full_name: &str) -> Result<Option<DnsRecord>> {
+    pub async fn find_dns_record(
+        &self,
+        zone_id: &str,
+        full_name: &str,
+    ) -> Result<Option<DnsRecord>> {
         let records: Vec<DnsRecord> = self
             .paginate(
                 &format!("/zones/{zone_id}/dns_records"),
@@ -381,13 +382,14 @@ impl CloudflareApi {
     }
 
     /// Lists DNS records of a given type (e.g. `CNAME`), following pagination.
-    pub async fn list_dns_records(&self, zone_id: &str, record_type: &str) -> Result<Vec<DnsRecord>> {
+    pub async fn list_dns_records(
+        &self,
+        zone_id: &str,
+        record_type: &str,
+    ) -> Result<Vec<DnsRecord>> {
         self.paginate(
             &format!("/zones/{zone_id}/dns_records"),
-            &[
-                ("type", record_type.into()),
-                ("per_page", "100".into()),
-            ],
+            &[("type", record_type.into()), ("per_page", "100".into())],
         )
         .await
     }
@@ -419,7 +421,10 @@ impl CloudflareApi {
         full_name: &str,
     ) -> Result<bool> {
         if let Some(existing) = self
-            .find_tunnel_by_name(account_id, full_name.split_once('.').map_or(full_name, |(l, _)| l))
+            .find_tunnel_by_name(
+                account_id,
+                full_name.split_once('.').map_or(full_name, |(l, _)| l),
+            )
             .await?
             .into_iter()
             .next()
@@ -513,7 +518,8 @@ impl CloudflareApi {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<()> {
-        self.request_page::<serde_json::Value>(method, path, body).await?;
+        self.request_page::<serde_json::Value>(method, path, body)
+            .await?;
         Ok(())
     }
 
@@ -683,12 +689,9 @@ fn is_retryable(err: &crate::Error) -> bool {
 /// same per-token Cloudflare quota — synchronised retries would keep
 /// colliding.
 fn retry_backoff(attempt: u32) -> Duration {
-    let base = 200u64
-        .saturating_mul(1u64 << attempt.min(6))
-        .min(8_000);
+    let base = 200u64.saturating_mul(1u64 << attempt.min(6)).min(8_000);
     let jitter = base / 2;
-    let noise = (base as f64 * 0.5
-        * ((attempt as u64).wrapping_mul(2_654_435_761) % 1_000) as f64
+    let noise = (base as f64 * 0.5 * ((attempt as u64).wrapping_mul(2_654_435_761) % 1_000) as f64
         / 1_000.0) as u64;
     Duration::from_millis(base - jitter + noise)
 }
@@ -795,8 +798,7 @@ mod tests {
 
     #[test]
     fn zone_without_account_reports_a_useful_error() {
-        let zone: Zone =
-            serde_json::from_str(r#"{"id":"z","name":"example.com"}"#).unwrap();
+        let zone: Zone = serde_json::from_str(r#"{"id":"z","name":"example.com"}"#).unwrap();
         let err = zone.require_account_id().unwrap_err();
         assert!(format!("{err:#}").contains("without an account"));
     }

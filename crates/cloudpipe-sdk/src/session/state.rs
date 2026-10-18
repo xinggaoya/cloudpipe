@@ -197,10 +197,7 @@ impl SessionState {
             .find_dns_record(&self.zone_id, &self.full_name)
             .await
         {
-            let _ = self
-                .api
-                .delete_dns_record(&self.zone_id, &record.id)
-                .await;
+            let _ = self.api.delete_dns_record(&self.zone_id, &record.id).await;
         }
         let _ = self
             .api

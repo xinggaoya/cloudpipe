@@ -180,9 +180,7 @@ fn route(req: &Req, state: &MockState) -> (u16, Value) {
     let ok = |result: Value| (200, json!({ "success": true, "result": result }));
 
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/user/tokens/verify") => {
-            return ok(json!({ "id": "tok", "status": "active" }))
-        }
+        ("GET", "/user/tokens/verify") => return ok(json!({ "id": "tok", "status": "active" })),
         ("GET", "/zones") => {
             return ok(json!([{
                 "id": "zone-1",
@@ -200,7 +198,9 @@ fn route(req: &Req, state: &MockState) -> (u16, Value) {
             // ever wrapping.
             let remaining = state.fail_create_times.load(Ordering::SeqCst);
             if remaining > 0 {
-                state.fail_create_times.store(remaining - 1, Ordering::SeqCst);
+                state
+                    .fail_create_times
+                    .store(remaining - 1, Ordering::SeqCst);
                 return (
                     500,
                     json!({"success": false, "result": null,
@@ -213,10 +213,11 @@ fn route(req: &Req, state: &MockState) -> (u16, Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_string();
-            let id = format!("tun-{name}-{}", state.tunnel_creation_count.load(Ordering::SeqCst));
-            state
-                .tunnels()
-                .insert(name.clone(), id.clone());
+            let id = format!(
+                "tun-{name}-{}",
+                state.tunnel_creation_count.load(Ordering::SeqCst)
+            );
+            state.tunnels().insert(name.clone(), id.clone());
             state.tunnel_creation_count.fetch_add(1, Ordering::SeqCst);
             return ok(json!({
                 "id": id, "name": name, "status": "healthy", "token": "fake-token"
@@ -370,10 +371,7 @@ async fn spawn_mock_api(state: Arc<MockState>) -> String {
 /// The `term_marker` file is touched from a TERM trap, which lets a test
 /// assert that shutdown signals the process *before* the SDK starts
 /// deleting Cloudflare resources.
-async fn write_fake_cloudflared(
-    dir: &Path,
-    markers: Option<(&Path, &Path)>,
-) -> std::path::PathBuf {
+async fn write_fake_cloudflared(dir: &Path, markers: Option<(&Path, &Path)>) -> std::path::PathBuf {
     let path = dir.join("cloudflared");
     let script = match markers {
         Some((ready, term)) => format!(
@@ -395,10 +393,7 @@ async fn write_fake_cloudflared(
 
 /// A `cloudflared` stand-in whose first invocation exits immediately (a
 /// simulated crash) and later ones idle forever.
-async fn write_crashing_cloudflared(
-    dir: &Path,
-    counter_file: &Path,
-) -> std::path::PathBuf {
+async fn write_crashing_cloudflared(dir: &Path, counter_file: &Path) -> std::path::PathBuf {
     let path = dir.join("cloudflared");
     let script = format!(
         "#!/bin/sh\ntrap 'exit 0' TERM INT\nCOUNTER_FILE=\"{}\"\n\
@@ -621,8 +616,7 @@ async fn permanent_failures_are_not_retried() {
             calls_for_task.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let _ = read_request(&mut stream).await;
-                let body =
-                    r#"{"success":false,"result":null,"errors":[{"code":10001,"message":"bad auth"}]}"#;
+                let body = r#"{"success":false,"result":null,"errors":[{"code":10001,"message":"bad auth"}]}"#;
                 let response = format!(
                     "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -691,7 +685,10 @@ async fn full_lifecycle_creates_then_cleans_up() {
     // which is an implementation detail — `purge` collapses concurrent
     // callers via a shared flag and that must stay free to change.
     assert!(state.tunnels().is_empty(), "no tunnel may be left behind");
-    assert!(state.records().is_empty(), "no DNS record may be left behind");
+    assert!(
+        state.records().is_empty(),
+        "no DNS record may be left behind"
+    );
 
     let err = handle.stop().await.unwrap_err();
     assert!(matches!(err, cloudpipe_sdk::Error::AlreadyShutDown));
@@ -986,7 +983,10 @@ async fn wait_is_passive_and_does_not_clean_up() {
         .is_err();
     assert!(timed_out, "wait() must not signal shutdown");
 
-    assert!(state.deleted_tunnels().is_empty(), "wait() deleted the tunnel");
+    assert!(
+        state.deleted_tunnels().is_empty(),
+        "wait() deleted the tunnel"
+    );
     assert!(state.deleted_records().is_empty(), "wait() deleted the DNS");
 
     handle.stop().await.expect("stop should succeed");
@@ -1080,6 +1080,7 @@ async fn preview_cleanup_changes_nothing() {
     assert_eq!(report.removed_count(), 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_handle_still_releases_cloudflare_resources() {
     let state = MockState::new();
     let base = spawn_mock_api(state.clone()).await;

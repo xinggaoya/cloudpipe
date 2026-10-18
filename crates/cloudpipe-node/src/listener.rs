@@ -92,8 +92,8 @@ pub struct Listener {
 impl Listener {
     /// Boots the tunnel with the supplied options.
     pub async fn start(options: ConnectOptions) -> Result<Self> {
-        let protocol =
-            cloudpipe_node_core::parse_protocol(options.protocol.as_deref()).map_err(error::invalid_arg)?;
+        let protocol = cloudpipe_node_core::parse_protocol(options.protocol.as_deref())
+            .map_err(error::invalid_arg)?;
         let port = cloudpipe_node_core::parse_port(options.port).map_err(error::invalid_arg)?;
 
         let mut builder = TunnelBuilder::new()
@@ -308,7 +308,6 @@ impl Listener {
     pub fn port(&self) -> u32 {
         u32::from(self.port.load(std::sync::atomic::Ordering::Relaxed))
     }
-
 
     /// Registers a callback for a single named event.
     ///

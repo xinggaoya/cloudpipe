@@ -10,10 +10,13 @@
 npm install @xinggao/cloudpipe
 ```
 
-Prebuilt binaries are shipped for macOS (arm64 + x64), Linux (x64-gnu),
-and Windows (x64-msvc). Linux aarch64-gnu and Alpine/musl support are
-scheduled for v0.2.0 — see the workflows' matrix entry for the upstream
-zig-cross-compile setup we still need to land.
+Prebuilt binaries are shipped for macOS (arm64 + x64), Linux (x64-gnu)
+and Windows (x64-msvc). Linux aarch64-gnu and Alpine/musl need a zig
+cross-compiler that the CI matrix does not set up yet.
+
+No other binary needs to be installed: `cloudflared` is downloaded on
+first use to `~/.cfp/bin/cloudflared`, at a **pinned version** whose
+SHA-256 is verified before the binary is made executable.
 
 ## Quick start
 
@@ -31,9 +34,32 @@ console.log(`live at ${listener.url}`);
 await listener.close();
 ```
 
-No other binary needs to be installed — `cloudflared` is downloaded on
-first use to `~/.cfp/bin/cloudflared` (with a default GitHub mirror for
-users behind the GFW; override with `CFP_GITHUB_PROXY`).
+## Changing a live tunnel
+
+```js
+await listener.update(9090);   // same public URL, new local port
+console.log(listener.port);    // 9090
+```
+
+This rewrites the tunnel's remote ingress, so no URL you already shared
+breaks. It is the counterpart of ngrok's `listener.update()`.
+
+## Self-signed HTTPS origins
+
+`cloudflared` validates the origin certificate, so a local dev server with
+a self-signed certificate needs an explicit opt-out:
+
+```js
+const listener = await connect({
+  token,
+  domain: 'example.com',
+  protocol: 'https',
+  port: 8443,
+  noTlsVerify: true,
+});
+```
+
+`originHostHeader` is there for services that route on their own hostname.
 
 ## Lifecycle events
 
@@ -74,6 +100,9 @@ fields.
 | `autoRestart` | `boolean` | `false` | Respawn `cloudflared` on the same URL after a crash. |
 | `cloudflaredPath` | `string` | — | Use a specific `cloudflared` binary instead of downloading. |
 | `githubProxy` | `string` | `https://v4.gh-proxy.org/` | GitHub mirror prefix for the `cloudflared` download. |
+| `noTlsVerify` | `boolean` | `false` | Skip origin certificate validation. |
+| `originHostHeader` | `string` | — | `Host` header sent to the origin. |
+| `restartPolicy` | `{ maxAttempts?, baseDelayMs?, maxDelayMs? }` | 5 / 500 / 8000 | Reconnection budget when `autoRestart` is on. |
 
 ### `Listener`
 
@@ -82,9 +111,16 @@ fields.
 | `url` | `string` | Public HTTPS URL of the tunnel. |
 | `fullName` | `string` | Public hostname (`myapp.example.com`). |
 | `subdomain` | `string` | Just the subdomain part. |
-| `on(event, cb)` | `(name, payload) → void` | Register an event listener. |
-| `wait()` | `Promise<void>` | Block until the tunnel exits on its own. |
+| `port` | `number` | Local port currently forwarded. |
+| `on(event, cb)` | `(name, payload) → void` | Register an event listener. Throws on an unknown event name. |
+| `off(event)` | `void` | Remove every listener for an event. |
+| `removeAllListeners()` | `void` | Remove every listener. |
+| `wait()` | `Promise<void>` | Block until the tunnel ends on its own. Does **not** prevent a later `close()`. |
+| `update(port)` | `Promise<void>` | Repoint at another local port; public URL unchanged. |
 | `close()` | `Promise<void>` | Trigger clean shutdown + wait. |
+
+`await listener.wait(); await listener.close();` works: a pending `wait()`
+does not starve a later `close()`.
 
 ### Errors
 
@@ -112,7 +148,19 @@ try {
 
 The full top-level code list is in
 [`index.d.ts`](./index.d.ts) (`CloudpipeErrorCode`); the
-`CLOUDFLARE_API` sub-kind catalog is `CloudflareApiKind`.
+`CLOUDFLARE_API` sub-kind catalog is `CloudflareApiKind`. Both are also
+available at runtime via `errorCodes()` and `cloudflareErrorKinds()`.
+
+`parseErrorCode` is forward-compatible: a code this build does not know
+about is returned verbatim (including any `:KIND` suffix) rather than
+throwing, so a newer SDK does not break an older consumer.
+
+## Cleanup on abandonment
+
+Dropping the listener ends the session, which stops `cloudflared` and
+releases the tunnel and DNS record. Calling `close()` explicitly is still
+preferred — it waits for the teardown to finish — but a listener you lose
+reference to is no longer a leaked tunnel.
 
 ## License
 

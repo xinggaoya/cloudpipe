@@ -38,6 +38,24 @@ pub struct Cli {
     #[arg(long)]
     pub no_restart: bool,
 
+    /// Skip TLS verification when the origin is `https://` with a
+    /// self-signed certificate.
+    ///
+    /// Almost every local dev server uses a self-signed certificate, and
+    /// `cloudflared` validates the origin certificate, so exposing one over
+    /// `https` fails without this.
+    #[arg(long)]
+    pub insecure: bool,
+
+    /// Send this `Host` header to the origin instead of the public
+    /// hostname. Needed when the local service routes on its own host.
+    #[arg(long, value_name = "HOST")]
+    pub origin_host_header: Option<String>,
+
+    /// Origin TCP connect timeout, in seconds.
+    #[arg(long, value_name = "SECONDS")]
+    pub origin_connect_timeout: Option<u64>,
+
     /// Print the SDK's internal trace to stderr.
     ///
     /// Equivalent to `CFP_LOG=debug`. Use it to see the retry/backoff
@@ -83,6 +101,12 @@ pub struct TunnelArgs {
     pub port: u16,
     pub subdomain: Option<String>,
     pub auto_restart: bool,
+    /// Skip origin TLS verification.
+    pub insecure: bool,
+    /// Override the `Host` header sent to the origin.
+    pub origin_host_header: Option<String>,
+    /// Origin TCP connect timeout, in seconds.
+    pub origin_connect_timeout: Option<u64>,
 }
 
 impl Cli {
@@ -111,11 +135,20 @@ impl Cli {
             port = Some(value);
         }
 
+        if let Some(timeout) = self.origin_connect_timeout {
+            if timeout == 0 || timeout > 300 {
+                bail!("--origin-connect-timeout must be between 1 and 300 seconds");
+            }
+        }
+
         Ok(TunnelArgs {
             protocol: Protocol::parse(protocol_token).map_err(anyhow::Error::msg)?,
             port: port.unwrap_or(crate::DEFAULT_PORT),
             subdomain: self.subdomain.clone(),
             auto_restart: !self.no_restart,
+            insecure: self.insecure,
+            origin_host_header: self.origin_host_header.clone(),
+            origin_connect_timeout: self.origin_connect_timeout,
         })
     }
 }
@@ -194,6 +227,37 @@ mod tests {
             }
             _ => panic!("expected Cleanup command"),
         }
+    }
+
+    #[test]
+    fn origin_tuning_flags_parse() {
+        let cli = parse(&["https", "8443", "--insecure"]);
+        let args = cli.to_tunnel_args().unwrap();
+        assert!(args.insecure);
+        assert_eq!(args.protocol, Protocol::Https);
+
+        let cli = parse(&["8080", "--origin-host-header", "localhost:8080"]);
+        let args = cli.to_tunnel_args().unwrap();
+        assert_eq!(args.origin_host_header.as_deref(), Some("localhost:8080"));
+
+        let cli = parse(&["8080", "--origin-connect-timeout", "15"]);
+        let args = cli.to_tunnel_args().unwrap();
+        assert_eq!(args.origin_connect_timeout, Some(15));
+    }
+
+    #[test]
+    fn absurd_origin_connect_timeouts_are_rejected() {
+        assert!(parse(&["8080", "--origin-connect-timeout", "0"])
+            .to_tunnel_args()
+            .is_err());
+        assert!(parse(&["8080", "--origin-connect-timeout", "99999"])
+            .to_tunnel_args()
+            .is_err());
+    }
+
+    #[test]
+    fn insecure_is_off_by_default() {
+        assert!(!parse(&["8080"]).to_tunnel_args().unwrap().insecure);
     }
 
     #[test]

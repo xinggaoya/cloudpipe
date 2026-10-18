@@ -182,8 +182,7 @@ static DETECTED: std::sync::LazyLock<Style> = std::sync::LazyLock::new(Style::de
 
 /// Test hook. `STYLE_AUTO` means "follow detection"; anything else is an
 /// encoded [`Style`].
-static STYLE_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(STYLE_AUTO);
+static STYLE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(STYLE_AUTO);
 
 #[allow(dead_code)]
 impl Style {
@@ -239,7 +238,10 @@ pub fn render_event(event: Event) {
         Event::IngressConfigured { protocol, port } => {
             println!(
                 "  {}",
-                dim(&format!("Configuring ingress ({protocol}://localhost:{port})..."), st)
+                dim(
+                    &format!("Configuring ingress ({protocol}://localhost:{port})..."),
+                    st
+                )
             );
         }
         Event::DnsCreated { full_name } => {
@@ -261,10 +263,16 @@ pub fn render_event(event: Event) {
         Event::Restarted { attempt } => {
             println!(
                 "  {}",
-                green(&format!("Resumed on the same URL (attempt #{attempt})."), st)
+                green(
+                    &format!("Resumed on the same URL (attempt #{attempt})."),
+                    st
+                )
             );
         }
-        Event::RestartGivingUp { attempts, last_error } => {
+        Event::RestartGivingUp {
+            attempts,
+            last_error,
+        } => {
             println!(
                 "  {}",
                 red(
@@ -341,17 +349,22 @@ pub fn render_live_block(
 
     // Measure the longest row so the rule actually matches the content,
     // rather than a magic constant that drifts on every locale change.
-    let width = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0).max(20);
+    let width = rows
+        .iter()
+        .map(|r| r.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(20);
 
     let mut out = String::new();
     out.push('\n');
-    out.push_str(&format!("  {} {}\n", green("WE LIVE!", st), st.rocket_glyph()));
-    out.push('\n');
     out.push_str(&format!(
         "  {} {}\n",
-        st.arrow_glyph(),
-        cyan_bold(url, st)
+        green("WE LIVE!", st),
+        st.rocket_glyph()
     ));
+    out.push('\n');
+    out.push_str(&format!("  {} {}\n", st.arrow_glyph(), cyan_bold(url, st)));
     out.push('\n');
     out.push_str(&format!("  {}\n", dim(&st.rule(width + 2), st)));
     for row in rows {
@@ -363,15 +376,12 @@ pub fn render_live_block(
 }
 
 /// Prints the tunnel success block after the URL is live.
-pub fn tunnel_live(
-    url: &str,
-    port: u16,
-    protocol: &str,
-    subdomain: &str,
-    auto_restart: bool,
-) {
+pub fn tunnel_live(url: &str, port: u16, protocol: &str, subdomain: &str, auto_restart: bool) {
     let parsed = Protocol::parse(protocol).unwrap_or(Protocol::Http);
-    print!("{}", render_live_block(url, parsed, port, subdomain, auto_restart));
+    print!(
+        "{}",
+        render_live_block(url, parsed, port, subdomain, auto_restart)
+    );
 }
 
 /// Maps an SDK error onto actionable guidance.
@@ -451,7 +461,10 @@ pub fn success(message: &str) {
 
 pub fn no_token_guide() {
     let st = style();
-    eprintln!("{}", red(&bold("No Cloudflare API token configured.", st), st));
+    eprintln!(
+        "{}",
+        red(&bold("No Cloudflare API token configured.", st), st)
+    );
     eprintln!();
     eprintln!("{}", bold("One-time setup (30 seconds):", st));
     eprintln!("  1. Open https://dash.cloudflare.com/profile/api-tokens");
@@ -571,7 +584,11 @@ pub fn render_cleanup(report: &CleanupReport, dry_run: bool, json: bool) -> Stri
 
     if !report.errors.is_empty() {
         out.push('\n');
-        out.push_str(&format!("{} {} error(s):\n", red("Failed:", st), report.errors.len()));
+        out.push_str(&format!(
+            "{} {} error(s):\n",
+            red("Failed:", st),
+            report.errors.len()
+        ));
         for err in &report.errors {
             out.push_str(&format!("  {} {err}\n", st.bullet()));
         }
@@ -781,8 +798,14 @@ mod tests {
 
     #[test]
     fn describe_reason_handles_all_variants() {
-        assert_eq!(describe_reason(&ShutdownReason::UserRequested), "user requested");
-        assert_eq!(describe_reason(&ShutdownReason::ChildExited), "cloudflared exited");
+        assert_eq!(
+            describe_reason(&ShutdownReason::UserRequested),
+            "user requested"
+        );
+        assert_eq!(
+            describe_reason(&ShutdownReason::ChildExited),
+            "cloudflared exited"
+        );
         assert!(describe_reason(&ShutdownReason::Error("x".into())).contains("internal error"));
     }
 }

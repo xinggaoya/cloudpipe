@@ -158,7 +158,9 @@ pub enum InstallError {
     /// Either the mirror is serving something other than the release, or
     /// the download was corrupted. The partial file is discarded and the
     /// binary is *not* made executable.
-    #[error("checksum mismatch for the downloaded cloudflared asset: expected {expected}, got {actual}")]
+    #[error(
+        "checksum mismatch for the downloaded cloudflared asset: expected {expected}, got {actual}"
+    )]
     ChecksumMismatch {
         /// The digest this build pins for the asset.
         expected: String,

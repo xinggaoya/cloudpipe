@@ -9,6 +9,7 @@
 //! The classification itself lives in `cloudpipe_node_core::error` where
 //! it is unit-tested; this module only adds the `napi::Error` skin.
 
+use cloudpipe_node_core::CloudpipeErrorCode;
 use napi::Error as NapiError;
 use napi::Status;
 
@@ -36,10 +37,16 @@ pub(crate) fn other(msg: impl Into<String>) -> FixedError {
 }
 
 /// Maps a [`Status::InvalidArg`] when the JS side supplies a value
-/// outside the Rust SDK's accepted range (e.g. port > 65535 or an
-/// unknown protocol string).
+/// outside the Rust SDK's accepted range (e.g. port 0, port > 65535, an
+/// unknown protocol string, or an unknown event name).
+///
+/// The message still carries the `[CODE]` prefix so `parseErrorCode`
+/// works uniformly across every failure mode — otherwise the two mistakes
+/// a caller is most likely to make were the only ones with no machine-
+/// readable code.
 pub(crate) fn invalid_arg(msg: impl Into<String>) -> FixedError {
-    NapiError::new(Status::InvalidArg, msg.into())
+    let prefix = format!("[{}] ", CloudpipeErrorCode::InvalidArgument.as_str());
+    NapiError::new(Status::InvalidArg, format!("{prefix}{}", msg.into()))
 }
 
 /// Channel dropped its reply before the session task could answer —

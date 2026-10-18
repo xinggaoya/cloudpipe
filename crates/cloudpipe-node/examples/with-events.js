@@ -10,75 +10,71 @@
 // Run with:
 //   node examples/with-events.js
 
-const { connect } = require('@xinggao/cloudpipe');
+const { connect, eventNames } = require('@xinggao/cloudpipe');
 
 function parse(json) {
- try {
- return JSON.parse(json);
- } catch {
- return json;
- }
+  try {
+    return JSON.parse(json);
+  } catch {
+    return json;
+  }
 }
 
 (async () => {
- const token = process.env.CLOUDFLARE_API_TOKEN;
- const domain = process.env.CFP_DOMAIN;
- if (!token || !domain) {
- console.error(
- 'set CLOUDFLARE_API_TOKEN and CFP_DOMAIN before running this example',
- );
- process.exit(1);
- }
+  const token = process.env.CLOUDFLARE_API_TOKEN;
+  const domain = process.env.CFP_DOMAIN;
+  if (!token || !domain) {
+    console.error(
+      'set CLOUDFLARE_API_TOKEN and CFP_DOMAIN before running this example',
+    );
+    process.exit(1);
+  }
 
- const listener = await connect({
- token,
- domain,
- protocol: 'http',
- port: 8080,
- autoRestart: true,
- });
+  // The runtime validates event names, so this list is the same one
+  // `listener.on()` accepts.
+  console.log('subscribing to:', eventNames().join(', '), '\n');
 
- listener.on('creatingTunnel', (json) => {
- console.log('creating tunnel', parse(json).name);
- });
- listener.on('dnsCreated', (json) => {
- console.log('DNS created for', parse(json).fullName);
- });
- listener.on('cloudflaredStarted', () => {
- console.log('cloudflared spawned');
- });
- listener.on('edgeConnected', (json) => {
- const { connIndex, total } = parse(json);
- console.log(`edge connection ${connIndex}/${total}`);
- });
- listener.on('restarting', (json) => {
- const { reason, attempt } = parse(json);
- console.log(`restarting (attempt ${attempt}):`, reason);
- });
- listener.on('restartGivingUp', (json) => {
- const { attempts, lastError } = parse(json);
- console.log(`auto-restart giving up after ${attempts} attempts: ${lastError}`);
- });
- listener.on('shuttingDown', (json) => {
- console.log('shutting down:', parse(json).reason);
- });
- listener.on('cleaned', () => {
- console.log('all resources cleaned up');
- });
+  const listener = await connect({
+    token,
+    domain,
+    port: 8080,
+    autoRestart: true,
+  });
 
- console.log('live at', listener.url);
+  for (const name of eventNames()) {
+    listener.on(name, (json) => {
+      console.log(`[${name}]`, parse(json));
+    });
+  }
 
- process.on('SIGINT', async () => {
- try {
- await listener.close();
- } catch (err) {
- console.error('shutdown error:', err);
- }
- process.exit(0);
- });
+  console.log('live at', listener.url);
+  console.log('forwarding localhost:', listener.port);
 
- await listener.wait().catch((err) => {
- console.error('tunnel exited unexpectedly:', err);
- process.exit(1);
- });
+  // Move the tunnel to another local port without changing the URL.
+  setTimeout(async () => {
+    console.log('\nrepointing to port 9090 (same public URL)…');
+    try {
+      await listener.update(9090);
+      console.log('now forwarding localhost:', listener.port);
+    } catch (err) {
+      console.error('update failed:', err.message);
+    }
+  }, 10_000).unref?.();
+
+  const shutdown = async (signal) => {
+    console.log(`\n${signal} — closing`);
+    try {
+      // `off` drops the handlers first so the teardown events do not
+      // interleave with our own logging.
+      listener.removeAllListeners();
+      await listener.close();
+    } catch (err) {
+      console.error('close failed:', err.message);
+      process.exitCode = 1;
+    }
+    process.exit(process.exitCode ?? 0);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 })();

@@ -22,7 +22,11 @@ pub(crate) async fn resolve_conflicts(
     // `if let Ok(existing) = ...`, which made a network blip or an auth
     // failure look exactly like "no such tunnel" — the session would then
     // charge ahead and fail later with a misleading `SubdomainInUse`.
-    if let Some(existing) = api.find_tunnel_by_name(account_id, subdomain).await?.into_iter().next()
+    if let Some(existing) = api
+        .find_tunnel_by_name(account_id, subdomain)
+        .await?
+        .into_iter()
+        .next()
     {
         if existing.status == "healthy" {
             return Err(Error::SubdomainInUse(subdomain.to_string()));

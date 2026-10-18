@@ -334,7 +334,10 @@ async fn download_and_install(
 
     let client = reqwest::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
-        .user_agent(format!("cloudpipe/{version}", version = env!("CARGO_PKG_VERSION")))
+        .user_agent(format!(
+            "cloudpipe/{version}",
+            version = env!("CARGO_PKG_VERSION")
+        ))
         .build()
         .map_err(crate::error::ApiError::Http)?;
 
@@ -356,10 +359,7 @@ async fn download_and_install(
         }
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .context("reading download body")?;
+    let bytes = response.bytes().await.context("reading download body")?;
     if bytes.len() as u64 > MAX_ASSET_BYTES {
         return Err(InstallError::TooLarge {
             bytes: bytes.len() as u64,
@@ -488,10 +488,7 @@ async fn write_token_file(binary: &Path, token: &str) -> Result<PathBuf> {
         // file is created `0600` rather than chmod-ed afterwards — there is
         // no window in which the secret is world-readable.
         let mut opts = fs::OpenOptions::new();
-        opts.write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600);
+        opts.write(true).create(true).truncate(true).mode(0o600);
         opts.open(&file).await
     };
     #[cfg(not(unix))]
@@ -653,12 +650,9 @@ mod tests {
     async fn token_file_is_0600_and_removed_on_spawn() {
         let tmp = tempfile::tempdir().unwrap();
         let fake = tmp.path().join("cloudflared");
-        tokio::fs::write(
-            &fake,
-            "#!/bin/sh\nexec cat /dev/null\n",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(&fake, "#!/bin/sh\nexec cat /dev/null\n")
+            .await
+            .unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             tokio::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
@@ -697,7 +691,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out");
 
-        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let mut builder =
+            tar::Builder::new(GzEncoder::new(Vec::new(), flate2::Compression::fast()));
         let mut header = tar::Header::new_gnu();
         header.set_size(3);
         header.set_mode(0o755);
@@ -716,7 +711,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out");
 
-        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let mut builder =
+            tar::Builder::new(GzEncoder::new(Vec::new(), flate2::Compression::fast()));
         let mut header = tar::Header::new_gnu();
         header.set_size(3);
         header.set_mode(0o644);

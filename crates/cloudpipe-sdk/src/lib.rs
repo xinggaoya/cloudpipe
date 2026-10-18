@@ -22,7 +22,7 @@
 //! println!("live at {}", handle.url());
 //!
 //! // `wait` blocks until the tunnel exits on its own (e.g. cloudflared
-//! // crashed or the 4h age limit was reached). It does NOT signal
+//! // crashed with auto-restart disabled). It does NOT signal
 //! // shutdown — pair it with a control signal and call `stop` yourself.
 //! tokio::select! {
 //!     _ = tokio::signal::ctrl_c() => handle.stop().await?,

@@ -87,9 +87,7 @@ impl CloudflareApiKind {
 }
 
 /// Classifies an SDK error into the top-level code plus optional sub-kind.
-pub fn classify(
-    err: &cloudpipe_sdk::Error,
-) -> (CloudpipeErrorCode, Option<CloudflareApiKind>) {
+pub fn classify(err: &cloudpipe_sdk::Error) -> (CloudpipeErrorCode, Option<CloudflareApiKind>) {
     use cloudpipe_sdk::Error as E;
     match err {
         E::MissingCredential(_) => (CloudpipeErrorCode::MissingCredential, None),
@@ -172,7 +170,10 @@ mod tests {
             "ALREADY_SHUT_DOWN"
         );
         assert_eq!(CloudpipeErrorCode::Io.as_str(), "IO");
-        assert_eq!(CloudpipeErrorCode::InvalidArgument.as_str(), "INVALID_ARGUMENT");
+        assert_eq!(
+            CloudpipeErrorCode::InvalidArgument.as_str(),
+            "INVALID_ARGUMENT"
+        );
         assert_eq!(CloudpipeErrorCode::Other.as_str(), "OTHER");
     }
 

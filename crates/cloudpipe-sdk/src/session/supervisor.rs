@@ -87,9 +87,7 @@ impl Supervisor {
             }
 
             attempt += 1;
-            let _ = self
-                .event_tx
-                .send(Event::Restarting { reason, attempt });
+            let _ = self.event_tx.send(Event::Restarting { reason, attempt });
 
             // ---- Phase 2: no child; retry the bootstrap ---------------
             match self.retry_bootstrap(attempt).await {

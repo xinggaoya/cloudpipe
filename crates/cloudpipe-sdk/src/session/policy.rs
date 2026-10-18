@@ -46,9 +46,7 @@ impl RestartPolicy {
             .saturating_mul(1u64 << attempt.saturating_sub(1).min(16))
             .min(cap);
         // 50% base + up to 50% jitter.
-        let jitter = (ceiling / 2)
-            * ((attempt as u64).wrapping_mul(2_654_435_761) % 1_000)
-            / 1_000;
+        let jitter = (ceiling / 2) * ((attempt as u64).wrapping_mul(2_654_435_761) % 1_000) / 1_000;
         Duration::from_millis(ceiling / 2 + jitter)
     }
 }

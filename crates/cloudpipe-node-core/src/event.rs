@@ -33,6 +33,10 @@ pub fn event_to_payload(event: &Event) -> (&'static str, String) {
             json!({ "reason": reason_to_value(reason), "attempt": attempt }),
         ),
         Event::Restarted { attempt } => ("restarted", json!({ "attempt": attempt })),
+        Event::BootstrapFailed { attempt, error } => (
+            "bootstrapFailed",
+            json!({ "attempt": attempt, "error": error }),
+        ),
         Event::RestartGivingUp {
             attempts,
             last_error,
@@ -89,6 +93,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "restarting",
     "restarted",
     "restartGivingUp",
+    "bootstrapFailed",
     "edgeConnected",
     "cloudflaredLog",
     "shuttingDown",
@@ -191,12 +196,7 @@ mod tests {
         let cases = [
             (Event::Banner, "banner"),
             (Event::ResolvingConflicts, "resolvingConflicts"),
-            (
-                Event::CreatingTunnel {
-                    name: "n".into(),
-                },
-                "creatingTunnel",
-            ),
+            (Event::CreatingTunnel { name: "n".into() }, "creatingTunnel"),
             (
                 Event::IngressConfigured {
                     protocol: Protocol::Tcp,
@@ -225,6 +225,13 @@ mod tests {
                     last_error: "e".into(),
                 },
                 "restartGivingUp",
+            ),
+            (
+                Event::BootstrapFailed {
+                    attempt: 2,
+                    error: "e".into(),
+                },
+                "bootstrapFailed",
             ),
             (
                 Event::EdgeConnected {
@@ -256,6 +263,59 @@ mod tests {
             assert!(
                 EVENT_NAMES.contains(&name),
                 "{name} missing from EVENT_NAMES catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn event_names_covers_every_named_variant() {
+        // `EVENT_NAMES` is what `Listener#on` validates against, so a
+        // variant missing from it would be silently unregisterable. The
+        // `every_documented_event_name_is_reachable` case above asserts
+        // the other direction; this asserts the sizes agree.
+        for event in [
+            Event::Banner,
+            Event::ResolvingConflicts,
+            Event::CreatingTunnel { name: "n".into() },
+            Event::IngressConfigured {
+                protocol: Protocol::Http,
+                port: 1,
+            },
+            Event::DnsCreated {
+                full_name: "f".into(),
+            },
+            Event::CloudflaredStarted,
+            Event::Restarting {
+                reason: ShutdownReason::ChildExited,
+                attempt: 1,
+            },
+            Event::Restarted { attempt: 1 },
+            Event::RestartGivingUp {
+                attempts: 1,
+                last_error: "e".into(),
+            },
+            Event::BootstrapFailed {
+                attempt: 1,
+                error: "e".into(),
+            },
+            Event::EdgeConnected {
+                conn_index: 0,
+                total: 1,
+            },
+            Event::CloudflaredLog {
+                level: LogLevel::Info,
+                line: "l".into(),
+            },
+            Event::ShuttingDown {
+                reason: ShutdownReason::UserRequested,
+            },
+            Event::Cleaned,
+        ] {
+            let (name, _) = event_to_payload(&event);
+            assert_ne!(name, "unknown", "a known variant fell into the catch-all");
+            assert!(
+                EVENT_NAMES.contains(&name),
+                "EVENT_NAMES is missing \"{name}\" — Listener#on would reject it"
             );
         }
     }

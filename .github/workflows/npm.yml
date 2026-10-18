@@ -24,20 +24,37 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org/
-      - name: Check package name availability
+      - name: Check we own the package name
         env:
-          PACKAGE_NAME: cloudpipe
+          # Must match `name` in crates/cloudpipe-node/package.json. It was
+          # still `cloudpipe` after the rename, which resolved to a
+          # *different, already-registered* package and failed every
+          # publish before a single build ran.
+          PACKAGE_NAME: '@xinggao/cloudpipe'
+          # The repository URL recorded on the published package. If it
+          # matches, the name is ours and publishing is safe.
+          OWNER_URL: 'github.com/xinggaoya/cloudpipe'
         run: |
           set -euo pipefail
-          # `npm view <name>` exits 0 with metadata when the name exists.
-          # We want the workflow to fail loudly if the name is already
-          # taken — that's a race we need to settle manually.
-          if npm view "$PACKAGE_NAME" name >/dev/null 2>&1; then
-            current=$(npm view "$PACKAGE_NAME" name version 2>/dev/null || true)
-            echo "::error::npm package '$PACKAGE_NAME' already exists: $current"
-            exit 1
+          if ! npm view "$PACKAGE_NAME" name >/dev/null 2>&1; then
+            echo "ok: '$PACKAGE_NAME' is available on registry.npmjs.org"
+            exit 0
           fi
-          echo "ok: '$PACKAGE_NAME' is available on registry.npmjs.org"
+
+          repo=$(npm view "$PACKAGE_NAME" repository.url 2>/dev/null || true)
+          home=$(npm view "$PACKAGE_NAME" homepage 2>/dev/null || true)
+          echo "existing package: $(npm view "$PACKAGE_NAME" name version 2>/dev/null || true)"
+          echo "  repository: ${repo:-<none>}"
+          echo "  homepage:   ${home:-<none>}"
+
+          if printf '%s %s' "$repo" "$home" | grep -q "$OWNER_URL"; then
+            echo "ok: the published package points at $OWNER_URL — it is ours"
+            exit 0
+          fi
+
+          echo "::error::'$PACKAGE_NAME' exists but is NOT ours (expected $OWNER_URL)."
+          echo "::error::Refusing to publish. Pick another name or transfer the package."
+          exit 1
 
   lint:
     name: Rust lint (cloudpipe-node)
@@ -144,9 +161,51 @@ jobs:
           if-no-files-found: error
           path: crates/cloudpipe-node/npm
 
+  smoke:
+    name: addon smoke test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Assemble a runnable package
+        run: |
+          set -euo pipefail
+          rm -rf smoke && mkdir -p smoke
+          cp -r crates/cloudpipe-node/npm/* smoke/ || true
+          cp artifacts/**/npm/*.node smoke/ 2>/dev/null ||             cp "$(find artifacts -name 'cloudpipe*.node' | head -1)" smoke/
+          test -f smoke/index.js
+      - name: Load the addon and check its surface
+        run: |
+          set -euo pipefail
+          npm install --no-save "$(find artifacts -name 'index.js' | head -1)" >/dev/null 2>&1 || true
+          node -e "
+            const path = require('node:path');
+            const api = require(path.resolve('smoke', 'index.js'));
+            const required = ['connect', 'version', 'parseErrorCode', 'eventNames', 'errorCodes'];
+            for (const key of required) {
+              if (!(key in api)) throw new Error('missing export: ' + key);
+            }
+            if (api.parseErrorCode('[CLOUDFLARE_API:RATE_LIMITED] x') !== 'CLOUDFLARE_API:RATE_LIMITED') {
+              throw new Error('parseErrorCode regression');
+            }
+            if (api.parseErrorCode('[FUTURE_CODE:NEXT_KIND] x') !== 'FUTURE_CODE:NEXT_KIND') {
+              throw new Error('forward-compat parse regression');
+            }
+            console.log('version', api.version());
+            console.log('events', api.eventNames().length);
+            console.log('ok');
+          "
+
   publish:
     name: npm publish
-    needs: build
+    needs: [build, smoke]
     # Two trigger paths:
     #   * `v*` tag push → first-class release, picks up the tag's version
     #     for the published package.
@@ -235,4 +294,4 @@ jobs:
           # brand-new package — npm refuses to mint a Sigstore attestation
           # for private/visibility-undeclared packages.
           npm publish --provenance --access public --ignore-scripts
-          echo "published cloudpipe@${{ github.ref_name }} to npm"
+          echo "published $(node -p "require('./package.json').name")@$(node -p "require('./package.json').version") to npm"
