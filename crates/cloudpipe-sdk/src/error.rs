@@ -147,6 +147,37 @@ pub enum InstallError {
     /// `cloudflared` could not be spawned.
     #[error("spawn failed: {0}")]
     Spawn(#[source] std::io::Error),
+
+    /// The downloaded asset's SHA-256 did not match the pinned digest.
+    ///
+    /// Either the mirror is serving something other than the release, or
+    /// the download was corrupted. The partial file is discarded and the
+    /// binary is *not* made executable.
+    #[error("checksum mismatch for the downloaded cloudflared asset: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        /// The digest this build pins for the asset.
+        expected: String,
+        /// The digest the download actually produced.
+        actual: String,
+    },
+
+    /// The asset is not covered by this build's pinned digest table, so it
+    /// cannot be installed safely.
+    #[error(
+        "refusing to install {0} unverified — this build pins no SHA-256 for it. \
+         Install cloudflared yourself and put it on PATH, or pass an explicit \
+         binary path."
+    )]
+    UnverifiedAsset(String),
+
+    /// The download exceeded the in-memory size ceiling.
+    #[error("download too large: {bytes} bytes exceeds the {limit}-byte limit")]
+    TooLarge {
+        /// Size of the download.
+        bytes: u64,
+        /// The configured ceiling.
+        limit: u64,
+    },
 }
 
 /// Translates a numeric Cloudflare error code into a stable [`CloudflareErrorKind`].

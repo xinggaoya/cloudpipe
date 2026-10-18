@@ -97,9 +97,10 @@ async fn handle_key(token: Option<String>, clear: bool) -> Result<()> {
     let mut config = store.load();
 
     if clear {
-        store.save(&Config::default())?;
+        let cleared = Config::new_empty();
+        store.save(&cleared)?;
         ui::success("All credentials cleared.");
-        ui::key_status(&Config::default());
+        ui::key_status(&cleared);
         return Ok(());
     }
 

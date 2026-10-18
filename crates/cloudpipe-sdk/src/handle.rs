@@ -229,11 +229,15 @@ impl TunnelHandle {
 
 impl Drop for TunnelHandle {
     fn drop(&mut self) {
-        // Best-effort: trigger shutdown so the background task wakes up and
-        // cleans up. We can't `await` in Drop, so the actual cleanup is
-        // owned by the session task. If the runtime is being torn down too,
-        // leaked tasks will be aborted — but `cloudflared` was spawned with
-        // `kill_on_drop(true)` so the local half dies with us.
+        // We cannot `await` in `Drop`, so the Cloudflare-side teardown is
+        // detached onto the runtime instead. The previous implementation
+        // only called `task.abort()`, which killed the supervisor *before*
+        // it could run cleanup — so `drop(handle)` reliably orphaned a
+        // tunnel and a DNS record on the user's account.
+        if !self.stopped {
+            self.spawn_detached_cleanup();
+        }
+
         self.shutdown.trigger();
         if let Some(task) = self.task.take() {
             task.abort();
@@ -244,5 +248,28 @@ impl Drop for TunnelHandle {
             }
         }
         self.dispatch.abort();
+    }
+}
+
+impl TunnelHandle {
+    /// Releases the Cloudflare resources in the background.
+    ///
+    /// Best-effort by nature: the process may be exiting and the runtime
+    /// may be shutting down, in which case the task is dropped rather than
+    /// run. That is strictly better than never attempting it at all, and
+    /// `cfp cleanup` remains the backstop for anything left behind.
+    fn spawn_detached_cleanup(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime (e.g. dropped outside async context). Nothing can
+            // be awaited; `cfp cleanup` is the recovery path.
+            return;
+        };
+        let snapshot = match self.state.try_lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+        handle.spawn(async move {
+            snapshot.purge().await;
+        });
     }
 }

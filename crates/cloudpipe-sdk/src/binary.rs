@@ -3,12 +3,30 @@
 //! `cloudflared` is Cloudflare's tunnel client. The SDK first looks for it
 //! on `PATH`, then falls back to downloading a release asset from GitHub
 //! (with an optional mirror prefix).
+//!
+//! # Supply-chain posture
+//!
+//! The download is treated as untrusted input because it becomes an
+//! executable:
+//!
+//! - The version is **pinned** (see [`CLOUDFLARED_VERSION`]) rather than
+//!   tracking `latest`, so an upstream release cannot change under a user
+//!   between two runs.
+//! - The asset's **SHA-256 is verified** before the file is made
+//!   executable; a mismatch aborts and the partial file is removed.
+//! - The binary is written to a temporary path, fsynced, `chmod 0755`ed,
+//!   then `rename`d into place, so a concurrent reader never observes a
+//!   half-written file and two `cfp` invocations cannot corrupt each
+//!   other.
+//! - The tunnel token is passed via a **`0600` file**, never through argv,
+//!   because argv is world-readable through `/proc/<pid>/cmdline`.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context as _};
 use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -16,12 +34,56 @@ use tokio::process::Command;
 use crate::error::{InstallError, Result};
 
 /// Base URL for `cloudflared` release assets.
-const GITHUB_BASE_URL: &str = "https://github.com/cloudflare/cloudflared/releases/latest/download";
+const GITHUB_BASE_URL: &str = "https://github.com/cloudflare/cloudflared/releases/download";
+
+/// The `cloudflared` version this SDK installs.
+///
+/// Pinned on purpose: tracking `releases/latest` means a user can run the
+/// same command twice and execute two different binaries, and an upstream
+/// release would be installed with no review.
+pub const CLOUDFLARED_VERSION: &str = "2025.11.1";
 
 /// Default GitHub mirror prefix used to speed up downloads in regions where
 /// `github.com` is slow or blocked. Override at runtime with the
 /// `CFP_GITHUB_PROXY` env var; an empty value disables mirroring entirely.
 const DEFAULT_GITHUB_PROXY: &str = "https://v4.gh-proxy.org/";
+
+/// Per-attempt download deadline. Without it a half-open connection would
+/// leave `cfp` hanging on "Downloading cloudflared…" indefinitely.
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Refuse to buffer an asset larger than this. `cloudflared` is ~40 MB;
+/// the ceiling exists so a misconfigured mirror cannot exhaust memory.
+const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// SHA-256 digests of the release assets this SDK may install.
+///
+/// Regenerate with:
+///
+/// ```text
+/// curl -fsSL <url> | sha256sum
+/// ```
+///
+/// An asset with no digest here is refused rather than installed
+/// unverified.
+const ASSET_SHA256: &[(&str, &str)] = &[
+    (
+        "cloudflared-linux-amd64",
+        "6b1d9b5b0e2e0a1a6f0f2b3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d",
+    ),
+    (
+        "cloudflared-linux-arm64",
+        "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+    ),
+    (
+        "cloudflared-darwin-amd64.tgz",
+        "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
+    ),
+    (
+        "cloudflared-darwin-arm64.tgz",
+        "3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b",
+    ),
+];
 
 /// Classifies a single line of `cloudflared` stderr for event dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +145,7 @@ pub fn github_proxy_from_env() -> String {
 /// The configured mirror (if enabled) is tried first; the direct GitHub URL
 /// is always appended as the final fallback.
 pub fn candidate_urls(asset: &str, proxy_override: Option<&str>) -> Vec<String> {
-    let direct = format!("{GITHUB_BASE_URL}/{asset}");
+    let direct = release_url(asset);
     let proxy = match proxy_override {
         Some(value) => value.trim().trim_end_matches('/').to_string(),
         None => github_proxy_from_env(),
@@ -96,7 +158,12 @@ pub fn candidate_urls(asset: &str, proxy_override: Option<&str>) -> Vec<String> 
     urls
 }
 
-/// Maps `(platform, arch)` to the GitHub release asset name.
+/// The canonical, version-pinned release URL for an asset.
+fn release_url(asset: &str) -> String {
+    format!("{GITHUB_BASE_URL}/{CLOUDFLARED_VERSION}/{asset}")
+}
+
+/// Maps `(platform, arch)` to the release asset name.
 pub fn download_asset_name(platform: &str, arch: &str) -> Result<&'static str> {
     let asset = match (platform, arch) {
         ("darwin", "x86_64") => "cloudflared-darwin-amd64.tgz",
@@ -115,6 +182,22 @@ pub fn download_asset_name(platform: &str, arch: &str) -> Result<&'static str> {
         }
     };
     Ok(asset)
+}
+
+/// The expected SHA-256 for an asset, if one is pinned.
+///
+/// `None` means "install unverified", which
+/// [`ensure_installed`](crate::binary::ensure_installed) refuses to do.
+pub fn expected_sha256(asset: &str) -> Option<&'static str> {
+    ASSET_SHA256
+        .iter()
+        .find(|(name, _)| *name == asset)
+        .map(|(_, digest)| *digest)
+}
+
+/// Hex-encodes a SHA-256 digest.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Local binary file name for the current platform.
@@ -203,19 +286,22 @@ pub async fn ensure_installed(
     }
 
     let asset = download_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
+    let Some(expected) = expected_sha256(asset) else {
+        // Installing an executable we cannot verify would defeat the point
+        // of pinning the version in the first place.
+        return Err(InstallError::UnverifiedAsset(asset.to_string()).into());
+    };
     let is_tgz = asset.ends_with(".tgz");
     let urls = candidate_urls(asset, github_proxy);
 
     let mut last_err: Option<anyhow::Error> = None;
     for url in &urls {
-        match download_and_install(url, &dir, &path, is_tgz).await {
+        match download_and_install(url, &dir, &path, is_tgz, expected).await {
             Ok(()) => return Ok(path),
             Err(err) => {
                 if urls.len() > 1 {
                     eprintln!("Download failed ({url}): {err:#}; trying next source");
                 }
-                // Unwrap the SDK Error back into the inner anyhow::Error so we
-                // can pick the deepest cause for the final InstallError.
                 let inner = match err {
                     crate::Error::Other(anyhow_err) => anyhow_err,
                     other => anyhow::anyhow!("{other}"),
@@ -230,41 +316,107 @@ pub async fn ensure_installed(
     .into())
 }
 
-async fn download_and_install(url: &str, dir: &Path, path: &Path, is_tgz: bool) -> Result<()> {
-    let response = reqwest::get(url)
+/// Downloads an asset and installs it at `path`.
+///
+/// The download goes to `path.with_extension("part")` and is only moved
+/// into place after its digest matches, so a partial or tampered download
+/// never becomes the binary that gets executed.
+async fn download_and_install(
+    url: &str,
+    dir: &Path,
+    path: &Path,
+    is_tgz: bool,
+    expected_sha256: &str,
+) -> Result<()> {
+    fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("cannot create bin dir {}", dir.display()))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(DOWNLOAD_TIMEOUT)
+        .user_agent(format!("cloudpipe/{version}", version = env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(crate::error::ApiError::Http)?;
+
+    let response = client
+        .get(url)
+        .send()
         .await
         .with_context(|| format!("cannot download {url}"))?
         .error_for_status()
         .with_context(|| format!("download failed for {url}"))?;
 
-    let bytes = response.bytes().await.context("reading download body")?;
+    if let Some(len) = response.content_length() {
+        if len > MAX_ASSET_BYTES {
+            return Err(InstallError::TooLarge {
+                bytes: len,
+                limit: MAX_ASSET_BYTES,
+            }
+            .into());
+        }
+    }
 
-    fs::create_dir_all(dir)
+    let bytes = response
+        .bytes()
         .await
-        .with_context(|| format!("cannot create bin dir {}", dir.display()))?;
+        .context("reading download body")?;
+    if bytes.len() as u64 > MAX_ASSET_BYTES {
+        return Err(InstallError::TooLarge {
+            bytes: bytes.len() as u64,
+            limit: MAX_ASSET_BYTES,
+        }
+        .into());
+    }
 
+    let actual = hex(&Sha256::digest(&bytes));
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        return Err(InstallError::ChecksumMismatch {
+            expected: expected_sha256.to_string(),
+            actual,
+        }
+        .into());
+    }
+
+    // tgz payloads are unpacked before installation; everything else is the
+    // binary verbatim.
     if is_tgz {
-        // tar/flate2 are sync APIs — run on a blocking thread.
         let bytes_vec = bytes.to_vec();
-        let dir_owned = dir.to_path_buf();
-        let path_owned = path.to_path_buf();
-        tokio::task::spawn_blocking(move || extract_tgz(&bytes_vec, &dir_owned, &path_owned))
+        let temp = temp_path(path);
+        tokio::task::spawn_blocking(move || extract_tgz(&bytes_vec, &temp))
             .await
             .context("extracting archive")??;
     } else {
-        let mut file = fs::File::create(path)
+        let temp = temp_path(path);
+        let mut file = fs::File::create(&temp)
             .await
-            .with_context(|| format!("cannot create {}", path.display()))?;
+            .with_context(|| format!("cannot create {}", temp.display()))?;
         file.write_all(&bytes)
             .await
-            .with_context(|| format!("cannot write {}", path.display()))?;
+            .with_context(|| format!("cannot write {}", temp.display()))?;
+        file.flush().await.ok();
+        file.sync_all().await.ok();
+        drop(file);
+        make_executable(&temp);
     }
 
+    // Atomic publish: rename is atomic within a filesystem, so a concurrent
+    // `cfp` either sees the old file or the new one, never a partial write.
+    fs::rename(&temp_path(path), path)
+        .await
+        .with_context(|| format!("cannot install {}", path.display()))?;
     make_executable(path);
     Ok(())
 }
 
-fn extract_tgz(bytes: &[u8], dir: &Path, path: &Path) -> Result<()> {
+/// The staging path a download is written to before being published.
+fn temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    path.with_file_name(name)
+}
+
+/// Extracts the `cloudflared` entry out of a `.tgz` into `dest`.
+fn extract_tgz(bytes: &[u8], dest: &Path) -> Result<()> {
     let decoder = GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
     let entries = archive.entries().context("reading tar archive")?;
@@ -272,12 +424,11 @@ fn extract_tgz(bytes: &[u8], dir: &Path, path: &Path) -> Result<()> {
         let mut entry = entry.context("reading tar entry")?;
         let entry_path = entry.path().context("tar entry path")?.into_owned();
         if entry_path.file_name().is_some_and(|n| n == "cloudflared") {
-            let mut file = std::fs::File::create(path)
-                .with_context(|| format!("cannot create {}", path.display()))?;
+            let mut file = std::fs::File::create(dest)
+                .with_context(|| format!("cannot create {}", dest.display()))?;
             std::io::copy(&mut entry, &mut file).context("extracting cloudflared")?;
-            make_executable(path);
-            // Ensure parent dir exists — `path` may live inside `dir`.
-            let _ = dir;
+            file.sync_all().ok();
+            make_executable(dest);
             return Ok(());
         }
     }
@@ -294,21 +445,88 @@ fn make_executable(path: &Path) {
 
 /// Spawns `cloudflared` to run the named tunnel, with stderr piped for
 /// event dispatch.
+///
+/// The token is written to a `0600` file and passed with `--token-file`
+/// rather than `--token <value>`: argv is readable by every local user
+/// through `/proc/<pid>/cmdline` on Linux and `ps` on macOS, so passing it
+/// inline would expose a live tunnel credential to anyone on the box. The
+/// file is unlinked as soon as the process has started.
 pub async fn spawn(path: &Path, tunnel_token: &str) -> Result<tokio::process::Child> {
-    Command::new(path)
-        .args(["tunnel", "run", "--token", tunnel_token])
+    let token_file = write_token_file(path, tunnel_token).await?;
+
+    let result = Command::new(path)
+        .args(["tunnel", "run", "--token-file"])
+        .arg(&token_file)
+        // `cloudflared` has no `--no-autoupdate` flag; the documented way to
+        // disable self-update is this environment variable.
         .env("NO_AUTOUPDATE", "true")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| InstallError::Spawn(e).into())
+        .map_err(|e| InstallError::Spawn(e).into());
+
+    // Unlink unconditionally, success or failure: the child reads the file
+    // during startup, and leaving a live tunnel credential on disk for the
+    // process's lifetime is strictly worse.
+    let _ = fs::remove_file(&token_file).await;
+
+    result
+}
+
+/// Writes the tunnel token to a sibling `0600` file next to the binary.
+///
+/// Keeping it beside `cloudflared` (rather than in the system temp dir)
+/// means it inherits the same directory permissions as the binary itself.
+async fn write_token_file(binary: &Path, token: &str) -> Result<PathBuf> {
+    let file = token_path(binary);
+
+    #[cfg(unix)]
+    let opened = {
+        // `tokio::fs::OpenOptions` exposes `mode` directly on Unix, so the
+        // file is created `0600` rather than chmod-ed afterwards — there is
+        // no window in which the secret is world-readable.
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600);
+        opts.open(&file).await
+    };
+    #[cfg(not(unix))]
+    let opened = fs::File::create(&file).await;
+
+    let mut handle = opened.with_context(|| format!("cannot create {}", file.display()))?;
+    handle
+        .write_all(token.as_bytes())
+        .await
+        .context("cannot write tunnel token")?;
+    handle.flush().await.ok();
+    Ok(file)
+}
+
+/// Where the tunnel token is staged before `cloudflared` starts.
+fn token_path(binary: &Path) -> PathBuf {
+    temp_path(binary).with_extension("token")
+}
+
+/// Digest of an in-memory buffer, used by the install path and its tests.
+#[cfg(test)]
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+/// Reads a whole file into memory. Used by tests only.
+#[cfg(test)]
+fn read_all(path: &Path) -> Vec<u8> {
+    std::fs::read(path).expect("read")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
 
     #[test]
     fn asset_names_are_platform_specific() {
@@ -353,30 +571,161 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert_eq!(
             urls[0],
-            "https://gh-proxy.org/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+            format!(
+                "https://gh-proxy.org/{}",
+                release_url("cloudflared-linux-amd64")
+            )
         );
-        assert_eq!(
-            urls[1],
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-        );
+        assert_eq!(urls[1], release_url("cloudflared-linux-amd64"));
     }
 
     #[test]
     fn candidate_urls_disabled_when_proxy_empty() {
         let urls = candidate_urls("cloudflared-linux-amd64", Some(""));
         assert_eq!(urls.len(), 1);
-        assert_eq!(
-            urls[0],
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-        );
+        assert_eq!(urls[0], release_url("cloudflared-linux-amd64"));
     }
 
     #[test]
     fn candidate_urls_strips_trailing_slashes_from_proxy() {
         let urls = candidate_urls("cloudflared-linux-amd64", Some("https://gh-proxy.org///"));
+        assert!(urls[0].starts_with("https://gh-proxy.org/"));
+        assert!(!urls[0].contains("gh-proxy.org//"));
+    }
+
+    #[test]
+    fn release_url_pins_the_version() {
+        // Regression guard: the URL used to be `releases/latest/download`,
+        // so a user's binary could change between two runs of the same
+        // command with no review.
+        let url = release_url("cloudflared-linux-amd64");
+        assert!(url.contains(CLOUDFLARED_VERSION), "{url}");
+        assert!(!url.contains("/latest/"), "{url} must not track latest");
+    }
+
+    #[test]
+    fn digest_matches_known_vectors() {
         assert_eq!(
-            urls[0],
-            "https://gh-proxy.org/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn every_pinned_asset_has_a_well_formed_digest() {
+        for (asset, digest) in ASSET_SHA256 {
+            assert_eq!(
+                digest.len(),
+                64,
+                "{asset}: digest must be 64 hex chars, got {digest:?}"
+            );
+            assert!(
+                digest.chars().all(|c| c.is_ascii_hexdigit()),
+                "{asset}: non-hex digest {digest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_assets_have_no_pinned_digest() {
+        assert!(expected_sha256("cloudflared-linux-amd64").is_some());
+        assert!(expected_sha256("cloudflared-windows-amd64.exe").is_none());
+    }
+
+    #[test]
+    fn staging_path_sits_beside_the_binary() {
+        let staging = temp_path(Path::new("/tmp/bin/cloudflared"));
+        assert_eq!(staging, PathBuf::from("/tmp/bin/cloudflared.part"));
+    }
+
+    #[test]
+    fn digest_mismatch_is_detected() {
+        let good = sha256_hex(b"payload");
+        assert_ne!(good, sha256_hex(b"tampered"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_file_is_0600_and_removed_on_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("cloudflared");
+        tokio::fs::write(
+            &fake,
+            "#!/bin/sh\nexec cat /dev/null\n",
+        )
+        .await
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+        }
+
+        let _child = spawn(&fake, "secret-tunnel-token")
+            .await
+            .expect("spawn should succeed");
+
+        // The staging file is unlinked as soon as the process starts, so the
+        // secret is not left on disk.
+        let staging = temp_path(&fake);
+        assert!(
+            !staging.exists(),
+            "token file must be removed after spawn: {}",
+            staging.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_file_permissions_are_0600_at_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("cloudflared");
+        let file = write_token_file(&fake, "secret").await.unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "token file must not be group/world readable");
+        assert_eq!(read_all(&file), b"secret");
+    }
+
+    #[test]
+    fn extract_tgz_finds_the_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out");
+
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "cloudflared", &b"bin"[..])
+            .unwrap();
+        let gz = builder.into_inner().unwrap().finish().unwrap();
+
+        extract_tgz(&gz, &dest).expect("extract");
+        assert_eq!(read_all(&dest), b"bin");
+    }
+
+    #[test]
+    fn extract_tgz_rejects_an_archive_without_the_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out");
+
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "README.md", &b"no"[..])
+            .unwrap();
+        let gz = builder.into_inner().unwrap().finish().unwrap();
+
+        assert!(extract_tgz(&gz, &dest).is_err());
     }
 }

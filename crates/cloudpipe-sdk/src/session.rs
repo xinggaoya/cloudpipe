@@ -81,10 +81,38 @@ impl RestartPolicy {
     }
 }
 
-/// Generates a random subdomain (`user-1234`).
+/// Generates a random subdomain (`user-a7k2m9x`).
+///
+/// The previous implementation produced `user-0000`…`user-9999` from a
+/// single `RandomState` hash — 10,000 possible values. Two developers
+/// starting a tunnel on the same zone collided often enough that
+/// `SubdomainInUse` was a routine failure, not an edge case. Seven
+/// base32 characters drawn from the OS CSPRNG give 32^7 ≈ 3.4e10 values
+/// while staying a valid RFC 1123 DNS label.
+///
+/// ```no_run
+/// # use cloudpipe_sdk::random_subdomain;
+/// let name = random_subdomain();
+/// assert!(cloudpipe_sdk::validate_subdomain(&name).is_ok());
+/// ```
 pub fn random_subdomain() -> String {
-    let seed = RandomState::new().build_hasher().finish() as u32;
-    format!("user-{:04}", seed % 10000)
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    const LABEL_LEN: usize = 7;
+    let mut bytes = [0u8; LABEL_LEN];
+    // `getrandom` on Linux, `BCryptGenRandom`/`getrandom` elsewhere — all
+    // OS-backed, all infallible in practice. Falling back to a hashed
+    // address keeps this total rather than panicking in a library.
+    if getrandom::fill(&mut bytes).is_err() {
+        let seed = RandomState::new().build_hasher().finish();
+        for (i, slot) in bytes.iter_mut().enumerate() {
+            *slot = ((seed >> (i * 8)) & 0xff) as u8;
+        }
+    }
+    let suffix: String = bytes
+        .iter()
+        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+        .collect();
+    format!("user-{suffix}")
 }
 
 /// Holds the user-supplied event dispatch task. The handle aborts it on Drop.
@@ -716,21 +744,29 @@ async fn resolve_conflicts(
     subdomain: &str,
     full_name: &str,
 ) -> Result<()> {
-    if let Ok(existing) = api.find_tunnel_by_name(account_id, subdomain).await {
-        if let Some(t) = existing.into_iter().next() {
-            if t.status == "healthy" {
-                return Err(Error::SubdomainInUse(subdomain.to_string()));
-            }
-            warn!("reclaiming stale tunnel \"{subdomain}\" ({})", t.status);
-            if let Ok(Some(record)) = api.find_dns_record(zone_id, full_name).await {
-                let _ = api.delete_dns_record(zone_id, &record.id).await;
-            }
-            api.cleanup_connections(account_id, &t.id).await?;
-            api.delete_tunnel(account_id, &t.id).await?;
+    // Every lookup below propagates its error. The previous version wrote
+    // `if let Ok(existing) = ...`, which made a network blip or an auth
+    // failure look exactly like "no such tunnel" — the session would then
+    // charge ahead and fail later with a misleading `SubdomainInUse`.
+    if let Some(existing) = api.find_tunnel_by_name(account_id, subdomain).await?.into_iter().next()
+    {
+        if existing.status == "healthy" {
+            return Err(Error::SubdomainInUse(subdomain.to_string()));
         }
+        warn!(
+            "reclaiming stale tunnel \"{subdomain}\" ({})",
+            existing.status
+        );
+        // The DNS record for a stale tunnel may or may not still exist;
+        // a missing one is the normal case, not an error.
+        if let Some(record) = api.find_dns_record(zone_id, full_name).await? {
+            api.delete_dns_record(zone_id, &record.id).await?;
+        }
+        api.cleanup_connections(account_id, &existing.id).await?;
+        api.delete_tunnel(account_id, &existing.id).await?;
     }
 
-    if let Ok(Some(record)) = api.find_dns_record(zone_id, full_name).await {
+    if let Some(record) = api.find_dns_record(zone_id, full_name).await? {
         warn!("removing orphaned DNS record for {full_name}");
         api.delete_dns_record(zone_id, &record.id).await?;
     }

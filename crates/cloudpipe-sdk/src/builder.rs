@@ -323,11 +323,12 @@ where
         // Resolve and validate the subdomain first. It is the cheapest
         // possible failure (pure local check) and validating it after
         // zone discovery / `cloudflared` download would mean a typo costs
-        // the user an API round-trip and a ~30 MB download before the
+        // the user an API round-trip and a ~40 MB download before the
         // error surfaces.
-        let subdomain = match self.inner.subdomain.take() {
-            Some(s) if !s.is_empty() => s.to_ascii_lowercase(),
-            _ => crate::session::random_subdomain(),
+        let requested = self.inner.subdomain.take().filter(|s| !s.is_empty());
+        let subdomain = match &requested {
+            Some(s) => s.to_ascii_lowercase(),
+            None => crate::session::random_subdomain(),
         };
         validate_subdomain(&subdomain)
             .map_err(|e| Error::InvalidSubdomain(format!("\"{}\": {}", e.value, e.reason)))?;
@@ -357,6 +358,18 @@ where
             self.inner.domain.take(),
         )
         .await?;
+
+        // A *generated* name that happens to be taken just gets another
+        // draw — the user never chose it, so failing the whole start would
+        // be gratuitous. An explicitly requested name is never renamed:
+        // silently serving a different URL than the one asked for would be
+        // worse than an error.
+        let subdomain = match requested {
+            Some(_) => subdomain,
+            None => {
+                pick_available_subdomain(&api, &account_id, &zone_id, &domain).await?
+            }
+        };
 
         let binary_path = match self.inner.binary_path.take() {
             Some(p) => p,
@@ -406,6 +419,33 @@ where
         Ok(handle)
     }
 }
+
+/// Draws random subdomains until one is free.
+///
+/// Bounded by [`MAX_SUBDOMAIN_ATTEMPTS`]; if every draw collides (a zone
+/// already carrying thousands of tunnels) the last name is returned so the
+/// caller reports the normal `SubdomainInUse` error rather than looping.
+async fn pick_available_subdomain(
+    api: &CloudflareApi,
+    account_id: &str,
+    zone_id: &str,
+    domain: &str,
+) -> Result<String> {
+    let mut candidate = crate::session::random_subdomain();
+    for _ in 1..MAX_SUBDOMAIN_ATTEMPTS {
+        if api
+            .subdomain_available(account_id, zone_id, &format!("{candidate}.{domain}"))
+            .await?
+        {
+            return Ok(candidate);
+        }
+        candidate = crate::session::random_subdomain();
+    }
+    Ok(candidate)
+}
+
+/// How many names a generated subdomain may try before giving up.
+const MAX_SUBDOMAIN_ATTEMPTS: u32 = 5;
 
 /// Fills in any missing zone/account/domain by asking the Cloudflare API.
 ///

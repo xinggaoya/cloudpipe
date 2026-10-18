@@ -54,5 +54,5 @@ pub use client::{
 pub use error::{ApiError, CloudflareErrorKind, Error, InstallError, Result};
 pub use event::{Event, LogLevel, ShutdownReason};
 pub use handle::TunnelHandle;
-pub use protocol::Protocol;
-pub use session::RestartPolicy;
+pub use protocol::{validate_subdomain, Protocol};
+pub use session::{random_subdomain, RestartPolicy};

@@ -404,6 +404,33 @@ impl CloudflareApi {
         matches!(result, Ok(Some(_)))
     }
 
+    /// Whether a public hostname can be claimed for a new tunnel.
+    ///
+    /// Returns `Ok(false)` when a **healthy** tunnel already serves the
+    /// name, or when a DNS record for it exists. A stale tunnel alone does
+    /// not block the name — it will be reclaimed.
+    ///
+    /// The builder uses this to retry a *generated* subdomain when it
+    /// collides, without having to fail the whole `start()` first.
+    pub async fn subdomain_available(
+        &self,
+        account_id: &str,
+        zone_id: &str,
+        full_name: &str,
+    ) -> Result<bool> {
+        if let Some(existing) = self
+            .find_tunnel_by_name(account_id, full_name.split_once('.').map_or(full_name, |(l, _)| l))
+            .await?
+            .into_iter()
+            .next()
+        {
+            if existing.status == "healthy" {
+                return Ok(false);
+            }
+        }
+        Ok(self.find_dns_record(zone_id, full_name).await?.is_none())
+    }
+
     /// Replaces a tunnel's remote ingress configuration.
     pub async fn set_tunnel_ingress(
         &self,

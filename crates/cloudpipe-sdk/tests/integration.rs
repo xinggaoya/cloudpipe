@@ -963,6 +963,53 @@ async fn wait_is_passive_and_does_not_clean_up() {
     assert!(!state.deleted_records().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_handle_still_releases_cloudflare_resources() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = write_fake_cloudflared(tmp.path(), None).await;
+
+    {
+        let handle = TunnelBuilder::new()
+            .api(api_for(&base))
+            .account("acc-1")
+            .zone("zone-1")
+            .domain("example.com")
+            .subdomain("dropped")
+            .cloudflared_path(binary)
+            .start()
+            .await
+            .expect("start should succeed");
+        assert_eq!(state.tunnels().len(), 1);
+        drop(handle);
+    }
+
+    // The previous implementation only aborted the supervisor task, which
+    // left the tunnel and its DNS record on the account with no way to
+    // reclaim them except a manual `cfp cleanup`.
+    wait_until(
+        || state.tunnels().is_empty() && state.records().is_empty(),
+        Duration::from_secs(5),
+        "Drop to release the Cloudflare resources",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generated_subdomains_do_not_collide() {
+    // The old generator produced `user-0000`..`user-9999` — 10k values.
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let name = cloudpipe_sdk::random_subdomain();
+        assert!(
+            cloudpipe_sdk::validate_subdomain(&name).is_ok(),
+            "generated an invalid DNS label: {name}"
+        );
+        assert!(seen.insert(name.clone()), "collision on {name}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Builder-level checks
 // ---------------------------------------------------------------------------
