@@ -209,34 +209,17 @@ pub fn parse_error_code(message: String) -> Option<String> {
 /// The complete list of top-level cloudpipe error codes.
 #[napi]
 pub fn error_codes() -> Vec<String> {
-    [
-        CloudpipeErrorCode::MissingCredential,
-        CloudpipeErrorCode::CloudflareApi,
-        CloudpipeErrorCode::CloudflaredBinary,
-        CloudpipeErrorCode::InvalidSubdomain,
-        CloudpipeErrorCode::InvalidDomain,
-        CloudpipeErrorCode::SubdomainInUse,
-        CloudpipeErrorCode::AlreadyShutDown,
-        CloudpipeErrorCode::Io,
-        CloudpipeErrorCode::InvalidArgument,
-        CloudpipeErrorCode::Other,
-    ]
-    .iter()
-    .map(|c| c.as_str().to_string())
-    .collect()
+    CloudpipeErrorCode::ALL
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect()
 }
 
 /// The sub-kind catalog that may follow `CLOUDFLARE_API:`.
 #[napi]
 pub fn cloudflare_error_kinds() -> Vec<String> {
-    [
-        CloudflareApiKind::RateLimited,
-        CloudflareApiKind::DnsExists,
-        CloudflareApiKind::AuthFailed,
-        CloudflareApiKind::InvalidToken,
-        CloudflareApiKind::Other,
-    ]
-    .iter()
-    .map(|k| k.as_str().to_string())
-    .collect()
+    CloudflareApiKind::ALL
+        .iter()
+        .map(|k| k.as_str().to_string())
+        .collect()
 }

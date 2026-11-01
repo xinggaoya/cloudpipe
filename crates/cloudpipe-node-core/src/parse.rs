@@ -25,46 +25,26 @@ pub fn extract_code(message: &str) -> Option<String> {
     let mut parts = inner.splitn(2, ':');
     let parent = parts.next()?;
 
-    // Validate against the typed enum so a future code rename surfaces as
-    // a compile error in this crate rather than as silent JS-side string
-    // drift.
-    let parent_code = match parent {
-        "MISSING_CREDENTIAL" => CloudpipeErrorCode::MissingCredential,
-        "CLOUDFLARE_API" => CloudpipeErrorCode::CloudflareApi,
-        "CLOUDFLARE_BINARY" => CloudpipeErrorCode::CloudflaredBinary,
-        "INVALID_SUBDOMAIN" => CloudpipeErrorCode::InvalidSubdomain,
-        "INVALID_DOMAIN" => CloudpipeErrorCode::InvalidDomain,
-        "SUBDOMAIN_IN_USE" => CloudpipeErrorCode::SubdomainInUse,
-        "ALREADY_SHUT_DOWN" => CloudpipeErrorCode::AlreadyShutDown,
-        "IO" => CloudpipeErrorCode::Io,
-        "INVALID_ARGUMENT" => CloudpipeErrorCode::InvalidArgument,
-        "OTHER" => CloudpipeErrorCode::Other,
+    // Resolve against the typed enum rather than a list of string
+    // literals: the enum's `as_str` is the only place a code is spelled
+    // out, so the parser and the producer cannot drift apart.
+    if CloudpipeErrorCode::parse(parent).is_none() {
         // Unknown parent — return the raw text verbatim, sub-kind included.
         // We deliberately don't fail so forward-compat works both ways: a
         // newer SDK emitting an unknown code gives an older JS helper the
         // whole string back, not an exception and not a truncated prefix.
-        _ => {
-            return Some(match parts.next() {
-                Some(suffix) => format!("{parent}:{suffix}"),
-                None => parent.to_string(),
-            })
-        }
-    };
-    // Anchors the typed match above so the compiler flags a rename.
-    let _ = parent_code;
+        return Some(match parts.next() {
+            Some(suffix) => format!("{parent}:{suffix}"),
+            None => parent.to_string(),
+        });
+    }
 
     let Some(suffix) = parts.next() else {
         return Some(parent.to_string());
     };
-    let suffix_code = match suffix {
-        "RATE_LIMITED" => CloudflareApiKind::RateLimited,
-        "DNS_EXISTS" => CloudflareApiKind::DnsExists,
-        "AUTH_FAILED" => CloudflareApiKind::AuthFailed,
-        "INVALID_TOKEN" => CloudflareApiKind::InvalidToken,
-        "OTHER" => CloudflareApiKind::Other,
-        _ => return Some(format!("{parent}:{suffix}")),
-    };
-    let _ = suffix_code;
+    if CloudflareApiKind::parse(suffix).is_none() {
+        return Some(format!("{parent}:{suffix}"));
+    }
     Some(format!("{parent}:{suffix}"))
 }
 

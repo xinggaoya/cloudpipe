@@ -58,6 +58,28 @@ impl CloudpipeErrorCode {
             Self::Other => "OTHER",
         }
     }
+
+    /// Every error code, in the order `errorCodes()` returns them.
+    pub const ALL: &'static [Self] = &[
+        Self::MissingCredential,
+        Self::CloudflareApi,
+        Self::CloudflaredBinary,
+        Self::InvalidSubdomain,
+        Self::InvalidDomain,
+        Self::SubdomainInUse,
+        Self::AlreadyShutDown,
+        Self::Io,
+        Self::InvalidArgument,
+        Self::Other,
+    ];
+
+    /// The inverse of [`as_str`](Self::as_str).
+    ///
+    /// Unknown codes return `None` — a newer SDK may emit a code this
+    /// build has never heard of, and that must not be an error.
+    pub fn parse(code: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == code)
+    }
 }
 
 /// Sub-classification of [`CloudpipeErrorCode::CloudflareApi`].
@@ -72,6 +94,9 @@ pub enum CloudflareApiKind {
     AuthFailed,
     /// 1038 — token itself is invalid.
     InvalidToken,
+    /// The server returned 5xx. Worth retrying — the request never took
+    /// effect.
+    ServerError,
     /// Any other numeric code.
     Other,
 }
@@ -84,8 +109,24 @@ impl CloudflareApiKind {
             Self::DnsExists => "DNS_EXISTS",
             Self::AuthFailed => "AUTH_FAILED",
             Self::InvalidToken => "INVALID_TOKEN",
+            Self::ServerError => "SERVER_ERROR",
             Self::Other => "OTHER",
         }
+    }
+
+    /// Every sub-kind, in the order `cloudflareErrorKinds()` returns them.
+    pub const ALL: &'static [Self] = &[
+        Self::RateLimited,
+        Self::DnsExists,
+        Self::AuthFailed,
+        Self::InvalidToken,
+        Self::ServerError,
+        Self::Other,
+    ];
+
+    /// The inverse of [`as_str`](Self::as_str).
+    pub fn parse(code: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|k| k.as_str() == code)
     }
 }
 
@@ -121,9 +162,9 @@ fn kind_from_sdk(kind: CloudflareErrorKind) -> CloudflareApiKind {
         CloudflareErrorKind::DnsExists => CloudflareApiKind::DnsExists,
         CloudflareErrorKind::AuthFailed => CloudflareApiKind::AuthFailed,
         CloudflareErrorKind::InvalidToken => CloudflareApiKind::InvalidToken,
-        // A bare 5xx carries no numeric code worth surfacing; `OTHER` is
-        // the JS-facing "unclassified".
-        CloudflareErrorKind::ServerError => CloudflareApiKind::Other,
+        // A 5xx gets its own kind: flattening it into `OTHER` made it
+        // indistinguishable from a code this build has never heard of.
+        CloudflareErrorKind::ServerError => CloudflareApiKind::ServerError,
         CloudflareErrorKind::Other(_) => CloudflareApiKind::Other,
     }
 }
@@ -189,6 +230,58 @@ mod tests {
         assert_eq!(CloudflareApiKind::AuthFailed.as_str(), "AUTH_FAILED");
         assert_eq!(CloudflareApiKind::InvalidToken.as_str(), "INVALID_TOKEN");
         assert_eq!(CloudflareApiKind::Other.as_str(), "OTHER");
+    }
+
+    #[test]
+    fn every_code_round_trips_through_from_str() {
+        for code in CloudpipeErrorCode::ALL {
+            assert_eq!(
+                CloudpipeErrorCode::parse(code.as_str()),
+                Some(*code),
+                "{} did not round-trip",
+                code.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_kind_round_trips_through_from_str() {
+        for kind in CloudflareApiKind::ALL {
+            assert_eq!(
+                CloudflareApiKind::parse(kind.as_str()),
+                Some(*kind),
+                "{} did not round-trip",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_codes_are_rejected() {
+        assert_eq!(CloudpipeErrorCode::parse("NOPE"), None);
+        assert_eq!(CloudflareApiKind::parse("NOPE"), None);
+    }
+
+    #[test]
+    fn server_error_is_its_own_kind() {
+        // A 5xx used to be flattened into `Other`, so JS could not tell
+        // "the server broke" from "we have never heard of this code".
+        let err = Error::Cloudflare(ApiError::Api {
+            code: Some(503),
+            message: "unavailable".into(),
+            kind: CloudflareErrorKind::ServerError,
+        });
+        assert_eq!(error_prefix(&err), "[CLOUDFLARE_API:SERVER_ERROR] ");
+    }
+
+    #[test]
+    fn all_lists_every_variant() {
+        // A variant missing from `ALL` would be unreachable from
+        // JavaScript: both `from_str` and `errorCodes()` go through the
+        // list. The counts have to be updated when a variant is added,
+        // which is exactly the signal we want.
+        assert_eq!(CloudpipeErrorCode::ALL.len(), 10);
+        assert_eq!(CloudflareApiKind::ALL.len(), 6);
     }
 
     #[test]
