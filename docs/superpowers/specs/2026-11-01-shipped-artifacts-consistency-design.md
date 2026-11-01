@@ -563,6 +563,46 @@ zone 解析失败时：
 | crates.io / Python SDK / Docker / GH Action（B7） | 分发工程，与本 spec 无耦合，单独 spec |
 | npm musl / linux-arm64 target | `npm.yml` 已约定推到 v0.2.0 |
 
+## 8.5 实施过程中新发现的两个问题
+
+以下两项在设计完成之后、实施过程中才暴露出来，都不属于原定的 14 项，
+但同样属于"已发布产物与承诺不符"，因此一并修掉了。
+
+### 8.5.1 注册事件处理器会让 Node 进程无法退出
+
+`ThreadsafeFunction` 默认是 **strong** 的：它持有一个 libuv handle，
+于是事件循环永远排不空，Node 进程在脚本跑完之后就挂在那里不退出。
+
+README 的示例之所以看不出问题，是因为它在 `SIGINT` 处理里显式调用了
+`process.exit(0)`。但任何"连上隧道、注册处理器、然后脚本结束"的使用方式
+都会挂住 —— 而这正是 npm 包最典型的用法。
+
+修法：把绑定层使用的 `ThreadsafeFunction` 换成 napi-rs 的 **weak**
+变体（`ThreadsafeFunction<..., { Weak = true }>`）。weak 版本仍然投递
+每一次调用，只是不再持有事件循环的引用。是否让进程继续运行由用户的
+程序决定，而不是由插件决定。
+
+发现它的过程值得记下来：最初的误判是"mock API 服务器的 keep-alive
+连接挡住了进程退出"（那个确实也要修），把两件事分开测才看清。
+
+### 8.5.2 `cargo deny` 在 `main` 上一直是红的
+
+审计发现 `webpki-roots 1.0.9` 与 `rustls-webpki 0.103.14` 仍带着
+不受信任的 eSign 中间证书，`tokio 1.53.1` 也有 `AsyncFd` 的 unsound
+公告。CI 的 `audit` job 因此一直是失败的 —— 与 `verify-checksums`
+job 一样，是"长期红着但没人当回事"的那一类。
+
+三处升级（`webpki-roots` → 1.0.11、`rustls-webpki` → 0.103.16、
+`tokio` → 1.54.1）即可清零，不需要改代码。
+
+新增的 `cloudpipe-test-support` crate 同时触发了 `deny.toml` 的
+wildcard 规则（path 依赖必须带 version）。它不能带 version：该 crate
+是 `publish = false`，带上 version 后 cargo 会在打包 SDK 时保留这条
+dev-dependency，而 `cloudpipe-test-support` 并不在 crates.io 上，
+SDK 就发布不了了。因此把 path 依赖豁免出 wildcard 规则
+（`allow-wildcard-paths = true`），**registry 通配符仍然被拒绝** ——
+后者才是这条规则真正要防的东西。
+
 ## 9. 风险与前置条件
 
 1. **需要联网**：补摘要要下载约 200 MB cloudflared 资产；GFW 环境需 `CFP_GITHUB_PROXY`。
