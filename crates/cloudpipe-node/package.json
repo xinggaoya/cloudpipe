@@ -2,7 +2,7 @@
   "name": "@xinggao/cloudpipe",
   "version": "0.1.1",
   "description": "Serverless Cloudflare tunnels for Node.js — no backend, no auth, no cloudflared install.",
-  "main": "npm/index.js",
+  "main": "js/index.js",
   "types": "index.d.ts",
   "license": "MIT",
   "engines": {
@@ -30,8 +30,8 @@
     "registry": "https://registry.npmjs.org/"
   },
   "files": [
+    "js/index.js",
     "npm/index.js",
-    "npm/index.d.ts",
     "npm/cloudpipe.linux-x64-gnu.node",
     "npm/cloudpipe.darwin-arm64.node",
     "npm/cloudpipe.darwin-x64.node",
