@@ -115,13 +115,15 @@ impl Cli {
             bail!("subcommand handled separately");
         }
 
-        let mut protocol_token = "http";
+        let mut protocol = Protocol::Http;
         let mut port: Option<u16> = None;
 
         if let Some(first) = &self.first {
-            match first.as_str() {
-                "http" | "https" | "tcp" | "udp" | "ssh" => protocol_token = first,
-                _ => match first.parse::<u16>() {
+            // The protocol token is matched case-insensitively, the same
+            // way `Protocol::parse` (and the Node binding) does it.
+            match Protocol::parse(first) {
+                Ok(parsed) => protocol = parsed,
+                Err(_) => match first.parse::<u16>() {
                     Ok(value) => port = Some(value),
                     Err(_) => bail!(
                         "unexpected argument \"{first}\": expected a protocol \
@@ -142,7 +144,7 @@ impl Cli {
         }
 
         Ok(TunnelArgs {
-            protocol: Protocol::parse(protocol_token).map_err(anyhow::Error::msg)?,
+            protocol,
             port: port.unwrap_or(crate::DEFAULT_PORT),
             subdomain: self.subdomain.clone(),
             auto_restart: !self.no_restart,
@@ -169,6 +171,26 @@ mod tests {
         assert_eq!(args.protocol, Protocol::Https);
         assert_eq!(args.port, 8443);
         assert_eq!(args.subdomain, None);
+    }
+
+    #[test]
+    fn protocol_token_is_case_insensitive() {
+        // The SDK and the Node binding both accept "HTTPS"; the CLI used
+        // to reject it, which made the three front ends disagree.
+        let cli = parse(&["HTTPS", "8443"]);
+        let args = cli.to_tunnel_args().unwrap();
+        assert_eq!(args.protocol, Protocol::Https);
+        assert_eq!(args.port, 8443);
+    }
+
+    #[test]
+    fn an_unknown_token_reports_the_supported_protocols() {
+        let err = parse(&["rdp", "22"])
+            .to_tunnel_args()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("http"), "{err}");
+        assert!(err.contains("ssh"), "{err}");
     }
 
     #[test]
