@@ -142,7 +142,7 @@ async fn run_tunnel_command(ctx: &Ctx, args: TunnelArgs) -> Result<()> {
     ui::tunnel_live(
         handle.url(),
         args.port,
-        &args.protocol.to_string(),
+        args.protocol,
         handle.subdomain(),
         args.auto_restart,
     );

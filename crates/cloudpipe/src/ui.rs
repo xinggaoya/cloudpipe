@@ -216,104 +216,138 @@ fn style() -> Style {
     }
 }
 
-/// Prints the small startup banner.
-pub fn banner() {
+/// The text the startup banner renders to.
+pub fn banner_text() -> String {
     let st = style();
-    println!(
+    format!(
         "{} {}",
         magenta_bold(&format!("{} cfp", st.bolt_glyph()), st),
         dim("— serverless tunnels via Cloudflare Edge", st)
-    );
+    )
+}
+
+/// Prints the small startup banner.
+pub fn banner() {
+    println!("{}", banner_text());
+}
+
+/// Where a rendered event line goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventLine {
+    /// A line for stdout.
+    Out(String),
+    /// A line for stderr.
+    Err(String),
+}
+
+/// The text an event renders to, or `None` when it renders nothing.
+///
+/// Pure, so the whole event-to-output mapping can be asserted on without
+/// capturing stdout. The printing wrapper is [`render_event`].
+pub fn render_event_text(event: &Event) -> Option<EventLine> {
+    let st = style();
+    let out = |text: String| Some(EventLine::Out(text));
+    match event {
+        // The banner is a block of its own.
+        Event::Banner => None,
+        Event::ResolvingConflicts => None,
+        Event::CreatingTunnel { name } => out(format!(
+            "  {}",
+            dim(&format!("Creating tunnel \"{name}\"..."), st)
+        )),
+        Event::IngressConfigured { protocol, port } => out(format!(
+            "  {}",
+            dim(
+                &format!("Configuring ingress ({protocol}://localhost:{port})..."),
+                st
+            )
+        )),
+        Event::DnsCreated { full_name } => out(format!(
+            "  {}",
+            dim(&format!("Creating DNS {full_name}..."), st)
+        )),
+        Event::CloudflaredStarted => None,
+        Event::Restarting { reason, attempt } => out(format!(
+            "  {}",
+            yellow(
+                &format!(
+                    "cloudflared ended ({}) — restarting (attempt #{attempt})...",
+                    describe_reason(reason)
+                ),
+                st
+            )
+        )),
+        Event::Restarted { attempt } => out(format!(
+            "  {}",
+            green(
+                &format!("Resumed on the same URL (attempt #{attempt})."),
+                st
+            )
+        )),
+        Event::RestartGivingUp {
+            attempts,
+            last_error,
+        } => out(format!(
+            "  {}",
+            red(
+                &format!(
+                    "auto-restart failed {attempts} times in a row — giving up. \
+                     last error: {last_error}"
+                ),
+                st
+            )
+        )),
+        Event::BootstrapFailed { attempt, error } => out(format!(
+            "  {}",
+            yellow(&format!("reconnect attempt #{attempt} failed: {error}"), st)
+        )),
+        Event::EdgeConnected { conn_index, total } => out(format!(
+            "  {}",
+            green(
+                &format!("Edge connection {} of {total}", conn_index + 1),
+                st
+            )
+        )),
+        Event::CloudflaredLog { level, line } => match level {
+            // Warnings and errors are worth interrupting the output for.
+            // `Info` is dropped here on purpose: cloudflared emits it
+            // constantly and the CLI would drown in it. The event itself
+            // still reaches every SDK subscriber, so an embedder sees
+            // everything.
+            LogLevel::Error | LogLevel::Warn => Some(EventLine::Err(format!(
+                "  [cloudflared] {}",
+                yellow(line, st)
+            ))),
+            LogLevel::Info => None,
+        },
+        Event::ShuttingDown { reason } => {
+            if matches!(reason, ShutdownReason::ChildExited) {
+                out(format!(
+                    "  {}",
+                    dim("cloudflared exited — cleaning up before respawn.", st)
+                ))
+            } else {
+                None
+            }
+        }
+        Event::Cleaned => out(format!(
+            "  {}",
+            green("Tunnel and DNS record cleaned up.", st)
+        )),
+        _ => None,
+    }
 }
 
 /// Renders a single SDK event to stdout.
 pub fn render_event(event: Event) {
-    let st = style();
-    match event {
-        Event::Banner => banner(),
-        Event::ResolvingConflicts => {}
-        Event::CreatingTunnel { name } => {
-            println!("  {}", dim(&format!("Creating tunnel \"{name}\"..."), st));
-        }
-        Event::IngressConfigured { protocol, port } => {
-            println!(
-                "  {}",
-                dim(
-                    &format!("Configuring ingress ({protocol}://localhost:{port})..."),
-                    st
-                )
-            );
-        }
-        Event::DnsCreated { full_name } => {
-            println!("  {}", dim(&format!("Creating DNS {full_name}..."), st));
-        }
-        Event::CloudflaredStarted => {}
-        Event::Restarting { reason, attempt } => {
-            println!(
-                "  {}",
-                yellow(
-                    &format!(
-                        "cloudflared ended ({}) — restarting (attempt #{attempt})...",
-                        describe_reason(&reason)
-                    ),
-                    st
-                )
-            );
-        }
-        Event::Restarted { attempt } => {
-            println!(
-                "  {}",
-                green(
-                    &format!("Resumed on the same URL (attempt #{attempt})."),
-                    st
-                )
-            );
-        }
-        Event::RestartGivingUp {
-            attempts,
-            last_error,
-        } => {
-            println!(
-                "  {}",
-                red(
-                    &format!(
-                        "auto-restart failed {attempts} times in a row — giving up. \
-                         last error: {last_error}"
-                    ),
-                    st
-                )
-            );
-        }
-        Event::BootstrapFailed { attempt, error } => {
-            println!(
-                "  {}",
-                yellow(&format!("reconnect attempt #{attempt} failed: {error}"), st)
-            );
-        }
-        Event::EdgeConnected { total, .. } => {
-            if total == 1 {
-                println!("  {}", green("Edge connection established", st));
-            } else if total == 4 {
-                println!("  {}", green("All 4 connections established", st));
-            }
-        }
-        Event::CloudflaredLog { level, line } => {
-            if matches!(level, LogLevel::Error) {
-                eprintln!("  [cloudflared] {}", yellow(&line, st));
-            }
-        }
-        Event::ShuttingDown { reason } => {
-            if matches!(reason, ShutdownReason::ChildExited) {
-                println!(
-                    "  {}",
-                    dim("cloudflared exited — cleaning up before respawn.", st)
-                );
-            }
-        }
-        Event::Cleaned => {
-            println!("  {}", green("Tunnel and DNS record cleaned up.", st));
-        }
-        _ => {}
+    if matches!(event, Event::Banner) {
+        banner();
+        return;
+    }
+    match render_event_text(&event) {
+        Some(EventLine::Out(text)) => println!("{text}"),
+        Some(EventLine::Err(text)) => eprintln!("{text}"),
+        None => {}
     }
 }
 
@@ -376,11 +410,10 @@ pub fn render_live_block(
 }
 
 /// Prints the tunnel success block after the URL is live.
-pub fn tunnel_live(url: &str, port: u16, protocol: &str, subdomain: &str, auto_restart: bool) {
-    let parsed = Protocol::parse(protocol).unwrap_or(Protocol::Http);
+pub fn tunnel_live(url: &str, port: u16, protocol: Protocol, subdomain: &str, auto_restart: bool) {
     print!(
         "{}",
-        render_live_block(url, parsed, port, subdomain, auto_restart)
+        render_live_block(url, protocol, port, subdomain, auto_restart)
     );
 }
 
@@ -743,6 +776,41 @@ mod tests {
         let text = key_status_text(&Config::default());
         assert!(text.contains("Config file:"), "{text}");
         assert!(text.contains("config.json"), "{text}");
+    }
+
+    #[test]
+    fn every_edge_connection_is_rendered() {
+        // The old renderer only printed the first and the fourth
+        // connection, on the assumption that cloudflared always opens
+        // exactly four. It does not always.
+        set_style(Style::plain());
+        for total in 1..=4u8 {
+            let text = render_event_text(&Event::EdgeConnected {
+                conn_index: 0,
+                total,
+            })
+            .expect("the connection must render");
+            match text {
+                EventLine::Out(line) => {
+                    assert!(line.contains("connection"), "total {total}: {line}")
+                }
+                EventLine::Err(line) => panic!("connections go to stdout, got {line}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_connection_line_names_its_index() {
+        set_style(Style::plain());
+        let text = render_event_text(&Event::EdgeConnected {
+            conn_index: 2,
+            total: 4,
+        })
+        .expect("the connection must render");
+        match text {
+            EventLine::Out(line) => assert_eq!(line, "  Edge connection 3 of 4"),
+            EventLine::Err(line) => panic!("connections go to stdout, got {line}"),
+        }
     }
 
     #[test]
