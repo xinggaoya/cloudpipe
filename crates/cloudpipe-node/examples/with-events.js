@@ -10,7 +10,16 @@
 // Run with:
 //   node examples/with-events.js
 
-const { connect, eventNames } = require('@xinggao/cloudpipe');
+// Prefer the published package, so the example shows what a consumer
+// writes. Fall back to the local build so it also runs in this
+// repository, without a publish step in between.
+const { connect, eventNames } = (() => {
+  try {
+    return require('@xinggao/cloudpipe');
+  } catch {
+    return require('../js/index.js');
+  }
+})();
 
 function parse(json) {
   try {

@@ -10,7 +10,16 @@
 // Run with:
 //   node examples/quickstart.js
 
-const { connect, parseErrorCode } = require('@xinggao/cloudpipe');
+// Prefer the published package, so the example shows what a consumer
+// writes. Fall back to the local build so it also runs in this
+// repository, without a publish step in between.
+const { connect, parseErrorCode } = (() => {
+  try {
+    return require('@xinggao/cloudpipe');
+  } catch {
+    return require('../js/index.js');
+  }
+})();
 
 (async () => {
   const token = process.env.CLOUDFLARE_API_TOKEN;
