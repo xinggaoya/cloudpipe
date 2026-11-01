@@ -79,63 +79,17 @@ jobs:
       # indistinguishable from a tampered download at the point of use, so
       # it has to be checked against the bytes GitHub actually serves —
       # not just against its own charset, which any invented hex passes.
+      #
+      # The job regenerates the table and diffs it against the one in the
+      # tree. A missing platform and a stale digest are both hard
+      # failures: the previous version only failed on a wrong digest and
+      # reported missing platforms through a notice whose set arithmetic
+      # could never produce a difference.
       - name: Re-derive the digest table from the pinned release
-        env:
-          # Keep in sync with CLOUDFLARED_VERSION in
-          # crates/cloudpipe-sdk/src/binary.rs
-          VERSION: '2025.11.1'
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
-
-          # Extract the assets + pinned digests from the source of truth.
-          src="$GITHUB_WORKSPACE/crates/cloudpipe-sdk/src/binary.rs"
-          assets=$(grep -oP '(?<=    \(\n)[^"]*' /dev/null || true)
-          python3 - "$src" > digests.tsv <<'PY'
-          import re, sys
-          src = open(sys.argv[1]).read()
-          body = src.split("const ASSET_SHA256", 1)[1]
-          for name, digest in re.findall(r'"([\w.-]+)",\s*"([0-9a-f]{64})"', body):
-              print(f"{name}\t{digest}")
-          PY
-
-          echo "pinned in-tree:"
-          cat digests.tsv
-          echo
-
-          base="https://github.com/cloudflare/cloudflared/releases/download/$VERSION"
-          status=0
-          while IFS=$'\t' read -r asset digest; do
-            [ -n "$asset" ] || continue
-            actual=$(curl -fsSL --retry 3 --max-time 600 "$base/$asset" | sha256sum | cut -d' ' -f1)
-            if [ "$actual" = "$digest" ]; then
-              echo "  ok    $asset"
-            else
-              echo "  WRONG $asset"
-              echo "        pinned:   $digest"
-              echo "        upstream: $actual"
-              status=1
-            fi
-          done < digests.tsv
-
-          # Report, but do not fail, on assets this build cannot install
-          # yet — those are a coverage gap the table documents.
-          missing=$(python3 - "$src" <<'PY'
-          import re, sys
-          src = open(sys.argv[1]).read()
-          names = set(re.findall(r'"(cloudflared[\w.-]+)"', src.split("const ALL_ASSETS", 1)[1]))
-          pinned = set(re.findall(r'"(cloudflared[\w.-]+)"', src.split("const ASSET_SHA256", 1)[1]))
-          for n in sorted(names - pinned):
-              print(n)
-          PY
-          )
-          if [ -n "$missing" ]; then
-            echo
-            echo "::notice::no digest pinned for: $(echo "$missing" | tr '\n' ' ')"
-            echo "::notice::users on those platforms must set CFP_CLOUDFLARED_SHA256 or install cloudflared manually"
-          fi
-
-          exit $status
+          cd "$GITHUB_WORKSPACE"
+          scripts/gen-cloudflared-checksums.sh --check
 
   audit:
     name: Supply-chain audit
@@ -178,6 +132,9 @@ jobs:
             "$BIN" --help 2>&1 | grep -q -- "$flag" \
               || { echo "::error::README documents $flag but \`cfp --help\` lacks it"; exit 1; }
           done
+          # Subcommand flags live in the subcommand's own help.
+          "$BIN" key --help 2>&1 | grep -q -- "--token-file" \
+            || { echo "::error::README documents --token-file but \`cfp key --help\` lacks it"; exit 1; }
           for flag in --dry-run --json; do
             "$BIN" cleanup --help 2>&1 | grep -q -- "$flag" \
               || { echo "::error::README documents \`cfp cleanup $flag\` but the subcommand lacks it"; exit 1; }
