@@ -232,9 +232,7 @@ async fn handle_key(
     }
 
     let mut config = ctx.config.clone();
-    config.apply_zone(&zones[0])?;
-    config.token = Some(trimmed.to_string());
-    ctx.store.save(&config)?;
+    save_token_and_zone(&ctx.store, &mut config, trimmed, &zones[0])?;
 
     if zones.len() == 1 {
         ui::success(&format!(
@@ -296,6 +294,28 @@ async fn handle_cleanup(ctx: &Ctx, args: CleanupArgs) -> Result<()> {
     Ok(())
 }
 
+/// Saves the token and resolves the zone to expose tunnels under.
+///
+/// The token is written *before* the zone is resolved. A zone whose
+/// account id Cloudflare omitted used to abort the whole command with
+/// nothing written to disk, so re-running `cfp key` produced the
+/// identical failure and the user could never get past it.
+fn save_token_and_zone(
+    store: &ConfigStore,
+    config: &mut Config,
+    token: &str,
+    zone: &cloudpipe_sdk::Zone,
+) -> Result<()> {
+    config.token = Some(token.to_string());
+    store.save(config)?;
+
+    config.apply_zone(zone).map_err(|err| {
+        anyhow!("{err:#}\n\n  The token was saved — pick a zone with `cfp domain <name>`.")
+    })?;
+    store.save(config)?;
+    Ok(())
+}
+
 /// Reads a token from stdin, one line.
 ///
 /// This is the safest way to hand a secret to the process: it never
@@ -313,4 +333,56 @@ fn read_token_from_stdin() -> Result<String> {
 /// Reads a token from a file.
 fn read_token_from_file(path: &str) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading the token from {path}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cloudpipe_sdk::Zone;
+
+    #[test]
+    fn a_failed_zone_resolution_still_keeps_the_token() {
+        // `apply_zone` fails when the zone carries no account id. The
+        // token must survive that failure — losing it means the user
+        // re-runs `cfp key` and hits the identical error.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ConfigStore::with_dir(dir.path().to_path_buf());
+        let mut config = Config::default();
+
+        let zone = Zone {
+            id: "zone-1".into(),
+            name: "example.com".into(),
+            account: None,
+        };
+        let err = save_token_and_zone(&store, &mut config, "cf_test", &zone)
+            .expect_err("the zone resolution must fail");
+        assert!(format!("{err:#}").contains("account"), "{err:#}");
+
+        // The token survived, and the error says so.
+        let saved = store.load();
+        assert_eq!(saved.token.as_deref(), Some("cf_test"));
+        assert!(format!("{err:#}").contains("token was saved"), "{err:#}");
+    }
+
+    #[test]
+    fn a_successful_resolution_saves_both_the_token_and_the_zone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ConfigStore::with_dir(dir.path().to_path_buf());
+        let mut config = Config::default();
+
+        let zone = Zone {
+            id: "zone-1".into(),
+            name: "example.com".into(),
+            account: Some(cloudpipe_sdk::ZoneAccount {
+                id: "account-1".into(),
+            }),
+        };
+        save_token_and_zone(&store, &mut config, "cf_test", &zone).expect("the zone resolves");
+
+        let saved = store.load();
+        assert_eq!(saved.token.as_deref(), Some("cf_test"));
+        assert_eq!(saved.domain.as_deref(), Some("example.com"));
+        assert_eq!(saved.zone_id.as_deref(), Some("zone-1"));
+        assert_eq!(saved.account_id.as_deref(), Some("account-1"));
+    }
 }
