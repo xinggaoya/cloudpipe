@@ -56,6 +56,25 @@ const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300
 /// the ceiling exists so a misconfigured mirror cannot exhaust memory.
 const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Every release asset this SDK knows how to install.
+///
+/// The order is fixed and alphabetical so the generated checksum table
+/// and the in-tree table can be diffed line by line.
+///
+/// This list is the single source of truth for "which platforms do we
+/// support": `scripts/gen-cloudflared-checksums.sh` parses it, the CI
+/// `verify-checksums` job diffs the result against the pinned table, and
+/// `download_asset_name` is asserted to only ever return a member.
+pub const ALL_ASSETS: &[&str] = &[
+    "cloudflared-darwin-amd64.tgz",
+    "cloudflared-darwin-arm64.tgz",
+    "cloudflared-linux-amd64",
+    "cloudflared-linux-arm64",
+    "cloudflared-linux-arm",
+    "cloudflared-windows-386.exe",
+    "cloudflared-windows-amd64.exe",
+];
+
 /// SHA-256 digests of the release assets this SDK may install.
 ///
 /// Every entry is the digest of the bytes served by the official release
@@ -710,7 +729,7 @@ mod tests {
     /// Every asset `download_asset_name` can produce, across the platforms
     /// this build supports. Kept as a table so adding an architecture is a
     /// two-line change with a test failure pointing at it.
-    const ALL_ASSETS: &[(&str, &str, &str)] = &[
+    const PLATFORM_ASSETS: &[(&str, &str, &str)] = &[
         ("linux", "x86_64", "cloudflared-linux-amd64"),
         ("linux", "aarch64", "cloudflared-linux-arm64"),
         ("linux", "arm", "cloudflared-linux-arm"),
@@ -722,7 +741,7 @@ mod tests {
 
     #[test]
     fn asset_table_matches_the_platform_table() {
-        for (platform, arch, expected) in ALL_ASSETS {
+        for (platform, arch, expected) in PLATFORM_ASSETS {
             assert_eq!(
                 download_asset_name(platform, arch).unwrap(),
                 *expected,
@@ -732,12 +751,45 @@ mod tests {
     }
 
     #[test]
+    fn all_assets_lists_every_installable_asset() {
+        // The list drives the checksum generator script and the CI job,
+        // so it has to cover every platform `download_asset_name` can
+        // return — no more, no less.
+        assert_eq!(
+            ALL_ASSETS,
+            [
+                "cloudflared-darwin-amd64.tgz",
+                "cloudflared-darwin-arm64.tgz",
+                "cloudflared-linux-amd64",
+                "cloudflared-linux-arm64",
+                "cloudflared-linux-arm",
+                "cloudflared-windows-386.exe",
+                "cloudflared-windows-amd64.exe",
+            ]
+        );
+    }
+
+    #[test]
+    fn download_asset_name_only_returns_known_assets() {
+        for (platform, arch, expected) in PLATFORM_ASSETS {
+            let asset = download_asset_name(platform, arch).unwrap();
+            assert!(
+                ALL_ASSETS.contains(&asset),
+                "{platform}/{arch} -> {asset} is not in ALL_ASSETS"
+            );
+            assert_eq!(asset, *expected);
+        }
+        // An unsupported pair must still be an error, not a fallback.
+        assert!(download_asset_name("plan9", "x86_64").is_err());
+    }
+
+    #[test]
     fn the_table_never_mentions_an_unreachable_asset() {
         // A digest for an asset name nothing downloads is dead weight that
         // makes the table look fuller than the coverage actually is.
         for (name, _) in ASSET_SHA256 {
             assert!(
-                ALL_ASSETS.iter().any(|(_, _, asset)| asset == name),
+                PLATFORM_ASSETS.iter().any(|(_, _, asset)| asset == name),
                 "{name} is pinned but no platform resolves to it"
             );
         }
@@ -749,7 +801,7 @@ mod tests {
         // deliberately uncovered until CI fills them in. What matters is
         // that an uncovered one fails with instructions rather than
         // installing something unverifiable.
-        for (platform, arch, asset) in ALL_ASSETS {
+        for (platform, arch, asset) in PLATFORM_ASSETS {
             let digest = expected_sha256(asset);
             if digest.is_none() {
                 let err = InstallError::UnverifiedAsset((*asset).to_string()).to_string();
