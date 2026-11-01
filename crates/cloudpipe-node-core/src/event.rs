@@ -100,6 +100,62 @@ pub const EVENT_NAMES: &[&str] = &[
     "cleaned",
 ];
 
+/// A queue of events that were produced before any listener existed.
+///
+/// `cloudflared`'s startup events fire while the tunnel is being created,
+/// which is strictly before a JS caller can register a handler — the
+/// `Listener` object does not exist yet. Dropping them made the
+/// `dnsCreated` / `cloudflaredStarted` / `edgeConnected` events
+/// unreachable from JavaScript.
+#[derive(Debug, Default)]
+pub struct PendingEvents {
+    items: std::collections::VecDeque<(String, String)>,
+}
+
+impl PendingEvents {
+    /// How many events are held before the oldest is dropped.
+    pub const CAPACITY: usize = 512;
+
+    /// Records an event that had no listener.
+    pub fn push(&mut self, name: String, payload: String) {
+        if self.items.len() >= Self::CAPACITY {
+            self.items.pop_front();
+        }
+        self.items.push_back((name, payload));
+    }
+
+    /// Removes and returns every held event with the given name, in the
+    /// order it was produced.
+    pub fn drain_named(&mut self, name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+        while let Some((n, payload)) = self.items.pop_front() {
+            if n == name {
+                out.push(payload);
+            } else {
+                kept.push_back((n, payload));
+            }
+        }
+        self.items = kept;
+        out
+    }
+
+    /// Drops every held event with the given name.
+    pub fn remove_named(&mut self, name: &str) {
+        self.items.retain(|(n, _)| n != name);
+    }
+
+    /// How many events are currently held.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether nothing is held.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 /// Convenience accessor so the binding crate can name a protocol without
 /// importing `cloudpipe_sdk` directly.
 pub fn protocol_name(protocol: Protocol) -> &'static str {
@@ -318,6 +374,43 @@ mod tests {
                 "EVENT_NAMES is missing \"{name}\" — Listener#on would reject it"
             );
         }
+    }
+
+    #[test]
+    fn pending_events_are_drained_in_production_order() {
+        let mut pending = PendingEvents::default();
+        pending.push("dnsCreated".into(), "{\"fullName\":\"a\"}".into());
+        pending.push("banner".into(), "{}".into());
+        pending.push("dnsCreated".into(), "{\"fullName\":\"b\"}".into());
+
+        let drained = pending.drain_named("dnsCreated");
+        assert_eq!(
+            drained,
+            vec![
+                "{\"fullName\":\"a\"}".to_string(),
+                "{\"fullName\":\"b\"}".to_string()
+            ]
+        );
+        // The unrelated event survives.
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_events_are_capped() {
+        let mut pending = PendingEvents::default();
+        for i in 0..(PendingEvents::CAPACITY + 10) {
+            pending.push("x".into(), i.to_string());
+        }
+        assert_eq!(pending.len(), PendingEvents::CAPACITY);
+    }
+
+    #[test]
+    fn removing_a_name_drops_its_pending_events() {
+        let mut pending = PendingEvents::default();
+        pending.push("a".into(), "1".into());
+        pending.push("b".into(), "2".into());
+        pending.remove_named("a");
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]

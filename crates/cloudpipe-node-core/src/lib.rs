@@ -20,6 +20,6 @@ pub mod options;
 pub mod parse;
 
 pub use error::{CloudflareApiKind, CloudpipeErrorCode};
-pub use event::event_to_payload;
+pub use event::{event_to_payload, PendingEvents};
 pub use options::{parse_port, parse_protocol};
 pub use parse::extract_code;

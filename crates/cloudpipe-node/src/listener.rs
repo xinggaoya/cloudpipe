@@ -58,8 +58,16 @@ type EventEnvelope = (String, String);
 /// Threadsafe callback registered by [`Listener::on`].
 type EventCallback = Arc<napi::threadsafe_function::ThreadsafeFunction<String, ()>>;
 
+/// Per-event callbacks plus the events that arrived before any of them
+/// existed.
+#[derive(Default)]
+struct CallbackTable {
+    by_event: HashMap<String, Vec<EventCallback>>,
+    pending: cloudpipe_node_core::PendingEvents,
+}
+
 /// Registry of per-event callbacks, shared with the event pump.
-type CallbackRegistry = Arc<TokioMutex<HashMap<String, Vec<EventCallback>>>>;
+type CallbackRegistry = Arc<TokioMutex<CallbackTable>>;
 
 /// Commands the external `Listener` sends into the session task.
 enum Command {
@@ -131,7 +139,7 @@ impl Listener {
         // 64-slot bounded channel silently dropped `restarting` /
         // `bootstrapFailed` exactly when a user most wanted to see them.
         let (event_tx, event_rx) = mpsc::unbounded_channel::<EventEnvelope>();
-        let callbacks: CallbackRegistry = Arc::new(TokioMutex::new(HashMap::new()));
+        let callbacks: CallbackRegistry = Arc::new(TokioMutex::new(CallbackTable::default()));
         let callbacks_for_pump = Arc::clone(&callbacks);
 
         let builder = builder.on_event(move |event: Event| {
@@ -290,8 +298,16 @@ async fn event_pump(
         // lock; the actual `cb.call` runs after we drop the guard so a
         // slow JS handler doesn't block other registrations.
         let snapshot: Vec<EventCallback> = {
-            let guard = callbacks.lock().await;
-            guard.get(&name).map(|v| v.to_vec()).unwrap_or_default()
+            let mut guard = callbacks.lock().await;
+            let list = guard.by_event.get(&name).cloned().unwrap_or_default();
+            if list.is_empty() {
+                // No listener yet. The startup events fire before a JS
+                // caller can possibly register one — the `Listener` does
+                // not exist until `connect()` resolves — so dropping them
+                // here made `dnsCreated` and friends unreachable.
+                guard.pending.push(name.clone(), payload.clone());
+            }
+            list
         };
         for cb in snapshot {
             let _ = cb.call(Ok(payload.clone()), ThreadsafeFunctionCallMode::NonBlocking);
@@ -347,7 +363,18 @@ impl Listener {
         let registry = Arc::clone(&self.callbacks);
         runtime().block_on(async move {
             let mut guard = registry.lock().await;
-            guard.entry(event).or_default().push(callback);
+            guard
+                .by_event
+                .entry(event.clone())
+                .or_default()
+                .push(callback.clone());
+            // Hand over the events that arrived before this listener
+            // existed, in the order they were produced.
+            let ready = guard.pending.drain_named(&event);
+            drop(guard);
+            for payload in ready {
+                let _ = callback.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
+            }
         });
         Ok(())
     }
@@ -362,7 +389,10 @@ impl Listener {
         let registry = Arc::clone(&self.callbacks);
         runtime().block_on(async move {
             let mut guard = registry.lock().await;
-            guard.remove(&event);
+            guard.by_event.remove(&event);
+            // Events still waiting for a listener are dropped too —
+            // re-subscribing must not resurrect a cancelled event.
+            guard.pending.remove_named(&event);
         });
         Ok(())
     }
@@ -373,7 +403,8 @@ impl Listener {
         let registry = Arc::clone(&self.callbacks);
         runtime().block_on(async move {
             let mut guard = registry.lock().await;
-            guard.clear();
+            guard.by_event.clear();
+            guard.pending = cloudpipe_node_core::PendingEvents::default();
         });
         Ok(())
     }
