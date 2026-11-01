@@ -813,6 +813,131 @@ mod tests {
         }
     }
 
+    /// Renders an event with the plain style, so the assertions are
+    /// about the text and not about the terminal.
+    fn render(event: &Event) -> Option<String> {
+        set_style(Style::plain());
+        render_event_text(event).map(|line| match line {
+            EventLine::Out(text) | EventLine::Err(text) => text,
+        })
+    }
+
+    #[test]
+    fn every_event_variant_renders_exactly_what_it_says() {
+        use cloudpipe_sdk::{Event, LogLevel, Protocol, ShutdownReason};
+
+        let cases: Vec<(Event, Option<&str>)> = vec![
+            (Event::Banner, None),
+            (Event::ResolvingConflicts, None),
+            (
+                Event::CreatingTunnel {
+                    name: "demo".into(),
+                },
+                Some("  Creating tunnel \"demo\"..."),
+            ),
+            (
+                Event::IngressConfigured {
+                    protocol: Protocol::Https,
+                    port: 8443,
+                },
+                Some("  Configuring ingress (https://localhost:8443)..."),
+            ),
+            (
+                Event::DnsCreated {
+                    full_name: "demo.example.com".into(),
+                },
+                Some("  Creating DNS demo.example.com..."),
+            ),
+            (Event::CloudflaredStarted, None),
+            (
+                Event::Restarting {
+                    reason: ShutdownReason::ChildExited,
+                    attempt: 2,
+                },
+                Some("  cloudflared ended (cloudflared exited) — restarting (attempt #2)..."),
+            ),
+            (
+                Event::Restarted { attempt: 2 },
+                Some("  Resumed on the same URL (attempt #2)."),
+            ),
+            (
+                Event::RestartGivingUp {
+                    attempts: 5,
+                    last_error: "boom".into(),
+                },
+                Some("  auto-restart failed 5 times in a row — giving up. last error: boom"),
+            ),
+            (
+                Event::BootstrapFailed {
+                    attempt: 3,
+                    error: "boom".into(),
+                },
+                Some("  reconnect attempt #3 failed: boom"),
+            ),
+            (
+                Event::EdgeConnected {
+                    conn_index: 0,
+                    total: 2,
+                },
+                Some("  Edge connection 1 of 2"),
+            ),
+            (
+                Event::CloudflaredLog {
+                    level: LogLevel::Warn,
+                    line: "careful".into(),
+                },
+                Some("  [cloudflared] careful"),
+            ),
+            (
+                Event::CloudflaredLog {
+                    level: LogLevel::Info,
+                    line: "noise".into(),
+                },
+                None,
+            ),
+            (
+                Event::ShuttingDown {
+                    reason: ShutdownReason::ChildExited,
+                },
+                Some("  cloudflared exited — cleaning up before respawn."),
+            ),
+            (
+                Event::ShuttingDown {
+                    reason: ShutdownReason::UserRequested,
+                },
+                None,
+            ),
+            (Event::Cleaned, Some("  Tunnel and DNS record cleaned up.")),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(
+                render(&event).as_deref(),
+                expected,
+                "{event:?} rendered unexpectedly"
+            );
+        }
+    }
+
+    #[test]
+    fn cloudflared_errors_go_to_stderr() {
+        use cloudpipe_sdk::{Event, LogLevel};
+        set_style(Style::plain());
+        match render_event_text(&Event::CloudflaredLog {
+            level: LogLevel::Error,
+            line: "boom".into(),
+        }) {
+            Some(EventLine::Err(line)) => assert_eq!(line, "  [cloudflared] boom"),
+            other => panic!("errors belong on stderr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_banner_mentions_the_tool() {
+        set_style(Style::plain());
+        assert!(banner_text().contains("cfp"), "{}", banner_text());
+    }
+
     #[test]
     fn plain_style_emits_no_escape_sequences() {
         let prev = set_style(Style::plain());
