@@ -153,8 +153,9 @@ cfp https 8443
 cfp https 8443 -s myapp --insecure
 #   => skips origin certificate validation, which would otherwise fail
 
-# Move a live tunnel to a different local port (public URL unchanged)
-# (also available as TunnelBuilder::update_port in the SDK)
+# Move a live tunnel to a different local port (public URL unchanged).
+# Available in the SDK (TunnelHandle::update_port) and in Node
+# (listener.update); the CLI does not expose it yet.
 
 # Expose a TCP service (e.g. SSH, Postgres, Redis — anything L4)
 cfp tcp 22 -s ssh-tunnel

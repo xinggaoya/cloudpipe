@@ -45,6 +45,13 @@ multiple-versions = "warn"
 # Wildcards would let a new dependency silently pull a different major
 # version, which is exactly the supply-chain risk this file exists for.
 # Path dependencies must therefore declare a `version` too.
+#
+# The exception is `cloudpipe-test-support`: it is a `publish = false`
+# test helper, so no consumer can ever resolve it from a registry and
+# the wildcard it would become is unreachable. Every other path
+# dependency carries a version and is checked normally. Registry
+# wildcards — the risk this rule is actually about — stay denied.
+allow-wildcard-paths = true
 wildcards = "deny"
 deny = []
 skip-tree = []
