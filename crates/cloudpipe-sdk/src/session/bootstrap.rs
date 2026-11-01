@@ -221,6 +221,12 @@ async fn inner(
                                 total: total as u8,
                             });
                         }
+                        LineKind::Log(level) => {
+                            let _ = event_tx_for_pump.send(Event::CloudflaredLog {
+                                level,
+                                line: trimmed.to_string(),
+                            });
+                        }
                         LineKind::Error => {
                             let _ = event_tx_for_pump.send(Event::CloudflaredLog {
                                 level: LogLevel::Error,

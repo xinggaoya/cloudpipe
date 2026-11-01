@@ -32,6 +32,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::error::{InstallError, Result};
+use crate::event::LogLevel;
 
 /// Base URL for `cloudflared` release assets.
 const GITHUB_BASE_URL: &str = "https://github.com/cloudflare/cloudflared/releases/download";
@@ -126,6 +127,8 @@ const ASSET_SHA256: &[(&str, &str)] = &[
 pub(crate) enum LineKind {
     /// A new edge connection was registered.
     Connection,
+    /// A log line with a severity cloudflared stated itself.
+    Log(LogLevel),
     /// A real error worth surfacing.
     Error,
     /// Harmless noise (origin cert hints, retries, etc.).
@@ -157,6 +160,15 @@ pub fn classify_line(line: &str) -> LineKind {
     if lower.contains("registered tunnel connection") {
         return LineKind::Connection;
     }
+
+    // A timestamped line carries cloudflared's own severity, and that
+    // severity is authoritative. The ignore list below was written for
+    // the older, untagged format; letting it win here would hide a real
+    // `ERR connection terminated` behind a rule meant for routine noise.
+    if let Some(level) = parse_level_prefix(line) {
+        return LineKind::Log(level);
+    }
+
     if IGNORE_PATTERNS.iter().any(|p| lower.contains(p)) {
         return LineKind::Ignore;
     }
@@ -164,6 +176,40 @@ pub fn classify_line(line: &str) -> LineKind {
         return LineKind::Error;
     }
     LineKind::Ignore
+}
+
+/// Reads the severity cloudflared wrote into one of its log lines.
+///
+/// cloudflared prefixes each line with an RFC 3339 timestamp and a
+/// three-letter level, e.g. `2025-11-01T12:00:00Z WRN Retrying`. The
+/// timestamp is what makes the level trustworthy: without it, a bare
+/// `ERR` could just as easily be the first word of a sentence, so the
+/// untagged format keeps the older classification.
+///
+/// Returns `None` for a line that carries no level.
+fn parse_level_prefix(line: &str) -> Option<LogLevel> {
+    let mut tokens = line.split_whitespace();
+    let timestamp = tokens.next()?;
+    if !looks_like_timestamp(timestamp) {
+        return None;
+    }
+    level_from_token(tokens.next()?)
+}
+
+/// Whether the token is the RFC 3339 timestamp cloudflared prefixes its
+/// log lines with.
+fn looks_like_timestamp(token: &str) -> bool {
+    token.starts_with(|c: char| c.is_ascii_digit()) && token.contains('T') && token.ends_with('Z')
+}
+
+/// Maps cloudflared's three-letter severity onto the SDK's own levels.
+fn level_from_token(token: &str) -> Option<LogLevel> {
+    match token {
+        "ERR" | "FTL" => Some(LogLevel::Error),
+        "WRN" => Some(LogLevel::Warn),
+        "INF" | "DBG" | "TRC" => Some(LogLevel::Info),
+        _ => None,
+    }
 }
 
 /// Reads the GitHub mirror prefix from `CFP_GITHUB_PROXY`, falling back to
@@ -650,6 +696,65 @@ mod tests {
         assert_eq!(
             classify_line("Cannot determine default origin certificate path"),
             LineKind::Ignore
+        );
+    }
+
+    #[test]
+    fn cloudflared_levels_are_recognised() {
+        // cloudflared prefixes every stderr line with a timestamp and a
+        // three-letter severity. Those levels were silently dropped
+        // before: only "error"-ish lines produced an event, so a warning
+        // never reached the UI.
+        let cases = [
+            ("2025-11-01T12:00:00Z INF Starting tunnel", LogLevel::Info),
+            (
+                "2025-11-01T12:00:00Z WRN Unable to reach the origin service",
+                LogLevel::Warn,
+            ),
+            (
+                "2025-11-01T12:00:00Z ERR the origin refused the connection",
+                LogLevel::Error,
+            ),
+            ("2025-11-01T12:00:00Z DBG reading config", LogLevel::Info),
+            ("2025-11-01T12:00:00Z TRC very chatty", LogLevel::Info),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(
+                classify_line(line),
+                LineKind::Log(expected),
+                "{line} was not classified"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_level_outranks_the_error_substring() {
+        // "ERR" wins over a line that merely contains "err".
+        assert_eq!(
+            classify_line("2025-11-01T12:00:00Z INF nothing to report here"),
+            LineKind::Log(LogLevel::Info)
+        );
+    }
+
+    #[test]
+    fn an_untagged_level_keeps_the_old_classification() {
+        // Without a timestamp there is no way to tell a level token from
+        // an ordinary word, so the old rules apply.
+        assert_eq!(
+            classify_line("ERR something went very wrong"),
+            LineKind::Error
+        );
+        assert_eq!(classify_line("all good"), LineKind::Ignore);
+    }
+
+    #[test]
+    fn a_timestamped_error_is_not_hidden_by_the_noise_list() {
+        // `connection terminated` is in the ignore list for the old
+        // untagged format, where it was routine. A tagged error is the
+        // real thing.
+        assert_eq!(
+            classify_line("2025-11-01T12:00:00Z ERR connection terminated"),
+            LineKind::Log(LogLevel::Error)
         );
     }
 
