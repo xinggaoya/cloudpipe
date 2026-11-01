@@ -60,17 +60,26 @@ struct Ctx {
     /// Cached so a handler that makes several API calls reuses one client
     /// (and therefore one connection pool).
     api: OnceCell<CloudflareApi>,
+    /// Overrides the Cloudflare API base URL. Only the tests set it, and
+    /// they point it at an in-process mock.
+    api_base: Option<String>,
 }
 
 impl Ctx {
     /// Opens the config store and reads the current config.
     fn load() -> Result<Self> {
         let store = ConfigStore::default()?;
+        Self::with_store(store)
+    }
+
+    /// A context rooted at a specific store.
+    fn with_store(store: ConfigStore) -> Result<Self> {
         let config = store.load();
         Ok(Self {
             store,
             config,
             api: OnceCell::new(),
+            api_base: None,
         })
     }
 
@@ -90,11 +99,23 @@ impl Ctx {
         if let Some(api) = self.api.get() {
             return Ok(api);
         }
-        let api = CloudflareApi::new(self.token()?).map_err(anyhow::Error::msg)?;
+        let api = self.api_for_token(&self.token()?)?;
         let _ = self.api.set(api);
         self.api
             .get()
             .ok_or_else(|| anyhow!("could not initialise the Cloudflare client"))
+    }
+
+    /// A client for one specific token.
+    ///
+    /// `cfp key` verifies the token it is about to save, which is not
+    /// necessarily the one already in the config, so it cannot reuse the
+    /// cached client.
+    fn api_for_token(&self, token: &str) -> Result<CloudflareApi> {
+        match &self.api_base {
+            Some(base) => CloudflareApi::with_base(token, base.clone()).map_err(anyhow::Error::msg),
+            None => CloudflareApi::new(token).map_err(anyhow::Error::msg),
+        }
     }
 
     /// The account/zone/domain trio, for commands that operate on one zone.
@@ -211,7 +232,7 @@ async fn handle_key(
     }
 
     ui::step("Verifying token with Cloudflare...");
-    let api = CloudflareApi::new(trimmed.to_string()).map_err(anyhow::Error::msg)?;
+    let api = ctx.api_for_token(trimmed)?;
     let status = api
         .verify_token()
         .await
@@ -362,6 +383,91 @@ mod tests {
         let saved = store.load();
         assert_eq!(saved.token.as_deref(), Some("cf_test"));
         assert!(format!("{err:#}").contains("token was saved"), "{err:#}");
+    }
+
+    /// A context pointed at a mock API, with its config file in a temp dir.
+    async fn mock_ctx() -> (
+        Ctx,
+        tempfile::TempDir,
+        std::sync::Arc<cloudpipe_test_support::MockState>,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = cloudpipe_test_support::MockState::new();
+        let base = cloudpipe_test_support::spawn_mock_api(state.clone()).await;
+        let store = ConfigStore::with_dir(dir.path().to_path_buf());
+        let mut ctx = Ctx::with_store(store).expect("ctx");
+        ctx.api_base = Some(base);
+        // The zone-scoped commands need credentials in the config.
+        ctx.config.token = Some("cf_test".to_string());
+        ctx.config.domain = Some("example.com".to_string());
+        ctx.config.zone_id = Some("zone-1".to_string());
+        ctx.config.account_id = Some("acc-1".to_string());
+        (ctx, dir, state)
+    }
+
+    #[tokio::test]
+    async fn key_saves_the_token_even_when_the_zone_has_no_account() {
+        let (ctx, _dir, state) = mock_ctx().await;
+        // Cloudflare omits the account for some tokens, and `apply_zone`
+        // then fails. The token must survive: re-running `cfp key` used
+        // to produce the identical failure with nothing written.
+        state
+            .zones_without_account
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = handle_key(&ctx, Some("cf_test".to_string()), None, false)
+            .await
+            .expect_err("the zone resolution must fail");
+        assert!(format!("{err:#}").contains("account"), "{err:#}");
+
+        let saved = ctx.store.load();
+        assert_eq!(saved.token.as_deref(), Some("cf_test"));
+    }
+
+    #[tokio::test]
+    async fn key_reports_an_empty_token() {
+        let (ctx, _dir, _state) = mock_ctx().await;
+        let err = handle_key(&ctx, Some("   ".to_string()), None, false)
+            .await
+            .expect_err("an empty token must be rejected");
+        assert!(format!("{err:#}").contains("empty token"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn domain_reports_an_inaccessible_zone() {
+        let (ctx, _dir, _state) = mock_ctx().await;
+        // The mock only knows `example.com`.
+        let err = handle_domain(&ctx, "nope.example.com".into())
+            .await
+            .expect_err("the zone is not accessible");
+        assert!(format!("{err:#}").contains("not accessible"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn domain_switches_to_an_accessible_zone() {
+        let (ctx, _dir, _state) = mock_ctx().await;
+        handle_domain(&ctx, "example.com".into())
+            .await
+            .expect("the zone is accessible");
+
+        let saved = ctx.store.load();
+        assert_eq!(saved.domain.as_deref(), Some("example.com"));
+        assert_eq!(saved.zone_id.as_deref(), Some("zone-1"));
+        assert_eq!(saved.account_id.as_deref(), Some("acc-1"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_previews_without_deleting() {
+        let (ctx, _dir, _state) = mock_ctx().await;
+        handle_cleanup(
+            &ctx,
+            CleanupArgs {
+                dry_run: true,
+                json: true,
+            },
+        )
+        .await
+        .expect("the preview must succeed");
     }
 
     #[test]

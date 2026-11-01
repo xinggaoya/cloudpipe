@@ -42,6 +42,11 @@ pub struct MockState {
     pub fail_dns_create: AtomicBool,
     /// Last ingress configuration written per tunnel id.
     pub ingress: Mutex<HashMap<String, Value>>,
+    /// Set to make the zone listing carry no account reference.
+    ///
+    /// Cloudflare omits it for some tokens, and the CLI has to cope with
+    /// that rather than losing the saved token over it.
+    pub zones_without_account: AtomicBool,
 }
 
 impl MockState {
@@ -187,11 +192,17 @@ fn route(req: &Req, state: &MockState) -> (u16, Value) {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/user/tokens/verify") => return ok(json!({ "id": "tok", "status": "active" })),
         ("GET", "/zones") => {
-            return ok(json!([{
+            let mut zone = json!({
                 "id": "zone-1",
                 "name": "example.com",
                 "account": { "id": "acc-1" },
-            }]))
+            });
+            if state.zones_without_account.load(Ordering::SeqCst) {
+                zone.as_object_mut()
+                    .expect("a zone object")
+                    .remove("account");
+            }
+            return ok(json!([zone]));
         }
         _ => {}
     }
