@@ -188,6 +188,115 @@ pub fn event_names() -> Vec<String> {
         .collect()
 }
 
+/// Options accepted by [`cleanup`].
+#[napi(object)]
+pub struct CleanupOptions {
+    /// Cloudflare API token. **Required.**
+    pub token: String,
+
+    /// Base domain (e.g. `example.com`). Optional — the SDK resolves the
+    /// zone from the token when only one is accessible.
+    #[napi(js_name = "domain")]
+    pub domain: Option<String>,
+
+    /// Cloudflare account id. Optional.
+    #[napi(js_name = "account")]
+    pub account: Option<String>,
+
+    /// Cloudflare zone id. Optional.
+    #[napi(js_name = "zone")]
+    pub zone: Option<String>,
+
+    /// Report what would be removed without removing anything.
+    #[napi(js_name = "dryRun")]
+    pub dry_run: Option<bool>,
+
+    /// Base URL of a Cloudflare-compatible API. Intended for tests.
+    #[napi(js_name = "apiBase")]
+    pub api_base: Option<String>,
+}
+
+/// One resource a cleanup run touched.
+#[napi(object)]
+pub struct CleanupActionJs {
+    /// `"tunnel"` or `"dnsRecord"`.
+    #[napi(js_name = "kind")]
+    pub kind: String,
+    /// Cloudflare resource id.
+    pub id: String,
+    /// Human-readable name (tunnel name or DNS hostname).
+    pub name: String,
+}
+
+/// The result of a cleanup run.
+#[napi(object)]
+pub struct CleanupReportJs {
+    /// Resources actually removed.
+    pub removed: Vec<CleanupActionJs>,
+    /// Resources that would have been removed, when `dryRun` was set.
+    #[napi(js_name = "wouldRemove")]
+    pub would_remove: Vec<CleanupActionJs>,
+    /// Per-resource failures.
+    pub errors: Vec<String>,
+}
+
+/// Converts one SDK cleanup action into its JavaScript shape.
+fn cleanup_action_to_js(action: &cloudpipe_sdk::CleanupAction) -> CleanupActionJs {
+    match action {
+        cloudpipe_sdk::CleanupAction::Tunnel { id, name } => CleanupActionJs {
+            kind: "tunnel".into(),
+            id: id.clone(),
+            name: name.clone(),
+        },
+        cloudpipe_sdk::CleanupAction::DnsRecord { id, name } => CleanupActionJs {
+            kind: "dnsRecord".into(),
+            id: id.clone(),
+            name: name.clone(),
+        },
+    }
+}
+
+/// Reclaims dead tunnels and orphaned DNS records in one zone.
+///
+/// A Node application that dies without closing its listener leaves a
+/// tunnel and a CNAME behind. The SDK could always clean those up, but
+/// only the CLI could reach that code — until now.
+#[napi]
+pub async fn cleanup(options: CleanupOptions) -> Result<CleanupReportJs> {
+    let mut builder = cloudpipe_sdk::TunnelBuilder::new().token(options.token.clone());
+    if let Some(domain) = options.domain.filter(|d| !d.is_empty()) {
+        builder = builder.domain(domain);
+    }
+    if let Some(account) = options.account.filter(|a| !a.is_empty()) {
+        builder = builder.account(account);
+    }
+    if let Some(zone) = options.zone.filter(|z| !z.is_empty()) {
+        builder = builder.zone(zone);
+    }
+    if let Some(base) = options.api_base.filter(|b| !b.is_empty()) {
+        let api = cloudpipe_sdk::CloudflareApi::with_base(options.token.clone(), base)
+            .map_err(|e| error::other(format!("{e:#}")))?;
+        builder = builder.api(api);
+    }
+
+    let report = if options.dry_run.unwrap_or(false) {
+        builder.preview_zone().await
+    } else {
+        builder.cleanup_zone().await
+    }
+    .map_err(error::from_sdk_error)?;
+
+    Ok(CleanupReportJs {
+        removed: report.removed.iter().map(cleanup_action_to_js).collect(),
+        would_remove: report
+            .would_remove
+            .iter()
+            .map(cleanup_action_to_js)
+            .collect(),
+        errors: report.errors.clone(),
+    })
+}
+
 /// Extracts the `[CODE]` prefix from a cloudpipe error message.
 ///
 /// Cloudpipe surfaces its error taxonomy as a `[CODE]` prefix on
