@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use cloudpipe_sdk::{Event, TunnelBuilder, TunnelHandle};
@@ -95,6 +96,9 @@ pub struct Listener {
     cmd_tx: mpsc::Sender<Command>,
     /// Per-event-name callback list, populated by `on()` calls.
     callbacks: CallbackRegistry,
+    /// Set once the session task has finished. A `wait()` after that
+    /// resolves immediately instead of reporting a dead session.
+    finished: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Listener {
@@ -162,6 +166,11 @@ impl Listener {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(8);
 
+        // Shared with the session thread so a `wait()` issued after the
+        // tunnel has already ended resolves instead of failing.
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_for_thread = Arc::clone(&finished);
+
         // Spawn the event pump on the multi-thread runtime: it only
         // touches Send values (mpsc Receiver + Arc of HashMap of
         // ThreadsafeFunctions) and never holds a TunnelHandle.
@@ -185,7 +194,7 @@ impl Listener {
                         return;
                     }
                 };
-                rt.block_on(session_loop(handle, cmd_rx));
+                rt.block_on(session_loop(handle, cmd_rx, finished_for_thread));
             })
             .map_err(|e| error::other(format!("failed to spawn session thread: {e}")))?;
 
@@ -196,6 +205,7 @@ impl Listener {
             port: Arc::new(std::sync::atomic::AtomicU16::new(port)),
             cmd_tx,
             callbacks,
+            finished,
         })
     }
 }
@@ -214,8 +224,16 @@ impl Listener {
 ///
 /// from deadlocking, which the previous `while let Some(cmd) = rx.recv()`
 /// version did.
-async fn session_loop(mut handle: TunnelHandle, mut cmd_rx: mpsc::Receiver<Command>) {
-    let mut waiting: Option<oneshot::Sender<()>> = None;
+async fn session_loop(
+    mut handle: TunnelHandle,
+    mut cmd_rx: mpsc::Receiver<Command>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+) {
+    // Every parked `wait()` gets its own sender. The previous version
+    // kept a single one, so a second `wait()` silently replaced the
+    // first — whose promise then rejected with "session task dropped the
+    // reply channel" instead of resolving.
+    let mut waiters: Vec<oneshot::Sender<()>> = Vec::new();
 
     loop {
         // Poll alongside the command channel so a parked `wait()` resolves
@@ -225,15 +243,18 @@ async fn session_loop(mut handle: TunnelHandle, mut cmd_rx: mpsc::Receiver<Comma
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break };
+                let Some(cmd) = cmd else {
+                    // The Listener went away without closing.
+                    release_waiters(&mut waiters);
+                    finished.store(true, Ordering::SeqCst);
+                    break;
+                };
                 match cmd {
                     Command::Wait(tx) => {
                         // Park the waiter and go back to serving the
                         // channel, so their eventual `close()` is not
-                        // starved. Only one `wait()` is meaningful at a
-                        // time; a second replaces the first, whose sender
-                        // then drops and rejects that caller's promise.
-                        waiting = Some(tx);
+                        // starved.
+                        waiters.push(tx);
                     }
                     Command::Stop(tx) => {
                         let result: StopResult = handle
@@ -242,7 +263,8 @@ async fn session_loop(mut handle: TunnelHandle, mut cmd_rx: mpsc::Receiver<Comma
                             .map_err(|e| error::from_sdk_error(e).reason);
                         let _ = tx.send(result);
                         // Release anyone parked in `wait()`.
-                        drop(waiting.take());
+                        release_waiters(&mut waiters);
+                        finished.store(true, Ordering::SeqCst);
                         break;
                     }
                     Command::Update { port, reply } => {
@@ -253,13 +275,19 @@ async fn session_loop(mut handle: TunnelHandle, mut cmd_rx: mpsc::Receiver<Comma
             }
             () = wait_for_finish(&handle) => {
                 // The tunnel ended on its own; nothing will clear the
-                // parked waiter except us.
-                if let Some(tx) = waiting.take() {
-                    let _ = tx.send(());
-                }
+                // parked waiters except us.
+                release_waiters(&mut waiters);
+                finished.store(true, Ordering::SeqCst);
                 break;
             }
         }
+    }
+}
+
+/// Resolves every parked `wait()`.
+fn release_waiters(waiters: &mut Vec<oneshot::Sender<()>>) {
+    for tx in waiters.drain(..) {
+        let _ = tx.send(());
     }
 }
 
@@ -416,6 +444,10 @@ impl Listener {
     /// subsequent [`close`](Self::close) from working.
     #[napi]
     pub async fn wait(&self) -> Result<()> {
+        // Already over: resolve rather than report a dead session.
+        if self.finished.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Wait(tx))
