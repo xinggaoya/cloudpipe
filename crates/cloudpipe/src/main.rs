@@ -85,9 +85,9 @@ impl Ctx {
 
     /// The effective token, with the standard "run `cfp key` first" help.
     fn token(&self) -> Result<String> {
-        self.config.effective_token().ok_or_else(|| {
-            anyhow!("no Cloudflare API token configured — run `cfp key <token>` first")
-        })
+        self.config
+            .effective_token()
+            .ok_or_else(|| anyhow!("no Cloudflare API token configured — run `cfp key -` first"))
     }
 
     /// An API client for the effective token.

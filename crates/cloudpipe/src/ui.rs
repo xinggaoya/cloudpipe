@@ -443,7 +443,7 @@ pub fn sdk_error_hint(err: &Error) -> Option<&'static str> {
                 Some("Cloudflare is rate-limiting this token. Wait ~30s and retry; `cfp cleanup` clears leftovers from an interrupted run.")
             }
             CloudflareErrorKind::AuthFailed | CloudflareErrorKind::InvalidToken => {
-                Some("The token was rejected. Re-create it at https://dash.cloudflare.com/profile/api-tokens with Account→Tunnel:Edit, Zone→DNS:Edit and Zone→Zone:Read, then run `cfp key <token>`.")
+                Some("The token was rejected. Re-create it at https://dash.cloudflare.com/profile/api-tokens with Account→Tunnel:Edit, Zone→DNS:Edit and Zone→Zone:Read, then run `cfp key -`.")
             }
             CloudflareErrorKind::DnsExists => {
                 Some("A DNS record with that name already exists. Try another `-s <subdomain>`, or run `cfp cleanup`.")
@@ -466,7 +466,7 @@ pub fn sdk_error_hint(err: &Error) -> Option<&'static str> {
         InvalidDomain(_) => Some(
             "The base domain must be a lowercase RFC 1123 name like `example.com` — no scheme, port, path or trailing dot.",
         ),
-        MissingCredential(_) => Some("Run `cfp key <CF_API_TOKEN>` first, or set CLOUDFLARE_API_TOKEN."),
+        MissingCredential(_) => Some("Run `cfp key -` first, or set CLOUDFLARE_API_TOKEN."),
         AlreadyShutDown => Some("This handle was already stopped; nothing left to do."),
         Cloudflared(_) => Some(
             "cloudflared could not be installed or started. Pre-install it and pass its path, or check CFP_GITHUB_PROXY if you are behind a network that blocks GitHub.",
@@ -511,7 +511,7 @@ pub fn no_token_guide() {
     eprintln!("       Zone     -> Zone              -> Read");
     eprintln!("  3. Then run:");
     eprintln!();
-    eprintln!("       {}", cyan_bold("cfp key <CF_API_TOKEN>", st));
+    eprintln!("       {}", cyan_bold("cfp key -", st));
     eprintln!();
 }
 

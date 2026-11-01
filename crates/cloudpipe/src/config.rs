@@ -50,7 +50,7 @@ pub struct TunnelContext {
 
 /// Error produced when a required field is missing from the config.
 fn missing(field: &str) -> anyhow::Error {
-    anyhow::anyhow!("{field} not configured — run `cfp key <token>` first")
+    anyhow::anyhow!("{field} not configured — run `cfp key -` first")
 }
 
 /// User configuration persisted to disk.
