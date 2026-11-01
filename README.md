@@ -382,7 +382,7 @@ Other guarantees worth knowing about:
 - You need a domain managed by Cloudflare (any plan, including free).
 - Cloudflare's API rate limits apply per token. The SDK retries transient failures automatically; sustained heavy use may still need `cfp cleanup`.
 - The `cloudflared` binary is downloaded on first use and stored at `~/.cfp/bin/cloudflared` (~40 MB). Its version is pinned, so upgrading `cfp` to pick up a newer `cloudflared` is deliberate.
-- The built-in SHA-256 table covers Linux x86_64 and arm64. On other platforms, either install `cloudflared` yourself and put it on `PATH`, or set `CFP_CLOUDFLARED_SHA256=<digest you verified>` — an unverified executable is never installed. CI re-derives the table from the release on every build, so a stale or wrong digest fails the build rather than your first run.
+- The built-in SHA-256 table covers every platform the SDK can install on: Linux x86_64/arm64/arm, macOS x86_64/arm64, and Windows x86_64/386. If you build for a platform outside that set, either install `cloudflared` yourself and put it on `PATH`, or set `CFP_CLOUDFLARED_SHA256=<digest you verified>` — an unverified executable is never installed. CI re-derives the table from the release on every build, so a stale or wrong digest fails the build rather than your first run.
 - Auto-restart uses a bounded retry budget (5 attempts, 500 ms doubling to an 8 s cap). Beyond that the session ends and reports why, rather than reconnecting forever.
 
 ## License

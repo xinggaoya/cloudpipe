@@ -85,17 +85,11 @@ pub const ALL_ASSETS: &[&str] = &[
 /// because a wrong entry here is indistinguishable from a tampered
 /// download at the point of use:
 ///
-/// 1. `ci.yml`'s `verify-checksums` job re-downloads each asset from
-///    GitHub and diffs it against this table, so a stale or invented digest
-///    fails the build rather than every user's first run.
-/// 2. A release bump must update this table in the same commit, or (2)
-///    fires.
-///
-/// Regenerate with `cargo xtask` equivalent:
-///
-/// ```text
-/// curl -fsSL <asset-url> | sha256sum
-/// ```
+/// 1. `scripts/gen-cloudflared-checksums.sh` regenerates the table from
+///    the upstream release.
+/// 2. `ci.yml`'s `verify-checksums` job re-derives it and fails the build
+///    on any difference, so a stale or invented digest is a red build
+///    rather than every user's first run.
 ///
 /// An asset with no digest here is refused rather than installed
 /// unverified, unless the digest is supplied at runtime through
@@ -103,23 +97,33 @@ pub const ALL_ASSETS: &[&str] = &[
 const ASSET_SHA256: &[(&str, &str)] = &[
     // Verified against the bytes GitHub serves for CLOUDFLARED_VERSION.
     (
+        "cloudflared-darwin-amd64.tgz",
+        "155a288fef19dba08f0c7145c16a207baf137462d8a1289a78bf8564f9e51244",
+    ),
+    (
+        "cloudflared-darwin-arm64.tgz",
+        "45cfbb59a720f60b873906aa6469f8c4058f26be6d351c3e2920bc9cb4714273",
+    ),
+    (
         "cloudflared-linux-amd64",
-        "cc348a425d7944d3fad9d8ac124b06725d471634153b58e0d57c72a79cc1ea4e",
+        "991dffd8889ee9f0147b6b48933da9e4407e68ea8c6d984f55fa2d3db4bb431d",
     ),
     (
         "cloudflared-linux-arm64",
-        "3d67ef9295f7d5528a1acd74e8db79638a283b46f8922d5427545ff3f8ca3cc7",
+        "9979dc152097a29b6de4d1ef13e2f1821c67a6f096f88cc18f0fd25106305d3a",
     ),
-    // The remaining platforms are intentionally absent until their digests
-    // are filled in by `ci.yml`'s `verify-checksums` job, which downloads
-    // each asset and diffs it against this table. A fabricated digest here
-    // is indistinguishable from a tampered download at the point of use, so
-    // an unpinned platform is refused with an actionable message instead of
-    // installing something unverifiable.
-    //
-    // To use one of those platforms today without waiting for a release,
-    // set CFP_CLOUDFLARED_SHA256=<digest you verified>, or install
-    // cloudflared yourself and put it on PATH.
+    (
+        "cloudflared-linux-arm",
+        "b0ba2cda4a91ed212b0b1328f5209f97786e89d5e7cbddcfffa9570e56f69000",
+    ),
+    (
+        "cloudflared-windows-386.exe",
+        "1e76c0d4e6ff2576db46ad1a7397415729fbaf886b22aa49327f66185a2e8fc8",
+    ),
+    (
+        "cloudflared-windows-amd64.exe",
+        "413f9b24dc6e61a455564651524f167b8ce29ac4ccd40703dea7af93cd37ed39",
+    ),
 ];
 
 /// Classifies a single line of `cloudflared` stderr for event dispatch.
@@ -903,19 +907,25 @@ mod tests {
     }
 
     #[test]
-    fn platforms_without_a_pinned_digest_report_the_escape_hatch() {
-        // Not asserting that every platform is covered — a few are
-        // deliberately uncovered until CI fills them in. What matters is
-        // that an uncovered one fails with instructions rather than
-        // installing something unverifiable.
+    fn every_installable_platform_has_a_pinned_digest() {
+        // A platform we claim to support but cannot verify is worse than
+        // one we do not claim to support: the install fails at first use,
+        // in the user's face, instead of at build time.
         for (platform, arch, asset) in PLATFORM_ASSETS {
-            let digest = expected_sha256(asset);
-            if digest.is_none() {
-                let err = InstallError::UnverifiedAsset((*asset).to_string()).to_string();
-                assert!(err.contains(SHA256_ENV_VAR), "{platform}/{arch}: {err}");
-                assert!(err.contains("PATH"), "{platform}/{arch}: {err}");
-            }
+            assert!(
+                expected_sha256(asset).is_some(),
+                "{platform}/{arch} -> {asset} has no pinned digest"
+            );
         }
+    }
+
+    #[test]
+    fn an_unpinned_asset_reports_the_escape_hatch() {
+        // An asset this build cannot verify must fail with instructions
+        // rather than installing something unverifiable.
+        let err = InstallError::UnverifiedAsset("cloudflared-mystery".to_string()).to_string();
+        assert!(err.contains(SHA256_ENV_VAR), "{err}");
+        assert!(err.contains("PATH"), "{err}");
     }
 
     #[test]
