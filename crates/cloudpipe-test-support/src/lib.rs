@@ -422,7 +422,12 @@ pub async fn write_fake_cloudflared(
                 .to_string(),
         };
         write_script(&path, &script).await;
-        return path;
+        // The tail expression of the surviving `cfg` block: on Windows
+        // this block is the last one left in the body, so it is the
+        // function's return value. A `return` here would be the tail
+        // expression too — and clippy's `needless_return` rejects that
+        // on Windows while never seeing it on Unix.
+        path
     }
 
     #[cfg(unix)]
@@ -470,7 +475,9 @@ pub async fn write_crashing_cloudflared(dir: &Path, counter_file: &Path) -> std:
             counter_file.display()
         );
         write_script(&path, &script).await;
-        return path;
+        // See `write_fake_cloudflared`: the surviving `cfg` block is the
+        // function's tail expression on this platform.
+        path
     }
 
     #[cfg(unix)]
