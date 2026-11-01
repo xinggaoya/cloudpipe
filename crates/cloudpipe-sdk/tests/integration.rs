@@ -326,6 +326,11 @@ async fn shutdown_signals_cloudflared_before_touching_cloudflare() {
     // The TERM trap ran, i.e. the process was signalled. The SDK used to
     // delete the DNS record and the tunnel first, failing every in-flight
     // request; this asserts the ordering.
+    //
+    // Unix only: Windows has no TERM to trap — the SDK terminates the
+    // child outright there — so the marker cannot be written. The
+    // ordering the test is really about is the same on both platforms.
+    #[cfg(unix)]
     assert!(
         term.exists(),
         "cloudflared must receive a termination signal during shutdown"

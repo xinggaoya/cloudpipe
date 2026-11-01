@@ -397,40 +397,97 @@ pub async fn write_fake_cloudflared(
     dir: &Path,
     markers: Option<(&Path, &Path)>,
 ) -> std::path::PathBuf {
-    let path = dir.join("cloudflared");
-    let script = match markers {
-        Some((ready, term)) => format!(
-            "#!/bin/sh\ntrap 'echo terminated > \"{term}\"; exit 0' TERM INT\n\
-             echo \"2025-01-01 Registered tunnel connection connIndex=0\"\n\
-             echo up > \"{ready}\"\n\
-             while true; do sleep 0.05; done\n",
-            term = term.display(),
-            ready = ready.display()
-        ),
-        None => "#!/bin/sh\ntrap 'exit 0' TERM INT\n\
+    // A `#!/bin/sh` script is not a runnable image on Windows — spawning
+    // one fails with "%1 is not a valid Win32 application". Rust has
+    // run `.bat`/`.cmd` files through `cmd.exe` since 1.77, so the Windows
+    // fake is a batch file instead.
+    #[cfg(windows)]
+    {
+        let path = dir.join("cloudflared.cmd");
+        let script = match markers {
+            Some((ready, _term)) => format!(
+                "@echo off\r\n\
+                 echo 2025-01-01 Registered tunnel connection connIndex=0 1>&2\r\n\
+                 echo up > \"{ready}\"\r\n\
+                 :loop\r\n\
+                 ping -n 2 127.0.0.1 > nul\r\n\
+                 goto loop\r\n",
+                ready = ready.display()
+            ),
+            None => "@echo off\r\n\
+                      echo 2025-01-01 Registered tunnel connection connIndex=0 1>&2\r\n\
+                      :loop\r\n\
+                      ping -n 2 127.0.0.1 > nul\r\n\
+                      goto loop\r\n"
+                .to_string(),
+        };
+        write_script(&path, &script).await;
+        return path;
+    }
+
+    #[cfg(unix)]
+    {
+        let path = dir.join("cloudflared");
+        let script = match markers {
+            Some((ready, term)) => format!(
+                "#!/bin/sh\ntrap 'echo terminated > \"{term}\"; exit 0' TERM INT\n\
+                 echo \"2025-01-01 Registered tunnel connection connIndex=0\"\n\
+                 echo up > \"{ready}\"\n\
+                 while true; do sleep 0.05; done\n",
+                term = term.display(),
+                ready = ready.display()
+            ),
+            None => "#!/bin/sh\ntrap 'exit 0' TERM INT\n\
                   echo \"2025-01-01 Registered tunnel connection connIndex=0\"\n\
                   while true; do sleep 0.05; done\n"
-            .to_string(),
-    };
-    write_script(&path, &script).await;
-    path
+                .to_string(),
+        };
+        write_script(&path, &script).await;
+        path
+    }
 }
 
 /// A `cloudflared` stand-in whose first invocation exits immediately (a
 /// simulated crash) and later ones idle forever.
 pub async fn write_crashing_cloudflared(dir: &Path, counter_file: &Path) -> std::path::PathBuf {
-    let path = dir.join("cloudflared");
-    let script = format!(
-        "#!/bin/sh\ntrap 'exit 0' TERM INT\nCOUNTER_FILE=\"{}\"\n\
-         count=$(cat \"$COUNTER_FILE\" 2>/dev/null || echo 0)\n\
-         count=$((count + 1))\necho \"$count\" > \"$COUNTER_FILE\"\n\
-         echo \"2025-01-01 Registered tunnel connection connIndex=0\"\n\
-         if [ \"$count\" = \"1\" ]; then exit 1; fi\n\
-         while true; do sleep 0.05; done\n",
-        counter_file.display()
-    );
-    write_script(&path, &script).await;
-    path
+    // See `write_fake_cloudflared`: a shell script is not runnable on
+    // Windows, so the crash-counter is a batch file there.
+    #[cfg(windows)]
+    {
+        let path = dir.join("cloudflared.cmd");
+        let script = format!(
+            "@echo off\r\n\
+             set \"COUNTER_FILE={}\"\r\n\
+             set count=0\r\n\
+             if exist \"%COUNTER_FILE%\" set /p count=<\"%COUNTER_FILE%\"\r\n\
+             set /a count+=1\r\n\
+             > \"%COUNTER_FILE%\" echo %count%\r\n\
+             echo 2025-01-01 Registered tunnel connection connIndex=0 1>&2\r\n\
+             if %count% == 1 exit /b 1\r\n\
+             :loop\r\n\
+             ping -n 2 127.0.0.1 > nul\r\n\
+             goto loop\r\n",
+            counter_file.display()
+        );
+        write_script(&path, &script).await;
+        return path;
+    }
+
+    #[cfg(unix)]
+    {
+        let path = dir.join("cloudflared");
+        let script = format!(
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nCOUNTER_FILE=\"{}\"\n\
+             count=$(cat \"$COUNTER_FILE\" 2>/dev/null || echo 0)\n\
+             count=$((count + 1))\necho \"$count\" > \"$COUNTER_FILE\"\n\
+             echo \"2025-01-01 Registered tunnel connection connIndex=0\"\n\
+             if [ \"$count\" = \"1\" ]; then exit 1; fi\n\
+             while true; do sleep 0.05; done\n",
+            counter_file.display()
+        );
+        write_script(&path, &script).await;
+        path
+    }
 }
 
 pub async fn write_script(path: &Path, script: &str) {

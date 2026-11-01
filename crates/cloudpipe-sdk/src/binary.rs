@@ -569,6 +569,13 @@ fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
     }
+    #[cfg(not(unix))]
+    {
+        // Windows has no executable bit — the file extension decides
+        // what runs. The parameter is still named so the signature
+        // reads the same on both platforms.
+        let _ = path;
+    }
 }
 
 /// Spawns `cloudflared` to run the named tunnel, with stderr piped for
