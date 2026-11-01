@@ -16,7 +16,12 @@ use cloudpipe_sdk::CloudflareErrorKind;
 /// Stable error codes exposed to JavaScript as a `[CODE]` prefix on
 /// `error.message`. The codes intentionally mirror the
 /// `cloudpipe_sdk::Error` variants.
+///
+/// `#[non_exhaustive]`: the taxonomy grows as the SDK grows, and a new
+/// code must not be a breaking change for a Rust consumer that switches
+/// on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CloudpipeErrorCode {
     /// A required credential (token, domain, account/zone) was missing.
     MissingCredential,
@@ -84,7 +89,10 @@ impl CloudpipeErrorCode {
 
 /// Sub-classification of [`CloudpipeErrorCode::CloudflareApi`].
 /// Appended after the parent code, e.g. `"[CLOUDFLARE_API:RATE_LIMITED] "`.
+///
+/// `#[non_exhaustive]`: same reasoning as [`CloudpipeErrorCode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CloudflareApiKind {
     /// 10429 — hit too many requests.
     RateLimited,

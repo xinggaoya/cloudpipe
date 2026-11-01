@@ -195,7 +195,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloudpipe-node"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cloudpipe-node-core",
  "cloudpipe-sdk",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "cloudpipe-node-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cloudpipe-sdk",
  "serde_json",
