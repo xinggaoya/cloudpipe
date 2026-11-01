@@ -45,7 +45,7 @@
     "build": "napi build --platform --release --strip --output-dir ./npm --js index.js --dts index.d.ts",
     "build:debug": "napi build --platform --output-dir ./npm --js index.js --dts index.d.ts",
     "build:local": "napi build --target $(rustc -vV | sed -n 's|host: ||p') --platform --release --strip --output-dir ./npm --js index.js --dts index.d.ts",
-    "test": "node test/smoke.js",
+    "test": "node test/smoke.js && node test/parse-error-code.js",
     "test:examples": "node examples/quickstart.js && node examples/with-events.js",
     "prepublishOnly": "npm run build && npm run test"
   },

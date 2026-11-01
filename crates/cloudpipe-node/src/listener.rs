@@ -56,8 +56,28 @@ type StopResult = std::result::Result<(), String>;
 /// payload string)`.
 type EventEnvelope = (String, String);
 
+/// A thread-safe function that does not keep the Node event loop alive.
+///
+/// A strong thread-safe function holds a libuv handle, so registering an
+/// event handler would stop the event loop from ever draining — the
+/// Node process would simply never exit. The addon is a library: whether
+/// the program keeps running is the program's decision, not the
+/// addon's.
+///
+/// A weak thread-safe function still delivers every call; it only
+/// releases the loop reference.
+type WeakCallback = napi::threadsafe_function::ThreadsafeFunction<
+    String,
+    (),
+    String,
+    napi::bindgen_prelude::Status,
+    true,
+    true,
+    0,
+>;
+
 /// Threadsafe callback registered by [`Listener::on`].
-type EventCallback = Arc<napi::threadsafe_function::ThreadsafeFunction<String, ()>>;
+type EventCallback = Arc<WeakCallback>;
 
 /// Per-event callbacks plus the events that arrived before any of them
 /// existed.
@@ -109,7 +129,7 @@ impl Listener {
         let port = cloudpipe_node_core::parse_port(options.port).map_err(error::invalid_arg)?;
 
         let mut builder = TunnelBuilder::new()
-            .token(options.token)
+            .token(options.token.clone())
             .protocol(protocol)
             .port(port)
             .auto_restart(options.auto_restart.unwrap_or(false));
@@ -134,6 +154,11 @@ impl Listener {
         }
         if let Some(policy) = options.restart_policy {
             builder = builder.restart_policy(policy.resolve());
+        }
+        if let Some(base) = options.api_base.filter(|b| !b.is_empty()) {
+            let api = cloudpipe_sdk::CloudflareApi::with_base(options.token.clone(), base)
+                .map_err(|e| error::other(format!("{e:#}")))?;
+            builder = builder.api(api);
         }
 
         // An unbounded channel: these events are produced at the pace of
@@ -376,11 +401,7 @@ impl Listener {
     /// complete event-name catalog is available at runtime via
     /// [`crate::event_names`].
     #[napi]
-    pub fn on(
-        &self,
-        event: String,
-        callback: napi::threadsafe_function::ThreadsafeFunction<String, ()>,
-    ) -> Result<()> {
+    pub fn on(&self, event: String, callback: WeakCallback) -> Result<()> {
         if !cloudpipe_node_core::event::EVENT_NAMES.contains(&event.as_str()) {
             return Err(error::invalid_arg(format!(
                 "unknown event \"{event}\" — expected one of: {}",

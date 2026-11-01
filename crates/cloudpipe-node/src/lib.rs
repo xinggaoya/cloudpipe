@@ -122,6 +122,11 @@ pub struct ConnectOptions {
     /// Defaults to 5 attempts with a 500 ms doubling backoff.
     #[napi(js_name = "restartPolicy")]
     pub restart_policy: Option<RestartPolicyOptions>,
+
+    /// Base URL of a Cloudflare-compatible API. Intended for tests, which
+    /// point it at an in-process mock.
+    #[napi(js_name = "apiBase")]
+    pub api_base: Option<String>,
 }
 
 /// Reconnection budget for `autoRestart`.
