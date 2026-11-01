@@ -65,6 +65,8 @@ const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 /// support": `scripts/gen-cloudflared-checksums.sh` parses it, the CI
 /// `verify-checksums` job diffs the result against the pinned table, and
 /// `download_asset_name` is asserted to only ever return a member.
+///
+/// Re-exported as [`crate::ALL_ASSETS`].
 pub const ALL_ASSETS: &[&str] = &[
     "cloudflared-darwin-amd64.tgz",
     "cloudflared-darwin-arm64.tgz",
