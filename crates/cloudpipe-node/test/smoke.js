@@ -161,6 +161,28 @@ async function connectToMock(mock, extra = {}) {
     const mock = await startMockApi();
     const listener = await connectToMock(mock);
 
+    // A typo in the event name must fail loudly. The facade registers
+    // natively for every known name up front, so it never routes a
+    // caller's `on()` through the native check — it has to validate
+    // the name itself.
+    let unknownErr = null;
+    try {
+      listener.on('dnsCreatedd', () => {});
+    } catch (err) {
+      unknownErr = err;
+    }
+    check('an unknown event name is rejected', unknownErr !== null);
+    check(
+      'the rejection carries INVALID_ARGUMENT',
+      unknownErr && unknownErr.code === 'INVALID_ARGUMENT',
+      unknownErr && String(unknownErr.message),
+    );
+    check(
+      'the rejection message carries the code prefix',
+      unknownErr && api.parseErrorCode(unknownErr.message) === 'INVALID_ARGUMENT',
+      unknownErr && String(unknownErr.message),
+    );
+
     const seen = [];
     listener.on('dnsCreated', (payload) => seen.push(payload));
 

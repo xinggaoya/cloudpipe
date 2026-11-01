@@ -137,8 +137,8 @@ earlier listener does not receive it.
 | `subdomain` | `string` | Just the subdomain part. |
 | `port` | `number` | Local port currently forwarded. |
 | `on(event, cb)` | `(payload) → void` | Register an event listener. Throws on an unknown event name. |
-| `off(event, cb?)` | `void` | Remove one listener for an event, or every listener for it when no callback is given. |
-| `removeAllListeners()` | `void` | Remove every listener. |
+| `off(event, cb?)` | `Listener` | Remove one listener for an event, or every listener for it when no callback is given. |
+| `removeAllListeners()` | `Listener` | Remove every listener. |
 | `wait()` | `Promise<void>` | Block until the tunnel ends on its own. Does **not** prevent a later `close()`. |
 | `update(port)` | `Promise<void>` | Repoint at another local port; public URL unchanged. |
 | `close()` | `Promise<void>` | Trigger clean shutdown + wait. |

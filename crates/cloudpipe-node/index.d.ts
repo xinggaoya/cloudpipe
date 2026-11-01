@@ -197,6 +197,10 @@ export declare class Listener {
    *   console.log('creating tunnel', name);
    * });
    * ```
+   *
+   * Throws an `INVALID_ARGUMENT` error when `event` is not one of
+   * {@link ListenerEventName} — a typo would otherwise register a
+   * handler that never fires.
    */
   on(event: ListenerEventName, callback: (payload: string) => void): Listener;
 

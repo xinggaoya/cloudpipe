@@ -92,6 +92,7 @@ function wrapListener(listener, eventNames) {
   const handlers = new Map()
   /** @type {Map<string, string[]>} */
   const pending = new Map()
+  const known = new Set(eventNames)
 
   function deliver(set, payload) {
     for (const cb of Array.from(set)) {
@@ -152,6 +153,18 @@ function wrapListener(listener, eventNames) {
     on(event, callback) {
       if (typeof callback !== 'function') {
         throw new TypeError('on(event, callback) requires a function')
+      }
+      // The native binding rejects an unknown event name, but the facade
+      // never routes a caller's `on()` through it — it registers natively
+      // for every known name up front. Without this check a typo would
+      // be accepted silently and the handler would simply never fire.
+      if (!known.has(event)) {
+        const err = new Error(
+          `[INVALID_ARGUMENT] unknown event "${event}" — expected one of: ` +
+            eventNames.join(', '),
+        )
+        err.code = 'INVALID_ARGUMENT'
+        throw err
       }
       let set = handlers.get(event)
       if (!set) {
