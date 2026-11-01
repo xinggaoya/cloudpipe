@@ -30,6 +30,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+cloudpipe-test-support = { path = "../cloudpipe-test-support" }
 # `tempfile` gives each test its own self-cleaning directory. The previous
 # `std::env::temp_dir().join(format!("cfp-test-{}", process::id()))` scheme
 # made cases in the same test binary collide.

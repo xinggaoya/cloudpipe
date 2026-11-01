@@ -1,0 +1,14 @@
+[package]
+name = "cloudpipe-test-support"
+version = "0.0.0"
+edition.workspace = true
+description = "Shared test doubles for the cloudpipe workspace — a mock Cloudflare API and fake cloudflared binaries"
+license.workspace = true
+publish = false
+
+[dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
+
+[lints]
+workspace = true

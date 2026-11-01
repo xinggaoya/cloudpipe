@@ -27,6 +27,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
+cloudpipe-test-support = { path = "../cloudpipe-test-support" }
 tempfile = "3"
 
 [lints]

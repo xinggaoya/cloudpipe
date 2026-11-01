@@ -5,6 +5,7 @@ members = [
     "crates/cloudpipe-sdk",
     "crates/cloudpipe-node-core",
     "crates/cloudpipe-node",
+    "crates/cloudpipe-test-support",
 ]
 
 [workspace.package]
