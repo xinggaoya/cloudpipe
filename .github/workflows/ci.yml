@@ -44,6 +44,9 @@ jobs:
       - name: Run doc tests
         run: cargo test --workspace --doc
       - name: Build SDK without CLI deps
+        # The default shell on Windows is PowerShell, which does not
+        # understand the `\` line continuation or `&&` used below.
+        shell: bash
         run: |
           cargo tree -p cloudpipe-sdk | grep -iE 'colored|clap|ctrlc|napi' \
             && (echo "SDK pulls in CLI/binding-only deps" && exit 1) \

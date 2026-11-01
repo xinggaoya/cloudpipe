@@ -177,18 +177,50 @@ jobs:
       - name: Assemble a runnable package
         run: |
           set -euo pipefail
-          rm -rf smoke && mkdir -p smoke
-          cp -r crates/cloudpipe-node/npm/* smoke/ || true
-          cp artifacts/**/npm/*.node smoke/ 2>/dev/null ||             cp "$(find artifacts -name 'cloudpipe*.node' | head -1)" smoke/
-          test -f smoke/index.js
+          # Assemble the layout npm actually publishes: the JS facade at
+          # `js/index.js` (the package's `main`), the napi loader and the
+          # binaries under `npm/`. The previous step copied only the
+          # `.node` files, so the entry point was missing and the job
+          # failed on `test -f smoke/index.js`.
+          rm -rf smoke && mkdir -p smoke/js smoke/npm
+          cp crates/cloudpipe-node/js/index.js smoke/js/
+          cp crates/cloudpipe-node/index.d.ts smoke/
+          cp crates/cloudpipe-node/package.json smoke/
+          cp crates/cloudpipe-node/README.md smoke/README.md
+          cp crates/cloudpipe-node/LICENSE smoke/LICENSE
+          # `merge-multiple: true` dumps every artifact flat into
+          # artifacts/, but search rather than assume — a layout change
+          # in upload-artifact should not silently produce an empty
+          # package here.
+          loader=$(find artifacts/ -maxdepth 2 -type f -name 'index.js' | head -1)
+          if [ -z "$loader" ]; then
+            echo "::error::no artifact index.js found — the napi loader is missing"
+            exit 1
+          fi
+          cp "$loader" smoke/npm/index.js
+          node_count=0
+          while IFS= read -r n; do
+            [ -f "$n" ] || continue
+            cp "$n" smoke/npm/
+            node_count=$((node_count + 1))
+          done < <(find artifacts/ -maxdepth 3 -type f -name 'cloudpipe*.node')
+          if [ "$node_count" -eq 0 ]; then
+            echo "::error::no cloudpipe*.node in artifacts/ — upload step dropped them?"
+            exit 1
+          fi
+          echo "assembled $node_count .node binary(ies)"
+          test -f smoke/js/index.js
+          test -f smoke/npm/index.js
+          test -f smoke/package.json
       - name: Load the addon and check its surface
         run: |
           set -euo pipefail
-          npm install --no-save "$(find artifacts -name 'index.js' | head -1)" >/dev/null 2>&1 || true
           node -e "
             const path = require('node:path');
-            const api = require(path.resolve('smoke', 'index.js'));
-            const required = ['connect', 'version', 'parseErrorCode', 'eventNames', 'errorCodes'];
+            // Require the package the way a consumer does: through the
+            // entry point its package.json names.
+            const api = require(path.resolve('smoke'));
+            const required = ['connect', 'cleanup', 'version', 'parseErrorCode', 'eventNames', 'errorCodes'];
             for (const key of required) {
               if (!(key in api)) throw new Error('missing export: ' + key);
             }
@@ -258,6 +290,11 @@ jobs:
           # Use our hand-written type definitions so consumers get the full
           # event-name catalog and typed callback signatures.
           cp crates/cloudpipe-node/index.d.ts npm-staging/index.d.ts
+          # The facade is the package's `main` entry point — without it
+          # the published package resolves to nothing and every
+          # `require('@xinggao/cloudpipe')` fails.
+          mkdir -p npm-staging/js
+          cp crates/cloudpipe-node/js/index.js npm-staging/js/index.js
           cp crates/cloudpipe-node/package.json npm-staging/package.json
           cp crates/cloudpipe-node/README.md npm-staging/README.md
           cp crates/cloudpipe-node/LICENSE npm-staging/LICENSE
@@ -281,6 +318,12 @@ jobs:
           echo "---"
           ls -la npm-staging/npm/
           echo "---"
+          # The entry point must exist in the staged tree, otherwise the
+          # published package is unusable.
+          if [ ! -f npm-staging/js/index.js ]; then
+            echo "::error::npm-staging/js/index.js is missing — the package main would not resolve"
+            exit 1
+          fi
           echo "Pack dry-run from staging dir to verify layout:"
           (cd npm-staging && npm pack --dry-run --ignore-scripts)
       - name: Publish to npm
