@@ -482,28 +482,75 @@ pub fn no_token_guide() {
     eprintln!();
 }
 
+/// Prints the current credential status.
 pub fn key_status(config: &Config) {
-    let st = style();
-    match config.effective_token() {
-        Some(token) => {
-            let masked = mask_token(&token);
-            println!("{} {}", bold("Token", st), dim(&masked, st));
-        }
-        None => println!("{} {}", bold("Token", st), red("not set", st)),
-    }
-    print_field("Domain", config.domain.as_deref(), st);
-    print_field("Zone ID", config.zone_id.as_deref(), st);
-    print_field("Account ID", config.account_id.as_deref(), st);
-    println!();
-    println!("Config file: ~/.cfp/config.json");
-    println!("Clear credentials: {}", dim("cfp key --clear", st));
+    print!("{}", key_status_text(config));
 }
 
-fn print_field(label: &str, value: Option<&str>, st: Style) {
-    match value {
-        Some(value) => println!("{:<12} {}", bold(label, st), value),
-        None => println!("{:<12} {}", bold(label, st), yellow("not set", st)),
+/// The credential status as text.
+///
+/// The token's *source* matters to the user: a token that only exists in
+/// `CLOUDFLARE_API_TOKEN` is not persisted, and telling the two apart is
+/// the difference between "logged in" and "logged in until you close the
+/// shell".
+pub fn key_status_text(config: &Config) -> String {
+    let st = style();
+    let mut out = String::new();
+
+    match (&config.token, env_token()) {
+        (Some(token), _) => {
+            out.push_str(&format!(
+                "{} {} (saved to {})\n",
+                bold("Token", st),
+                dim(&mask_token(token), st),
+                config_file_label()
+            ));
+        }
+        (None, Some(_)) => {
+            out.push_str(&format!(
+                "{} {}\n",
+                bold("Token", st),
+                yellow("from CLOUDFLARE_API_TOKEN (not persisted to disk)", st)
+            ));
+        }
+        (None, None) => {
+            out.push_str(&format!("{} {}\n", bold("Token", st), red("not set", st)));
+        }
     }
+
+    out.push_str(&field_line("Domain", config.domain.as_deref(), st));
+    out.push_str(&field_line("Zone ID", config.zone_id.as_deref(), st));
+    out.push_str(&field_line("Account ID", config.account_id.as_deref(), st));
+    out.push('\n');
+    out.push_str(&format!("Config file: {}\n", config_file_label()));
+    out.push_str(&format!(
+        "Clear credentials: {}\n",
+        dim("cfp key --clear", st)
+    ));
+    out
+}
+
+/// One `label  value` line.
+fn field_line(label: &str, value: Option<&str>, st: Style) -> String {
+    match value {
+        Some(value) => format!("{:<12} {}\n", bold(label, st), value),
+        None => format!("{:<12} {}\n", bold(label, st), yellow("not set", st)),
+    }
+}
+
+/// The path the config file lives at, honouring `CFP_CONFIG_DIR`.
+fn config_file_label() -> String {
+    crate::config::ConfigStore::default()
+        .map(|store| store.file_path().display().to_string())
+        .unwrap_or_else(|_| "~/.cfp/config.json".to_string())
+}
+
+/// The token supplied by the environment, if any.
+fn env_token() -> Option<String> {
+    std::env::var(crate::config::TOKEN_ENV_VAR)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 fn mask_token(token: &str) -> String {
@@ -669,6 +716,33 @@ mod tests {
         };
         assert_eq!(st.rule(5), "─────");
         assert_eq!(st.bullet(), "•");
+    }
+
+    #[test]
+    fn key_status_distinguishes_where_the_token_came_from() {
+        let config = Config {
+            token: Some("cf_saved_token".into()),
+            ..Default::default()
+        };
+
+        let saved = key_status_text(&config);
+        assert!(saved.contains("saved"), "{saved}");
+        // The token itself must not be printed.
+        assert!(!saved.contains("cf_saved_token"), "{saved}");
+
+        // A config with no stored token must not claim to have one —
+        // whether the environment supplies it or nothing does.
+        let empty = key_status_text(&Config::default());
+        assert!(!empty.contains("saved"), "{empty}");
+    }
+
+    #[test]
+    fn key_status_names_the_real_config_file() {
+        // The path used to be hardcoded, which was wrong as soon as
+        // CFP_CONFIG_DIR was set.
+        let text = key_status_text(&Config::default());
+        assert!(text.contains("Config file:"), "{text}");
+        assert!(text.contains("config.json"), "{text}");
     }
 
     #[test]

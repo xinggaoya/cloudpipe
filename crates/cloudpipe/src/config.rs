@@ -171,7 +171,6 @@ impl ConfigStore {
     }
 
     /// Path of the config file.
-    #[allow(dead_code)]
     pub fn file_path(&self) -> &Path {
         &self.file
     }
