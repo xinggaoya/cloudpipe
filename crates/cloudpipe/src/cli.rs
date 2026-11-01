@@ -7,8 +7,9 @@ use cloudpipe_sdk::Protocol;
 
 /// cfp — serverless localhost tunnels via Cloudflare Edge.
 ///
-/// Bring your own Cloudflare API token: `cfp key <token>`, then run
-/// `cfp http 8080` to expose localhost:8080 at a random subdomain.
+/// Bring your own Cloudflare API token: `cfp key -` (paste it when
+/// prompted), then run `cfp http 8080` to expose localhost:8080 at a
+/// random subdomain.
 #[derive(Parser, Debug)]
 #[command(
     name = "cfp",
@@ -91,7 +92,7 @@ pub enum Command {
     Cleanup(CleanupArgs),
 }
 
-/// Options for `cfp cleanup`.
+/// Reclaim dead tunnels and orphaned DNS records in this zone.
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct CleanupArgs {
     /// List what would be removed without deleting anything.
