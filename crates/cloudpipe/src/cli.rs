@@ -71,7 +71,16 @@ pub struct Cli {
 pub enum Command {
     /// Save, show or clear the Cloudflare API token.
     Key {
+        /// The token itself. Prefer `-` (read it from stdin) or
+        /// `--token-file`: a token passed as an argument is visible to
+        /// every local user through `ps` and `/proc/<pid>/cmdline`.
         token: Option<String>,
+
+        /// Read the token from this file instead of the command line.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<String>,
+
+        /// Clear the saved credentials.
         #[arg(long)]
         clear: bool,
     },
@@ -219,9 +228,28 @@ mod tests {
     fn key_subcommand_parses() {
         let cli = parse(&["key", "some-token"]);
         match cli.command.unwrap() {
-            Command::Key { token, clear } => {
+            Command::Key {
+                token,
+                token_file,
+                clear,
+            } => {
                 assert_eq!(token.as_deref(), Some("some-token"));
+                assert_eq!(token_file, None);
                 assert!(!clear);
+            }
+            _ => panic!("expected Key command"),
+        }
+    }
+
+    #[test]
+    fn key_accepts_a_token_file() {
+        let cli = parse(&["key", "--token-file", "/tmp/tok"]);
+        match cli.command.unwrap() {
+            Command::Key {
+                token, token_file, ..
+            } => {
+                assert_eq!(token, None);
+                assert_eq!(token_file.as_deref(), Some("/tmp/tok"));
             }
             _ => panic!("expected Key command"),
         }

@@ -133,8 +133,9 @@ cargo build --release
 
 ```bash
 # Save the token. cfp verifies it with Cloudflare and auto-discovers
-# the account and the first accessible zone.
-cfp key <CF_API_TOKEN>
+# the account and the first accessible zone. Reading it from stdin keeps
+# it out of your shell history and out of `ps` output.
+cfp key -            # then paste the token and press Enter
 
 # Expose localhost:8080 with a random subdomain (defaults to http)
 cfp 8080
@@ -225,7 +226,7 @@ For `udp`, reach the service by pointing your client at `myhost.example.com:5182
 | `cfp ... --origin-host-header <host>` | Send a specific `Host` header to the origin. |
 | `cfp ... --no-restart` | Exit the first time `cloudflared` dies instead of restarting it. |
 | `cfp ... -v / --verbose` | Print the SDK's internal trace to stderr. |
-| `cfp key [TOKEN] [--clear]` | Save, show or clear the Cloudflare token. Saving auto-discovers account/zone. |
+| `cfp key [TOKEN\|-] [--token-file <path>] [--clear]` | Save, show or clear the Cloudflare token. `-` reads it from stdin. Saving auto-discovers account/zone. |
 | `cfp domain <example.com>` | Switch the base domain to a different accessible zone. |
 | `cfp domains` | List zones accessible with the saved token. |
 | `cfp cleanup [--dry-run] [--json]` | Remove dead tunnels, their DNS records and orphaned CNAMEs. |

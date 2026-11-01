@@ -41,7 +41,11 @@ async fn run(cli: Cli) -> Result<()> {
     // messages depending on which command hit it.
     let ctx = Ctx::load()?;
     match cli.command {
-        Some(Command::Key { token, clear }) => handle_key(&ctx, token, clear).await,
+        Some(Command::Key {
+            token,
+            token_file,
+            clear,
+        }) => handle_key(&ctx, token, token_file, clear).await,
         Some(Command::Domain { domain }) => handle_domain(&ctx, domain).await,
         Some(Command::Domains) => handle_domains(&ctx).await,
         Some(Command::Cleanup(args)) => handle_cleanup(&ctx, args).await,
@@ -164,7 +168,12 @@ async fn run_tunnel_command(ctx: &Ctx, args: TunnelArgs) -> Result<()> {
     Ok(())
 }
 
-async fn handle_key(ctx: &Ctx, token: Option<String>, clear: bool) -> Result<()> {
+async fn handle_key(
+    ctx: &Ctx,
+    token: Option<String>,
+    token_file: Option<String>,
+    clear: bool,
+) -> Result<()> {
     if clear {
         let cleared = Config::new_empty();
         ctx.store.save(&cleared)?;
@@ -173,11 +182,27 @@ async fn handle_key(ctx: &Ctx, token: Option<String>, clear: bool) -> Result<()>
         return Ok(());
     }
 
-    let Some(token) = token else {
-        // Bare `cfp key` shows the current status, so a missing token is
-        // the documented outcome here rather than an error.
-        ui::key_status(&ctx.config);
-        return Ok(());
+    // Three ways to supply the token, in order of preference. Reading it
+    // from stdin or a file keeps it out of `ps` output and shell history.
+    let token = match (token.as_deref(), token_file.as_deref()) {
+        (Some(_), Some(_)) => {
+            bail!("pass the token either as an argument or via --token-file, not both")
+        }
+        (Some("-"), None) => read_token_from_stdin()?,
+        (Some(value), None) => {
+            eprintln!(
+                "warning: a token passed as an argument is visible in `ps` output — \
+                 prefer `cfp key -` or `cfp key --token-file <path>`"
+            );
+            value.to_string()
+        }
+        (None, Some(path)) => read_token_from_file(path)?,
+        (None, None) => {
+            // Bare `cfp key` shows the current status, so a missing token
+            // is the documented outcome here rather than an error.
+            ui::key_status(&ctx.config);
+            return Ok(());
+        }
     };
 
     let trimmed = token.trim();
@@ -269,4 +294,23 @@ async fn handle_cleanup(ctx: &Ctx, args: CleanupArgs) -> Result<()> {
 
     ui::cleanup_summary(&report, args.dry_run, args.json);
     Ok(())
+}
+
+/// Reads a token from stdin, one line.
+///
+/// This is the safest way to hand a secret to the process: it never
+/// reaches the process table, the shell history, or a crash report.
+fn read_token_from_stdin() -> Result<String> {
+    use std::io::BufRead as _;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("reading the token from stdin")?;
+    Ok(line)
+}
+
+/// Reads a token from a file.
+fn read_token_from_file(path: &str) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("reading the token from {path}"))
 }
