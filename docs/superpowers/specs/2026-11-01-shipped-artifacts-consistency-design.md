@@ -11,7 +11,7 @@
 
 | 编号 | 现象 | 影响面 |
 |---|---|---|
-| D1 | macOS / Windows 上 cloudflared 自动下载被拒 | 所有非 Linux 平台用户 |
+| D1 | cloudflared 自动安装在**所有平台**上都失败：摘要表只有 2 项，且两项摘要都**与上游不符** | 所有用户 |
 | D2 | Node 启动期生命周期事件全部丢失 | 所有 npm 用户 |
 | D3 | npm 包发布的 `on()` 回调签名与运行时不一致 | 所有 npm 用户 |
 | D4 | 手写 tracing subscriber 丢弃所有数字字段 | CLI + Node |
@@ -52,21 +52,58 @@
 
 `crates/cloudpipe-sdk/src/binary.rs:81-101` 的 `ASSET_SHA256` 只钉了 `cloudflared-linux-amd64`
 与 `cloudflared-linux-arm64` 两项。而 `download_asset_name`（`binary.rs:182-200`）支持
-darwin / windows / linux-arm 共 7 个资产。`ensure_installed`（`binary.rs:344-350`）在资产没有
-可用摘要时**直接拒绝安装**，返回 `InstallError::UnverifiedAsset`。
+darwin / windows / linux-arm 共 7 个资产。
 
-结果：macOS 与 Windows 用户（含 npm 预编译包的主力用户）必须自行安装 `cloudflared`，
-与根 README:315-318 及 `crates/cloudpipe-node/README.md:17-18` 的
-"No separate `cloudflared` install required" 承诺相矛盾。
+**更严重的是：钉住的那两项摘要本身就是错的。**
+
+| 资产 | 仓库里钉的 | 上游 `2025.11.1` 实际的 |
+|---|---|---|
+| `cloudflared-linux-amd64` | `cc348a425d7944d3fad9d8ac124b06725d471634153b58e0d57c72a79cc1ea4e` | `991dffd8889ee9f0147b6b48933da9e4407e68ea8c6d984f55fa2d3db4bb431d` |
+| `cloudflared-linux-arm64` | `3d67ef9295f7d5528a1acd74e8db79638a283b46f8922d5427545ff3f8ca3cc7` | `9979dc152097a29b6de4d1ef13e2f1821c67a6f096f88cc18f0fd25106305d3a` |
+
+上游值由两条独立路径确认：本地下载后 `sha256sum`，以及 GitHub Release API 的
+`digest` 字段（`GET /repos/cloudflare/cloudflared/releases/tags/2025.11.1`）——
+两者逐字节一致。
+
+后果分两种，**两种都让自动安装彻底不可用**：
+
+- Linux（x86_64 / arm64）：下载成功但校验失败 → `InstallError::ChecksumMismatch`。
+- macOS / Windows / linux-arm：没有摘要 → `InstallError::UnverifiedAsset`，直接拒绝安装。
+
+也就是说，**今天任何没有预先安装 `cloudflared` 的用户，第一次运行 `cfp` 都会失败**。
+根 README:315-318 与 `crates/cloudpipe-node/README.md:17-18` 承诺的
+"No separate `cloudflared` install required" 在任何平台上都不成立。
+
+`ci.yml` 的 `verify-checksums` job 本应捕获这一点 —— 它的抽取逻辑是正确的
+（能提取出那两条），比对也必然失败。因此**该 job 在 `main` 上当前是红的**，
+只是它红的方式（"WRONG cloudflared-linux-amd64"）被淹没在 CI 日志里，
+没有被当作发布阻断处理。
+
+顺带说明：摘要值从 `4fa905a` 引入起就是错的 —— 那次提交同时引入了
+`CLOUDFLARED_VERSION` 与这张表，两者从未与上游对齐过。
 
 ### 3.2 变更
 
-1. **补全摘要表**：`ASSET_SHA256` 增加
-   `cloudflared-darwin-arm64.tgz`、`cloudflared-darwin-amd64.tgz`、
-   `cloudflared-windows-amd64.exe`、`cloudflared-windows-386.exe`、`cloudflared-linux-arm`。
+1. **补全并修正摘要表**：`ASSET_SHA256` 增加
+   `cloudflared-darwin-amd64.tgz`、`cloudflared-darwin-arm64.tgz`、
+   `cloudflared-windows-amd64.exe`、`cloudflared-windows-386.exe`、`cloudflared-linux-arm`，
+   并**修正两条已存在的 Linux 摘要**（当前值与上游不符，见 §3.1）。
 
    摘要对象是**下载到的原始字节**：`binary.rs:428` 在解包之前对响应体做 SHA-256，
    所以 `.tgz` 的摘要就是 `.tgz` 文件自身的摘要，与解包逻辑无关。
+
+   `2025.11.1` 的正确值（本地下载 `sha256sum` 与 GitHub Release API 的 `digest`
+   字段双向确认）：
+
+   | 资产 | SHA-256 |
+   |---|---|
+   | `cloudflared-darwin-amd64.tgz` | `155a288fef19dba08f0c7145c16a207baf137462d8a1289a78bf8564f9e51244` |
+   | `cloudflared-darwin-arm64.tgz` | `45cfbb59a720f60b873906aa6469f8c4058f26be6d351c3e2920bc9cb4714273` |
+   | `cloudflared-linux-amd64` | `991dffd8889ee9f0147b6b48933da9e4407e68ea8c6d984f55fa2d3db4bb431d` |
+   | `cloudflared-linux-arm64` | `9979dc152097a29b6de4d1ef13e2f1821c67a6f096f88cc18f0fd25106305d3a` |
+   | `cloudflared-linux-arm` | `b0ba2cda4a91ed212b0b1328f5209f97786e89d5e7cbddcfffa9570e56f69000` |
+   | `cloudflared-windows-386.exe` | `1e76c0d4e6ff2576db46ad1a7397415729fbaf886b22aa49327f66185a2e8fc8` |
+   | `cloudflared-windows-amd64.exe` | `413f9b24dc6e61a455564651524f167b8ce29ac4ccd40703dea7af93cd37ed39` |
 
 2. **在 `binary.rs` 增加一个生产可见的资产清单** `ALL_ASSETS`：
 
