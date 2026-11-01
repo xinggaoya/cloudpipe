@@ -103,6 +103,13 @@ The complete event-name catalog is documented in
 as a JSON string — `JSON.parse` it inside the handler to access
 fields.
 
+Events that fire before a handler is registered are delivered as soon as
+one is. The startup events (`dnsCreated`, `cloudflaredStarted`, the first
+`edgeConnected`) happen while the tunnel is being created — before
+`connect()` even resolves — so without this they would be unreachable. A
+callback registered *after* the event has already been delivered to an
+earlier listener does not receive it.
+
 ## API
 
 ### `connect(options) → Promise<Listener>`
@@ -129,8 +136,8 @@ fields.
 | `fullName` | `string` | Public hostname (`myapp.example.com`). |
 | `subdomain` | `string` | Just the subdomain part. |
 | `port` | `number` | Local port currently forwarded. |
-| `on(event, cb)` | `(name, payload) → void` | Register an event listener. Throws on an unknown event name. |
-| `off(event)` | `void` | Remove every listener for an event. |
+| `on(event, cb)` | `(payload) → void` | Register an event listener. Throws on an unknown event name. |
+| `off(event, cb?)` | `void` | Remove one listener for an event, or every listener for it when no callback is given. |
 | `removeAllListeners()` | `void` | Remove every listener. |
 | `wait()` | `Promise<void>` | Block until the tunnel ends on its own. Does **not** prevent a later `close()`. |
 | `update(port)` | `Promise<void>` | Repoint at another local port; public URL unchanged. |
@@ -138,6 +145,31 @@ fields.
 
 `await listener.wait(); await listener.close();` works: a pending `wait()`
 does not starve a later `close()`.
+
+### `cleanup(options) → Promise<CleanupReport>`
+
+Reclaims dead tunnels and orphaned DNS records in one zone. A Node
+application that dies without closing its listener leaves a tunnel and a
+CNAME behind; this is how they get reclaimed from the same language.
+
+```js
+const { cleanup } = require('@xinggao/cloudpipe');
+
+const report = await cleanup({ token, domain: 'example.com' });
+console.log(`removed ${report.removed.length} resources`);
+
+// Preview first — nothing is deleted.
+const preview = await cleanup({ token, domain: 'example.com', dryRun: true });
+console.log(preview.wouldRemove);
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `token` | `string` | — | **Required.** Cloudflare API token. |
+| `domain` | `string` | auto | Base domain. |
+| `account` | `string` | auto | Cloudflare account id. |
+| `zone` | `string` | auto | Cloudflare zone id. |
+| `dryRun` | `boolean` | `false` | Report what would be removed without removing anything. |
 
 ### Errors
 
@@ -159,6 +191,19 @@ try {
  switch (code) {
  case 'MISSING_CREDENTIAL': ...
  case 'CLOUDFLARE_API:RATE_LIMITED': ...
+ }
+}
+```
+
+The error object also carries `err.code` and `err.kind` directly, so a
+`switch` on `err.code` works without parsing the message:
+
+```js
+catch (err) {
+ switch (err.code) {
+ case 'MISSING_CREDENTIAL': ...
+ case 'CLOUDFLARE_API':
+   if (err.kind === 'RATE_LIMITED') ...
  }
 }
 ```

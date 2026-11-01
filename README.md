@@ -313,6 +313,11 @@ process.on('SIGINT', async () => {
 });
 ```
 
+Events that fire before a handler is registered are delivered as soon as
+one is — the startup events (`dnsCreated`, `cloudflaredStarted`, the first
+`edgeConnected`) happen while the tunnel is being created, before
+`connect()` even resolves, so without this they would be unreachable.
+
 Prebuilt binaries are shipped for macOS (arm64 + x64), Linux (x64-gnu) and
 Windows (x64-msvc). No separate `cloudflared` install required — the SDK
 downloads a pinned, checksum-verified build on first use, with a GitHub
