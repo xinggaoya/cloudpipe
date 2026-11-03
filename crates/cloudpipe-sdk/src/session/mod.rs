@@ -25,7 +25,9 @@
 
 mod bootstrap;
 mod conflict;
+mod crashloop;
 mod policy;
+pub(crate) mod pump;
 mod state;
 mod supervisor;
 
@@ -77,9 +79,20 @@ pub(crate) async fn start(cfg: SessionConfig) -> Result<TunnelHandle> {
     let event_tx_for_task = cfg.event_tx.clone();
     let cfg_for_task = cfg.clone();
 
+    // The supervisor publishes how the session ended here, so a caller
+    // that waits for the session can tell a clean stop from a failure
+    // without racing the event stream.
+    let outcome_slot: crate::handle::OutcomeSlot = Arc::new(std::sync::Mutex::new(None));
+    let outcome_slot_for_task = Arc::clone(&outcome_slot);
+
     let task: JoinHandle<()> = tokio::spawn(async move {
-        let supervisor =
-            Supervisor::new(initial_child, state_for_task, stderr_for_task, cfg_for_task);
+        let supervisor = Supervisor::new(
+            initial_child,
+            state_for_task,
+            stderr_for_task,
+            outcome_slot_for_task,
+            cfg_for_task,
+        );
         supervisor.run().await;
         let _ = event_tx_for_task.send(Event::Cleaned);
         debug!("supervisor: task done");
@@ -98,6 +111,7 @@ pub(crate) async fn start(cfg: SessionConfig) -> Result<TunnelHandle> {
         task,
         stderr_slot,
         cfg.dispatch.clone(),
+        outcome_slot,
     ))
 }
 

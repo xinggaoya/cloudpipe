@@ -9,15 +9,17 @@
 //!    until it succeeds, the user stops, or the budget is spent.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, warn};
 
+use crate::binary::{self, LineKind};
 use crate::error::Result;
 use crate::event::{Event, ShutdownReason};
-use crate::handle::{Shutdown, StderrSlot};
+use crate::handle::{Outcome, OutcomeSlot, Shutdown, StderrSlot};
 use crate::session::bootstrap;
+use crate::session::crashloop::{self, CrashDecision, CrashGuard};
 use crate::session::state::{SessionConfig, SessionState};
 
 /// Everything the supervisor task needs, bundled so the loop body stays
@@ -31,6 +33,13 @@ pub(crate) struct Supervisor {
     cfg: SessionConfig,
     full_name: String,
     auto_restart: bool,
+    /// When the current generation was spawned. The crash guard needs to
+    /// know whether the child had time to actually work.
+    generation_started: Instant,
+    /// Counts consecutive starts that failed.
+    guard: CrashGuard,
+    /// Where the terminal outcome is published.
+    outcome_slot: OutcomeSlot,
 }
 
 impl Supervisor {
@@ -39,10 +48,12 @@ impl Supervisor {
         child: tokio::process::Child,
         state: Arc<Mutex<SessionState>>,
         stderr_slot: StderrSlot,
+        outcome_slot: OutcomeSlot,
         cfg: SessionConfig,
     ) -> Self {
         let full_name = format!("{}.{}", cfg.subdomain, cfg.domain);
         let auto_restart = cfg.auto_restart;
+        let guard = crashloop::guard_for(&cfg.restart_policy);
         Self {
             child,
             state,
@@ -52,6 +63,21 @@ impl Supervisor {
             cfg,
             full_name,
             auto_restart,
+            generation_started: Instant::now(),
+            guard,
+            outcome_slot,
+        }
+    }
+
+    /// Publishes how the session ended.
+    ///
+    /// Written once, at the very end of the session, so a caller that
+    /// waits for the session to finish can read the outcome without
+    /// racing the event stream.
+    fn finish(&self, outcome: Outcome) {
+        let mut guard = self.outcome_slot.lock().expect("outcome slot poisoned");
+        if guard.is_none() {
+            *guard = Some(outcome);
         }
     }
 
@@ -62,7 +88,7 @@ impl Supervisor {
 
         loop {
             // ---- Phase 1: a child is running; wait for it to end -------
-            let reason = self.wait_for_exit().await;
+            let (reason, status) = self.wait_for_exit().await;
             debug!(?reason, "supervisor: cloudflared generation ended");
 
             // Stop the process *before* touching Cloudflare. The old order
@@ -70,11 +96,21 @@ impl Supervisor {
             // still serving, so every in-flight request failed and "clean
             // exit" was not clean.
             self.terminate_child().await;
-            self.drain_stderr_pump();
+            let stderr = self.drain_stderr_pump().await;
+            let code = status.and_then(|status| status.code());
+
+            // The reason the child died, published *before* the cleanup
+            // noise so a consumer can show it first.
+            let _ = self.event_tx.send(Event::CloudflaredExited {
+                code,
+                stderr: stderr.clone(),
+            });
+
             let snapshot = self.state.lock().await.clone();
             snapshot.purge().await;
 
             if matches!(reason, ShutdownReason::UserRequested) {
+                self.finish(Outcome::Stopped);
                 let _ = self.event_tx.send(Event::ShuttingDown { reason });
                 break;
             }
@@ -83,7 +119,31 @@ impl Supervisor {
                 reason: reason.clone(),
             });
             if !self.auto_restart {
+                self.finish(Outcome::Crashed);
                 break;
+            }
+
+            // ---- Crash-loop guard ------------------------------------
+            // A child that dies the moment it starts will die again the
+            // moment it is restarted. The budget bounds that, so a
+            // misconfiguration ends the session with an explanation
+            // instead of looping forever.
+            let uptime = self.generation_started.elapsed();
+            match self.guard.record(uptime) {
+                CrashDecision::GiveUp { attempts } => {
+                    let last_error = describe_exit(code, &stderr);
+                    warn!(
+                        attempts,
+                        "supervisor: giving up after {attempts} failed starts: {last_error}"
+                    );
+                    self.finish(Outcome::GaveUp);
+                    let _ = self.event_tx.send(Event::RestartGivingUp {
+                        attempts,
+                        last_error,
+                    });
+                    break;
+                }
+                CrashDecision::Retry { .. } => {}
             }
 
             attempt += 1;
@@ -96,6 +156,7 @@ impl Supervisor {
                 }
                 Err(err) => {
                     warn!(attempts = self.cfg.restart_policy.max_attempts, "{err:#}");
+                    self.finish(Outcome::GaveUp);
                     let _ = self.event_tx.send(Event::RestartGivingUp {
                         attempts: self.cfg.restart_policy.max_attempts,
                         last_error: format!("{err:#}"),
@@ -132,8 +193,11 @@ impl Supervisor {
                     self.child = next.child;
                     {
                         let mut guard = self.stderr_slot.lock().expect("stderr slot poisoned");
-                        *guard = Some(next.stderr_task);
+                        *guard = Some(next.stderr_pump);
                     }
+                    // The new generation starts its own uptime clock: the
+                    // crash guard judges each generation on its own.
+                    self.generation_started = Instant::now();
                     return Ok(());
                 }
                 Err(err) => {
@@ -162,21 +226,24 @@ impl Supervisor {
     ///
     /// Driven by `child.wait()` raced against the shutdown notification —
     /// no polling interval, so an exit is observed the moment it happens.
-    async fn wait_for_exit(&mut self) -> ShutdownReason {
+    ///
+    /// The exit status is returned alongside the reason: it is the first
+    /// half of "why did it die", the stderr tail being the second.
+    async fn wait_for_exit(&mut self) -> (ShutdownReason, Option<std::process::ExitStatus>) {
         if self.shutdown.is_triggered() {
-            return ShutdownReason::UserRequested;
+            return (ShutdownReason::UserRequested, None);
         }
         tokio::select! {
             biased;
-            _ = self.shutdown.notified() => ShutdownReason::UserRequested,
+            _ = self.shutdown.notified() => (ShutdownReason::UserRequested, None),
             status = self.child.wait() => match status {
                 Ok(status) => {
                     debug!("cloudflared exited with {status:?}");
-                    ShutdownReason::ChildExited
+                    (ShutdownReason::ChildExited, Some(status))
                 }
                 Err(err) => {
                     warn!("wait on child failed: {err}");
-                    ShutdownReason::Error(err.to_string())
+                    (ShutdownReason::Error(err.to_string()), None)
                 }
             },
         }
@@ -205,10 +272,62 @@ impl Supervisor {
         let _ = self.child.start_kill();
     }
 
-    fn drain_stderr_pump(&self) {
-        if let Some(task) = crate::handle::take_pump(&self.stderr_slot) {
+    /// Waits for the stderr pump to reach EOF and returns the tail of
+    /// what the child printed.
+    ///
+    /// Awaiting the pump (rather than aborting it) is what makes the
+    /// reason a crash happened available: the pump ends when the child's
+    /// stderr closes, so its last line — the fatal message — is in the
+    /// tail by the time this returns.
+    async fn drain_stderr_pump(&mut self) -> String {
+        let Some(pump) = crate::handle::take_pump(&self.stderr_slot) else {
+            return String::new();
+        };
+        let tail = pump.tail.clone();
+        let mut task = pump.task;
+        if tokio::time::timeout(STDERR_DRAIN_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            // The pipe is still open (a grandchild inherited it). Whatever
+            // we have is the best we will get.
+            debug!("supervisor: stderr pump did not finish within the drain window");
             task.abort();
         }
+        // A poisoned tail is a reporting problem, not a reason to take
+        // the whole tunnel down.
+        let guard = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.snapshot()
+    }
+}
+
+/// How long to wait for the stderr pump to reach EOF after the child
+/// exited.
+///
+/// The pump ends when the child's stderr closes, which happens as the
+/// child exits — so the last line it printed is in the tail by the time
+/// the pump finishes. The timeout only guards against a grandchild that
+/// inherited the pipe and keeps it open.
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Builds a one-line explanation of why `cloudflared` ended.
+///
+/// Prefers the most recent *error* line of the tail — for a fatal
+/// startup failure that is the line that names the cause — and falls
+/// back to the last line of all.
+fn describe_exit(code: Option<i32>, stderr: &str) -> String {
+    let head = match code {
+        Some(code) => format!("cloudflared exited with code {code}"),
+        None => "cloudflared was terminated by a signal".to_string(),
+    };
+    let reason = stderr
+        .lines()
+        .rev()
+        .find(|line| matches!(binary::classify_line(line), LineKind::Error))
+        .or_else(|| stderr.lines().last());
+    match reason {
+        Some(line) => format!("{head}: {line}"),
+        None => head,
     }
 }
 

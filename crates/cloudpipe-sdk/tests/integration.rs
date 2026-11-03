@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use cloudpipe_sdk::{CleanupAction, CloudflareApi, Protocol, TunnelBuilder};
 use cloudpipe_test_support::{
-    read_request, spawn_mock_api, wait_until, write_crashing_cloudflared, write_fake_cloudflared,
-    MockState, CFARGO,
+    read_request, spawn_mock_api, wait_until, write_crashing_always_cloudflared,
+    write_crashing_cloudflared, write_fake_cloudflared, MockState, CFARGO,
 };
 use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
@@ -270,6 +270,12 @@ async fn full_lifecycle_creates_then_cleans_up() {
 
     handle.stop().await.expect("stop should succeed");
 
+    assert_eq!(
+        handle.outcome(),
+        Some(cloudpipe_sdk::Outcome::Stopped),
+        "a user-initiated stop is a clean exit, not a failure"
+    );
+
     assert!(
         !state.deleted_tunnels().is_empty(),
         "the tunnel must be deleted"
@@ -517,6 +523,11 @@ async fn auto_restart_off_terminates_on_crash() {
         state.tunnels().is_empty(),
         "the crashed generation's tunnel must be reclaimed"
     );
+    assert_eq!(
+        handle.outcome(),
+        Some(cloudpipe_sdk::Outcome::Crashed),
+        "a crash that was not restarted is a failure the caller can see"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -556,6 +567,111 @@ async fn auto_restart_gives_up_after_repeated_bootstrap_failures() {
     tokio::time::timeout(Duration::from_secs(10), handle.wait())
         .await
         .expect("the supervisor must give up rather than retry forever");
+}
+
+/// A `cloudflared` that dies the instant it starts can never succeed on
+/// a retry — the supervisor has to give up instead of looping forever.
+///
+/// This is the shape of the bug that made `cfp` unusable: the child died
+/// on every start, the supervisor restarted it every time, and the user
+/// watched an endless loop with no reason on screen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_that_dies_immediately_is_not_restarted_forever() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let counter = tmp.path().join("counter");
+    let binary = write_crashing_always_cloudflared(tmp.path(), &counter).await;
+
+    let mut handle = TunnelBuilder::new()
+        .api(api_for(&base))
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .subdomain("crashloop")
+        .auto_restart(true)
+        .restart_policy(cloudpipe_sdk::RestartPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(40),
+        })
+        .cloudflared_path(binary)
+        .start()
+        .await
+        .expect("the initial bootstrap succeeds");
+
+    // The session must end on its own.
+    tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("the supervisor must give up rather than retry forever");
+
+    let runs: u32 = std::fs::read_to_string(&counter)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        runs <= 3,
+        "the crash budget must bound the retries, not bound them loosely: {runs}"
+    );
+
+    // And nothing may be left behind on the account.
+    assert!(
+        state.tunnels().is_empty(),
+        "every crashed generation's tunnel must be reclaimed"
+    );
+    assert_eq!(
+        handle.outcome(),
+        Some(cloudpipe_sdk::Outcome::GaveUp),
+        "the caller must be able to tell that the tunnel is down for good"
+    );
+}
+
+/// The reason a child died has to reach the consumer — an exit code and
+/// the tail of what the child printed, not just "cloudflared exited".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_exit_reason_is_reported() {
+    let state = MockState::new();
+    let base = spawn_mock_api(state.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let counter = tmp.path().join("counter");
+    let binary = write_crashing_always_cloudflared(tmp.path(), &counter).await;
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events_for_handler = Arc::clone(&events);
+
+    let mut handle = TunnelBuilder::new()
+        .api(api_for(&base))
+        .account("acc-1")
+        .zone("zone-1")
+        .domain("example.com")
+        .subdomain("reason")
+        .auto_restart(false)
+        .cloudflared_path(binary)
+        .on_event(move |event| {
+            events_for_handler.lock().unwrap().push(event);
+        })
+        .start()
+        .await
+        .expect("the initial bootstrap succeeds");
+
+    tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("the session ends when the child exits");
+
+    let events = events.lock().unwrap().clone();
+    let (code, stderr) = events
+        .iter()
+        .find_map(|event| match event {
+            cloudpipe_sdk::Event::CloudflaredExited { code, stderr } => Some((code, stderr)),
+            _ => None,
+        })
+        .expect("the exit must be reported");
+    assert_eq!(*code, Some(1), "the exit code must be reported");
+    assert!(
+        stderr.contains("Failed to read token file"),
+        "the reason must be reported: {stderr:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

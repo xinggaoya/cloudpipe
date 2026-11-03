@@ -75,23 +75,50 @@ impl Shutdown {
 /// period, so a healthy shutdown never trips it.
 pub const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Holds the stderr pump task for the current session generation. The
+/// Holds the stderr pump for the current session generation. The
 /// background task swaps this slot whenever it respawns `cloudflared`;
 /// [`TunnelHandle::wait`] / [`TunnelHandle::stop`] / `Drop` always await
-/// the most recent task so we don't leak a generation's pump.
-pub(crate) type StderrSlot = Arc<StdMutex<Option<JoinHandle<()>>>>;
+/// the most recent pump so we don't leak a generation's pump.
+///
+/// The slot carries the pump's stderr *tail* as well as its task: the
+/// tail is what turns "cloudflared exited" into an explanation.
+pub(crate) type StderrSlot = Arc<StdMutex<Option<crate::session::pump::StderrPump>>>;
 
-/// Extracts the pump task from `slot` and releases the lock before the
+/// Extracts the pump from `slot` and releases the lock before the
 /// caller awaits it.
 ///
 /// The slot is a `std::sync::Mutex` (not an async one) on purpose: it is
 /// only ever held for a `take()`, never across an `.await`. Routing the
 /// extraction through this helper keeps that invariant checkable by the
 /// compiler instead of by convention.
-pub(crate) fn take_pump(slot: &StderrSlot) -> Option<JoinHandle<()>> {
+pub(crate) fn take_pump(slot: &StderrSlot) -> Option<crate::session::pump::StderrPump> {
     let mut guard = slot.lock().expect("stderr slot poisoned");
     guard.take()
 }
+
+/// How a tunnel session ended.
+///
+/// Reported by [`TunnelHandle::outcome`] once the session is over. The
+/// difference matters: "the user stopped it" is a clean exit, while
+/// "it died and could not be brought back" is a failure that deserves a
+/// non-zero exit code from a CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The user stopped the tunnel.
+    Stopped,
+    /// `cloudflared` exited and the session was not restarted.
+    Crashed,
+    /// The auto-restart budget was spent — the tunnel is down and will
+    /// not come back on its own.
+    GaveUp,
+}
+
+/// Shared slot the supervisor writes the terminal outcome into.
+///
+/// A `std::sync::Mutex` on purpose: it is written once, at the very end
+/// of the session, and read synchronously — never held across an
+/// `.await`.
+pub(crate) type OutcomeSlot = Arc<StdMutex<Option<Outcome>>>;
 
 /// A live tunnel. Created by [`crate::TunnelBuilder::start`].
 ///
@@ -111,6 +138,8 @@ pub struct TunnelHandle {
     task: Option<JoinHandle<()>>,
     stderr_slot: Option<StderrSlot>,
     dispatch: crate::session::DispatchSlot,
+    /// How the session ended, written by the supervisor when it finishes.
+    outcome_slot: OutcomeSlot,
     stopped: bool,
 }
 
@@ -138,6 +167,7 @@ impl TunnelHandle {
         task: JoinHandle<()>,
         stderr_slot: StderrSlot,
         dispatch: crate::session::DispatchSlot,
+        outcome_slot: OutcomeSlot,
     ) -> Self {
         let url = format!("https://{full_name}");
         Self {
@@ -152,8 +182,18 @@ impl TunnelHandle {
             task: Some(task),
             stderr_slot: Some(stderr_slot),
             dispatch,
+            outcome_slot,
             stopped: false,
         }
+    }
+
+    /// How the session ended.
+    ///
+    /// `None` while the session is still running. Once it is over, this
+    /// distinguishes a clean stop from a crash the supervisor could not
+    /// recover from.
+    pub fn outcome(&self) -> Option<Outcome> {
+        *self.outcome_slot.lock().expect("outcome slot poisoned")
     }
 
     /// The full public URL of the tunnel (always HTTPS).
@@ -263,8 +303,8 @@ impl TunnelHandle {
         // returning the background task has already finished, so the
         // slot will not be rewritten underneath us.
         if let Some(slot) = self.stderr_slot.take() {
-            if let Some(task) = take_pump(&slot) {
-                let _ = task.await;
+            if let Some(pump) = take_pump(&slot) {
+                let _ = pump.task.await;
             }
         }
     }
@@ -307,8 +347,8 @@ impl TunnelHandle {
             return Ok(());
         }
         if let Some(slot) = self.stderr_slot.take() {
-            if let Some(task) = take_pump(&slot) {
-                let _ = task.await;
+            if let Some(pump) = take_pump(&slot) {
+                let _ = pump.task.await;
             }
         }
 
@@ -344,8 +384,8 @@ impl Drop for TunnelHandle {
             task.abort();
         }
         if let Some(slot) = self.stderr_slot.take() {
-            if let Some(task) = take_pump(&slot) {
-                task.abort();
+            if let Some(pump) = take_pump(&slot) {
+                pump.task.abort();
             }
         }
         self.dispatch.abort();
@@ -406,7 +446,14 @@ mod tests {
                 .unwrap(),
             Arc::new(StdMutex::new(None)),
             crate::session::DispatchSlot::default(),
+            Arc::new(StdMutex::new(None)),
         )
+    }
+
+    #[test]
+    fn the_outcome_is_unknown_until_the_session_ends() {
+        let handle = detached();
+        assert_eq!(handle.outcome(), None);
     }
 
     #[test]
@@ -476,11 +523,12 @@ mod tests {
         let slot: StderrSlot = Arc::new(StdMutex::new(None));
         assert!(take_pump(&slot).is_none());
 
-        let slot: StderrSlot = Arc::new(StdMutex::new(Some(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .spawn(async { std::future::pending::<()>().await }),
-        )));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let pump = crate::session::pump::StderrPump {
+            task: runtime.spawn(async { std::future::pending::<()>().await }),
+            tail: Arc::new(StdMutex::new(crate::session::pump::StderrTail::default())),
+        };
+        let slot: StderrSlot = Arc::new(StdMutex::new(Some(pump)));
         assert!(take_pump(&slot).is_some(), "the task must come out");
         assert!(
             take_pump(&slot).is_none(),

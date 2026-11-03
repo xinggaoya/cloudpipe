@@ -18,8 +18,9 @@
 //!   then `rename`d into place, so a concurrent reader never observes a
 //!   half-written file and two `cfp` invocations cannot corrupt each
 //!   other.
-//! - The tunnel token is passed via a **`0600` file**, never through argv,
-//!   because argv is world-readable through `/proc/<pid>/cmdline`.
+//! - The tunnel token is handed over through the **environment**, never
+//!   through argv, because argv is world-readable through
+//!   `/proc/<pid>/cmdline` and `ps`. See [`TOKEN_ENV_VAR`].
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -36,6 +37,27 @@ use crate::event::LogLevel;
 
 /// Base URL for `cloudflared` release assets.
 const GITHUB_BASE_URL: &str = "https://github.com/cloudflare/cloudflared/releases/download";
+
+/// Environment variable `cloudflared` reads the tunnel token from.
+///
+/// `cloudflared tunnel run --token` is documented as
+/// `[%TUNNEL_TOKEN%]`, i.e. the flag falls back to this variable, so
+/// setting it is equivalent to passing `--token <value>` — without the
+/// value ever appearing in argv (and therefore in `ps` output or
+/// `/proc/<pid>/cmdline`, which every local user can read).
+///
+/// # Why not a token file
+///
+/// The previous implementation staged the token in a `0600` file and
+/// passed `--token-file`, then unlinked the file right after `spawn()`
+/// returned. `spawn()` returning only means fork/exec finished — the
+/// child had not yet opened the file — so the unlink raced the child's
+/// own `open()` and won essentially every time. `cloudflared` then died
+/// with `Failed to read token file: … The system cannot find the file
+/// specified.`, the supervisor restarted it, and the loop repeated
+/// forever. The environment has no such window: the value is already in
+/// the child's environment before its first instruction runs.
+pub const TOKEN_ENV_VAR: &str = "TUNNEL_TOKEN";
 
 /// The `cloudflared` version this SDK installs.
 ///
@@ -160,6 +182,31 @@ pub fn classify_line(line: &str) -> LineKind {
         "quic:",
     ];
 
+    // Fatal messages that do not contain the substring "err". Without
+    // this list they were classified `Ignore` and silently dropped, so a
+    // `cloudflared` that died with `Failed to read token file: …` left
+    // the user staring at an endless restart loop with no reason on
+    // screen. The patterns are the ones `cloudflared` actually emits on
+    // its fatal paths (CLI usage errors, unreadable credentials, refused
+    // connections).
+    const ERROR_PATTERNS: &[&str] = &[
+        "failed to",
+        "fatal",
+        "panic:",
+        "invalid",
+        "is not valid",
+        "cannot ",
+        "unable to",
+        "permission denied",
+        "no such file",
+        "not authorized",
+        "unauthorized",
+        "requires the id or name",
+        "requires a tunnel",
+        "unknown flag",
+        "unexpected argument",
+    ];
+
     let lower = line.to_ascii_lowercase();
     if lower.contains("registered tunnel connection") {
         return LineKind::Connection;
@@ -176,7 +223,7 @@ pub fn classify_line(line: &str) -> LineKind {
     if IGNORE_PATTERNS.iter().any(|p| lower.contains(p)) {
         return LineKind::Ignore;
     }
-    if lower.contains("err") || lower.contains("error") {
+    if lower.contains("err") || ERROR_PATTERNS.iter().any(|p| lower.contains(p)) {
         return LineKind::Error;
     }
     LineKind::Ignore
@@ -391,9 +438,6 @@ pub async fn ensure_installed(
     github_proxy: Option<&str>,
 ) -> Result<PathBuf> {
     if let Some(path) = find_in_path() {
-        // A previous run killed between fork and cloudflared's own open()
-        // leaves the token file behind. Clear it before returning.
-        cleanup_token_file(&path).await;
         return Ok(path);
     }
 
@@ -402,8 +446,6 @@ pub async fn ensure_installed(
     if is_executable(&path) {
         return Ok(path);
     }
-
-    cleanup_token_file(&path).await;
 
     let asset = download_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
     if sha256_is_overridden() {
@@ -581,79 +623,37 @@ fn make_executable(path: &Path) {
 /// Spawns `cloudflared` to run the named tunnel, with stderr piped for
 /// event dispatch.
 ///
-/// The token is written to a `0600` file and passed with `--token-file`
-/// rather than `--token <value>`: argv is readable by every local user
-/// through `/proc/<pid>/cmdline` on Linux and `ps` on macOS, so passing it
-/// inline would expose a live tunnel credential to anyone on the box. The
-/// file is unlinked as soon as the process has started.
+/// The token travels through the environment ([`TOKEN_ENV_VAR`]) rather
+/// than argv: argv is readable by every local user through
+/// `/proc/<pid>/cmdline` on Linux and `ps` on macOS, so passing it inline
+/// would expose a live tunnel credential to anyone on the box. The
+/// environment carries the same exposure (same-user `/proc/<pid>/environ`)
+/// but, unlike a staged file, it cannot be deleted out from under the
+/// child between `fork` and the child's own `open()`.
 pub async fn spawn(path: &Path, tunnel_token: &str) -> Result<tokio::process::Child> {
-    let token_file = write_token_file(path, tunnel_token).await?;
+    command_for(path, tunnel_token)
+        .spawn()
+        .map_err(|e| InstallError::Spawn(e).into())
+}
 
-    let result = Command::new(path)
-        .args(["tunnel", "run", "--token-file"])
-        .arg(&token_file)
+/// Builds the `cloudflared` invocation.
+///
+/// Split out from [`spawn`] so the argv/environment contract can be
+/// asserted on without starting a process.
+fn command_for(path: &Path, tunnel_token: &str) -> Command {
+    let mut cmd = Command::new(path);
+    cmd.args(["tunnel", "run"])
+        // The token is read from the environment by `cloudflared` itself
+        // (`--token` falls back to `%TUNNEL_TOKEN%`).
+        .env(TOKEN_ENV_VAR, tunnel_token)
         // `cloudflared` has no `--no-autoupdate` flag; the documented way to
         // disable self-update is this environment variable.
         .env("NO_AUTOUPDATE", "true")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
-
-    // Unlink unconditionally, success or failure: leaving a live tunnel
-    // credential on disk for the process's lifetime is strictly worse.
-    //
-    // This races the child's own `open()` — `spawn` returning only means
-    // fork/exec finished, not that `cloudflared` has read the file yet.
-    // The file is `0600` and `TunnelGuard` removes it again once the
-    // stderr pump has observed the process starting, so the exposure
-    // window is bounded and the credential never survives the session.
-    let _ = fs::remove_file(&token_file).await;
-
-    result.map_err(|e| InstallError::Spawn(e).into())
-}
-
-/// Removes a leftover token file.
-///
-/// The primary unlink happens in [`spawn`]; this exists for the case where
-/// the child is killed between fork and its own `open()`, which would
-/// otherwise leave the file behind until the next run.
-pub(crate) async fn cleanup_token_file(binary: &Path) {
-    let _ = fs::remove_file(token_path(binary)).await;
-}
-
-/// Writes the tunnel token to a sibling `0600` file next to the binary.
-///
-/// Keeping it beside `cloudflared` (rather than in the system temp dir)
-/// means it inherits the same directory permissions as the binary itself.
-async fn write_token_file(binary: &Path, token: &str) -> Result<PathBuf> {
-    let file = token_path(binary);
-
-    #[cfg(unix)]
-    let opened = {
-        // `tokio::fs::OpenOptions` exposes `mode` directly on Unix, so the
-        // file is created `0600` rather than chmod-ed afterwards — there is
-        // no window in which the secret is world-readable.
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
-        opts.open(&file).await
-    };
-    #[cfg(not(unix))]
-    let opened = fs::File::create(&file).await;
-
-    let mut handle = opened.with_context(|| format!("cannot create {}", file.display()))?;
-    handle
-        .write_all(token.as_bytes())
-        .await
-        .context("cannot write tunnel token")?;
-    handle.flush().await.ok();
-    Ok(file)
-}
-
-/// Where the tunnel token is staged before `cloudflared` starts.
-fn token_path(binary: &Path) -> PathBuf {
-    temp_path(binary).with_extension("token")
+        .kill_on_drop(true);
+    cmd
 }
 
 /// Digest of an in-memory buffer, used by the install path and its tests.
@@ -708,6 +708,80 @@ mod tests {
             classify_line("Cannot determine default origin certificate path"),
             LineKind::Ignore
         );
+    }
+
+    #[test]
+    fn the_token_travels_through_the_environment_not_argv() {
+        // Regression guard for the failure that made `cfp` loop forever:
+        // the token used to be staged in a file that was unlinked before
+        // `cloudflared` could open it, so the child died with
+        // `Failed to read token file` on every single start.
+        //
+        // The environment has no such window, and it keeps the secret out
+        // of `ps` output.
+        let cmd = command_for(Path::new("/usr/bin/cloudflared"), "secret-tunnel-token");
+
+        let env_token = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(TOKEN_ENV_VAR))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(
+            env_token.as_deref(),
+            Some("secret-tunnel-token"),
+            "the token must be handed over through {TOKEN_ENV_VAR}"
+        );
+
+        let argv: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !argv.iter().any(|arg| arg.contains("secret-tunnel-token")),
+            "the token must never appear in argv: {argv:?}"
+        );
+        assert_eq!(argv, vec!["tunnel".to_string(), "run".to_string()]);
+    }
+
+    #[test]
+    fn fatal_cloudflared_messages_are_not_silently_dropped() {
+        // Each of these is a message `cloudflared` prints when it cannot
+        // start. None of them contains the substring "err", so the old
+        // classifier dropped all of them and the user saw an endless
+        // restart loop with no reason on screen.
+        for line in [
+            "Failed to read token file: open /tmp/x.token: The system cannot find the file specified.",
+            "Provided Tunnel token is not valid.",
+            "\"cloudflared tunnel run\" requires the ID or name of the tunnel to run as the last command line argument",
+            "Cannot load the credentials file",
+            "permission denied",
+            "invalid token",
+        ] {
+            assert_eq!(
+                classify_line(line),
+                LineKind::Error,
+                "must be surfaced, not dropped: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_cloudflared_noise_stays_ignored() {
+        // The widening above must not turn routine chatter into errors.
+        for line in [
+            "ERR Failed to dial to edge",
+            "Cannot determine default origin certificate path",
+            "2026-01-01 INF Retrying connection in up to 5s",
+            "2026-01-01 WRN Timeout: no recent network activity",
+        ] {
+            assert_eq!(
+                classify_line(line),
+                LineKind::Ignore,
+                "must stay quiet: {line}"
+            );
+        }
     }
 
     #[test]

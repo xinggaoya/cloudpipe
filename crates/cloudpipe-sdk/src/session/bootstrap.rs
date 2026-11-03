@@ -5,20 +5,17 @@
 //! exists, so a failure at any later step unwinds the earlier ones instead
 //! of orphaning a tunnel or a DNS record on the account.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::task::JoinHandle;
 
 use tracing::warn;
 
-use crate::binary::{self, LineKind};
+use crate::binary;
 use crate::client::CloudflareApi;
 use crate::error::{Error, Result};
-use crate::event::{Event, LogLevel};
+use crate::event::Event;
 use crate::handle::StderrSlot;
 use crate::session::conflict::resolve_conflicts;
+use crate::session::pump::{self, StderrPump};
 use crate::session::state::{SessionConfig, SessionState};
 
 use super::emit;
@@ -58,17 +55,17 @@ impl Created {
 pub(crate) struct Bootstrap {
     pub(crate) state: SessionState,
     pub(crate) child: tokio::process::Child,
-    pub(crate) stderr_task: JoinHandle<()>,
+    pub(crate) stderr_pump: StderrPump,
 }
 
 impl Bootstrap {
     /// Splits the generation into the pieces the caller installs.
     ///
-    /// `JoinHandle` cannot be cloned, so the pump task is *moved* into the
-    /// shared slot exactly once — the supervisor reads that slot to abort
-    /// the previous generation, and the handle drains whichever is current.
+    /// The pump cannot be cloned, so it is *moved* into the shared slot
+    /// exactly once — the supervisor reads that slot to abort the previous
+    /// generation, and the handle drains whichever is current.
     pub(crate) fn into_parts(self) -> (SessionState, tokio::process::Child, StderrSlot) {
-        let slot: StderrSlot = Arc::new(std::sync::Mutex::new(Some(self.stderr_task)));
+        let slot: StderrSlot = Arc::new(std::sync::Mutex::new(Some(self.stderr_pump)));
         (self.state, self.child, slot)
     }
 }
@@ -197,52 +194,11 @@ async fn inner(
         .take()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("cloudflared stderr not piped")))?;
 
-    let connections = Arc::new(AtomicUsize::new(0));
-    let connections_for_pump = Arc::clone(&connections);
-    let event_tx_for_pump = cfg.event_tx.clone();
-    let stderr_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let kind = binary::classify_line(trimmed);
-                    match kind {
-                        LineKind::Connection => {
-                            let total = connections_for_pump.fetch_add(1, Ordering::SeqCst) + 1;
-                            let _ = event_tx_for_pump.send(Event::EdgeConnected {
-                                conn_index: total.saturating_sub(1) as u8,
-                                total: total as u8,
-                            });
-                        }
-                        LineKind::Log(level) => {
-                            let _ = event_tx_for_pump.send(Event::CloudflaredLog {
-                                level,
-                                line: trimmed.to_string(),
-                            });
-                        }
-                        LineKind::Error => {
-                            let _ = event_tx_for_pump.send(Event::CloudflaredLog {
-                                level: LogLevel::Error,
-                                line: trimmed.to_string(),
-                            });
-                        }
-                        LineKind::Ignore => {}
-                    }
-                }
-            }
-        }
-    });
+    let stderr_pump = pump::spawn(stderr, cfg.event_tx.clone());
 
     Ok(Bootstrap {
         state,
         child,
-        stderr_task,
+        stderr_pump,
     })
 }

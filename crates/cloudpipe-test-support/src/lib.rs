@@ -497,6 +497,60 @@ pub async fn write_crashing_cloudflared(dir: &Path, counter_file: &Path) -> std:
     }
 }
 
+/// A `cloudflared` stand-in that dies immediately *every* time it is
+/// started.
+///
+/// This is the "this can never succeed on a retry" case: the supervisor
+/// has to give up instead of restarting forever. The stand-in also says
+/// *why* it died, the way the real `cloudflared` does — that message is
+/// what the supervisor has to surface.
+pub async fn write_crashing_always_cloudflared(
+    dir: &Path,
+    counter_file: &Path,
+) -> std::path::PathBuf {
+    // See `write_fake_cloudflared`: a shell script is not a runnable image
+    // on Windows, so the crash-counter is a batch file there.
+    #[cfg(windows)]
+    {
+        let path = dir.join("cloudflared.cmd");
+        let script = format!(
+            "@echo off\r\n\
+             set \"COUNTER_FILE={}\"\r\n\
+             set count=0\r\n\
+             if exist \"%COUNTER_FILE%\" set /p count=<\"%COUNTER_FILE%\"\r\n\
+             set /a count+=1\r\n\
+             > \"%COUNTER_FILE%\" echo %count%\r\n\
+             echo 2025-01-01 Registered tunnel connection connIndex=0 1>&2\r\n\
+             echo Failed to read token file: no such file or directory 1>&2\r\n\
+             exit /b 1\r\n",
+            counter_file.display()
+        );
+        write_script(&path, &script).await;
+        // See `write_fake_cloudflared`: the surviving `cfg` block is the
+        // function's tail expression on this platform.
+        path
+    }
+
+    #[cfg(unix)]
+    {
+        let path = dir.join("cloudflared");
+        let script = format!(
+            "#!/bin/sh\n\
+             trap 'exit 0' TERM INT\n\
+             COUNTER_FILE=\"{}\"\n\
+             count=$(cat \"$COUNTER_FILE\" 2>/dev/null || echo 0)\n\
+             count=$((count + 1))\n\
+             echo \"$count\" > \"$COUNTER_FILE\"\n\
+             echo \"2025-01-01 Registered tunnel connection connIndex=0\"\n\
+             echo \"Failed to read token file: no such file or directory\" 1>&2\n\
+             exit 1\n",
+            counter_file.display()
+        );
+        write_script(&path, &script).await;
+        path
+    }
+}
+
 pub async fn write_script(path: &Path, script: &str) {
     tokio::fs::write(path, script).await.unwrap();
     #[cfg(unix)]

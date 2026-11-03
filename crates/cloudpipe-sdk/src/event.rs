@@ -40,6 +40,23 @@ pub enum Event {
     /// `cloudflared` was spawned successfully.
     CloudflaredStarted,
 
+    /// `cloudflared` exited.
+    ///
+    /// Emitted with the exit status and the tail of the child's stderr, so
+    /// a consumer can explain *why* the tunnel died instead of printing a
+    /// bare "cloudflared exited". The tail is empty when the child said
+    /// nothing before dying — which, before the stderr pump kept a tail,
+    /// was the normal case and the reason a crash was impossible to
+    /// diagnose.
+    CloudflaredExited {
+        /// The child's exit code, or `None` when it was terminated by a
+        /// signal (on Unix) rather than exiting on its own.
+        code: Option<i32>,
+        /// The last few stderr lines the child produced, newline-separated.
+        /// Empty when it produced none.
+        stderr: String,
+    },
+
     /// The previous tunnel session ended and a new one is being created on
     /// the same URL. Only emitted when auto-restart is enabled.
     Restarting {
