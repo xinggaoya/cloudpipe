@@ -162,6 +162,14 @@ Cloudflare Tunnel 凭据广播给本机其他用户。
 **修法**：改用 `--token-file <path>`（0600 临时文件）或 stdin 传入；
 spawn 后立刻 `unlink`。这是本项目安全模型里最该修的一条。
 
+> **后续修正（已实施）**：`--token-file` 方案本身有个竞态——`spawn` 返回只代表
+> fork/exec 完成，子进程还没 `open()` 那个文件，父进程抢先 `unlink` 会让
+> cloudflared 每次启动都以 `Failed to read token file: …` 退出；而这句报错不含
+> `err` 字样，被 stderr 分类器当成噪声丢弃，于是表现为「无限重启且看不到原因」。
+> 现改为通过环境变量 `TUNNEL_TOKEN` 交接（cloudflared 的 `--token` 本就回落到
+> 该变量）：既不落盘、不进 argv，也没有删除竞态。同时补上：致命日志分类、
+> 退出时上报 exit code + stderr 尾部、崩溃循环预算。
+
 ---
 
 ### P1-2 `cloudflared` 下载无校验、无超时、无原子写（供应链 + 并发）
@@ -615,7 +623,11 @@ P4-4 文档矛盾清理
    PATH 上 cloudflared 的机器首次运行即失败。改为只填经 release 实际校验的
    摘要，并新增 `verify-checksums` CI job 作为长期保障。
 3. **token 文件 unlink 竞态**，以及一个**恒真**的单测（断言了流程中从不出现的
-   `cloudflared.part`，所以无论代码怎么写都通过）。
+   `cloudflared.part`，所以无论代码怎么写都通过）。第一次「修复」只是在下一次
+   运行时清理残留文件，并没有消除竞态——真正消除它的是改用 `TUNNEL_TOKEN`
+   环境变量交接（见 P1-1 的后续修正）。配套还修了：致命日志被 stderr 分类器
+   丢弃（用户只看到无限重启，看不到原因）、子进程退出时不上报 exit code 与
+   stderr 尾部、以及崩溃循环没有预算（子进程一启动就死时无限重试）。
 4. **`ApiError::Timeout` 从未被构造**，导致 CLI 的超时提示是不可达分支。
 5. **`is_retryable` 把 Cloudflare 业务码当 HTTP 状态码比较**，`7003`
    （could-not-route）被误判为可重试，白重放三次。

@@ -93,10 +93,20 @@ impl Config {
         self.token.clone()
     }
 
+    /// The token stored in the config file.
+    ///
+    /// Legacy storage. `cfp key` now puts the token in the OS credential
+    /// store and leaves this empty; the field is still read (and migrated
+    /// into the store) so a token saved by an older version keeps
+    /// working.
+    pub fn file_token(&self) -> Option<String> {
+        self.token.clone()
+    }
+
     /// Whether enough credentials exist to talk to the Cloudflare API.
     #[allow(dead_code)]
     pub fn is_ready(&self) -> bool {
-        self.effective_token().is_some()
+        (self.effective_token().is_some() || self.file_token().is_some())
             && self.account_id.is_some()
             && self.zone_id.is_some()
             && self.domain.is_some()

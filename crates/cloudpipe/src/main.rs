@@ -2,6 +2,7 @@
 
 mod cli;
 mod config;
+mod credentials;
 mod logging;
 mod ui;
 
@@ -39,7 +40,7 @@ async fn run(cli: Cli) -> Result<()> {
     // and `run_tunnel_command` did not even share the token check the
     // other three used — so the same failure produced two different
     // messages depending on which command hit it.
-    let ctx = Ctx::load()?;
+    let ctx = Ctx::load().await?;
     match cli.command {
         Some(Command::Key {
             token,
@@ -63,16 +64,44 @@ struct Ctx {
     /// Overrides the Cloudflare API base URL. Only the tests set it, and
     /// they point it at an in-process mock.
     api_base: Option<String>,
+    /// Where the token may be stored.
+    credential_store: credentials::Store,
+    /// The token, resolved from the environment, the OS credential store
+    /// or the config file — in that order.
+    token: Option<String>,
+    /// The same resolution, with the token's *source*.
+    resolved: credentials::Resolved,
 }
 
 impl Ctx {
-    /// Opens the config store and reads the current config.
-    fn load() -> Result<Self> {
+    /// Opens the config store, reads the current config and resolves the
+    /// token.
+    async fn load() -> Result<Self> {
         let store = ConfigStore::default()?;
-        Self::with_store(store)
+        let mut ctx = Self::with_store(store)?;
+        ctx.credential_store = credentials::Store::Auto;
+
+        // A token that is still sitting in the config file is moved into
+        // the OS credential store, so the file stops holding a secret in
+        // plaintext.
+        if migrate_legacy_token(&ctx.store, &mut ctx.config, ctx.credential_store).await {
+            ui::note(
+                "Moved your API token from the config file into the OS credential store.\n  \
+                 The config file no longer contains the token.",
+            );
+        }
+
+        let resolved = credentials::resolve_token(&ctx.config, ctx.credential_store).await;
+        ctx.token = resolved.token.clone();
+        ctx.resolved = resolved;
+        Ok(ctx)
     }
 
     /// A context rooted at a specific store.
+    ///
+    /// The credential store is *not* consulted here: the tests use this
+    /// constructor, and a test run must never write to the developer's
+    /// real credential vault.
     fn with_store(store: ConfigStore) -> Result<Self> {
         let config = store.load();
         Ok(Self {
@@ -80,13 +109,17 @@ impl Ctx {
             config,
             api: OnceCell::new(),
             api_base: None,
+            credential_store: credentials::Store::FileOnly,
+            token: None,
+            resolved: credentials::Resolved::empty(),
         })
     }
 
     /// The effective token, with the standard "run `cfp key` first" help.
     fn token(&self) -> Result<String> {
-        self.config
-            .effective_token()
+        self.token
+            .clone()
+            .or_else(|| self.config.effective_token())
             .ok_or_else(|| anyhow!("no Cloudflare API token configured — run `cfp key -` first"))
     }
 
@@ -125,7 +158,7 @@ impl Ctx {
 }
 
 async fn run_tunnel_command(ctx: &Ctx, args: TunnelArgs) -> Result<()> {
-    if ctx.config.effective_token().is_none() {
+    if ctx.token().is_err() {
         // Starting a tunnel is the one command where the missing token is
         // worth a setup walkthrough rather than a one-liner.
         ui::no_token_guide();
@@ -184,7 +217,14 @@ async fn run_tunnel_command(ctx: &Ctx, args: TunnelArgs) -> Result<()> {
                 ui::error(&format!("cleanup failed: {err:#}"));
             }
         }
-        _ = handle.wait() => {}
+        _ = handle.wait() => {
+            // A tunnel that never came up must not exit 0. The session's
+            // outcome is read from the handle — not from the event stream,
+            // which would race the dispatch task.
+            if ui::is_failed_outcome(handle.outcome()) {
+                bail!("the tunnel could not be kept alive — see the error above");
+            }
+        }
     }
     Ok(())
 }
@@ -198,8 +238,18 @@ async fn handle_key(
     if clear {
         let cleared = Config::new_empty();
         ctx.store.save(&cleared)?;
+        // The token may live in the credential store rather than in the
+        // file — clearing the file alone would leave it behind.
+        if ctx.credential_store.allows_system() {
+            if let Err(err) = credentials::delete_token() {
+                ui::note(&format!(
+                    "Could not clear the OS credential store ({err}). \
+                     The config file has been cleared."
+                ));
+            }
+        }
         ui::success("All credentials cleared.");
-        ui::key_status(&cleared);
+        ui::key_status(&cleared, None);
         return Ok(());
     }
 
@@ -221,7 +271,7 @@ async fn handle_key(
         (None, None) => {
             // Bare `cfp key` shows the current status, so a missing token
             // is the documented outcome here rather than an error.
-            ui::key_status(&ctx.config);
+            ui::key_status(&ctx.config, Some(&ctx.resolved));
             return Ok(());
         }
     };
@@ -253,19 +303,22 @@ async fn handle_key(
     }
 
     let mut config = ctx.config.clone();
-    save_token_and_zone(&ctx.store, &mut config, trimmed, &zones[0])?;
+    let saved = credentials::save_token(trimmed, ctx.credential_store);
+    save_token_and_zone(&ctx.store, &mut config, trimmed, &zones[0], saved)?;
 
     if zones.len() == 1 {
         ui::success(&format!(
-            "Saved. Tunnels will be exposed under {}.",
+            "Saved to {}. Tunnels will be exposed under {}.",
+            saved.describe(),
             config.domain.clone().unwrap()
         ));
-        ui::key_status(&config);
+        ui::key_status(&config, Some(&ctx.resolved));
     } else {
         ui::heading("Multiple zones are accessible:");
         ui::zones(&zones, config.domain.as_deref());
         ui::success(&format!(
-            "Saved (default domain: {}). Switch with `cfp domain <name>`.",
+            "Saved to {} (default domain: {}). Switch with `cfp domain <name>`.",
+            saved.describe(),
             config.domain.clone().unwrap()
         ));
     }
@@ -326,8 +379,18 @@ fn save_token_and_zone(
     config: &mut Config,
     token: &str,
     zone: &cloudpipe_sdk::Zone,
+    saved: credentials::Saved,
 ) -> Result<()> {
-    config.token = Some(token.to_string());
+    // The token goes into the OS credential store when the machine has
+    // one, so it is not left lying in a plaintext file. The file keeps a
+    // copy only when the store cannot be read back — a store that
+    // silently loses the secret is worse than a file that holds it.
+    config.token = match saved {
+        credentials::Saved::System => None,
+        credentials::Saved::File | credentials::Saved::SystemWithFileCopy => {
+            Some(token.to_string())
+        }
+    };
     store.save(config)?;
 
     config.apply_zone(zone).map_err(|err| {
@@ -335,6 +398,63 @@ fn save_token_and_zone(
     })?;
     store.save(config)?;
     Ok(())
+}
+
+/// Moves a token that is still in the config file into the OS credential
+/// store.
+///
+/// Returns `true` when the config file no longer holds the token.
+///
+/// The move is verified before the file is rewritten: the token is
+/// written to the store, read back, and only then removed from the
+/// file. A store that refuses the secret — or accepts it and cannot
+/// read it back — leaves the file untouched, so the user never loses
+/// their token.
+async fn migrate_legacy_token(
+    store: &ConfigStore,
+    config: &mut Config,
+    credential_store: credentials::Store,
+) -> bool {
+    if !credential_store.allows_system() {
+        return false;
+    }
+    let Some(file_token) = config.file_token() else {
+        return false;
+    };
+    if !credentials::store_available() {
+        return false;
+    }
+
+    let stored = credentials::read_token_within(credentials::STORE_BUDGET).await;
+    let moved = match stored {
+        // The credential store already holds a token: it is where `cfp
+        // key` writes now, so it is the one the user chose most
+        // recently. The file copy is redundant — and is exactly the
+        // plaintext we are trying to get rid of.
+        Some(_) => true,
+        None => match credentials::write_token(&file_token) {
+            Ok(()) => {
+                credentials::read_token_within(credentials::STORE_BUDGET)
+                    .await
+                    .as_deref()
+                    == Some(file_token.as_str())
+            }
+            Err(_) => false,
+        },
+    };
+    if !moved {
+        return false;
+    }
+
+    config.token = None;
+    if let Err(err) = store.save(config) {
+        ui::note(&format!(
+            "Could not rewrite the config file ({err}); \
+             the token is still in it as well as in the credential store."
+        ));
+        return false;
+    }
+    true
 }
 
 /// Reads a token from stdin, one line.
@@ -375,8 +495,14 @@ mod tests {
             name: "example.com".into(),
             account: None,
         };
-        let err = save_token_and_zone(&store, &mut config, "cf_test", &zone)
-            .expect_err("the zone resolution must fail");
+        let err = save_token_and_zone(
+            &store,
+            &mut config,
+            "cf_test",
+            &zone,
+            credentials::Saved::File,
+        )
+        .expect_err("the zone resolution must fail");
         assert!(format!("{err:#}").contains("account"), "{err:#}");
 
         // The token survived, and the error says so.
@@ -483,7 +609,14 @@ mod tests {
                 id: "account-1".into(),
             }),
         };
-        save_token_and_zone(&store, &mut config, "cf_test", &zone).expect("the zone resolves");
+        save_token_and_zone(
+            &store,
+            &mut config,
+            "cf_test",
+            &zone,
+            credentials::Saved::File,
+        )
+        .expect("the zone resolves");
 
         let saved = store.load();
         assert_eq!(saved.token.as_deref(), Some("cf_test"));

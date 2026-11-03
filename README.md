@@ -6,9 +6,9 @@
 
 `cfp` exposes a local port to the public internet by creating a Cloudflare Tunnel and a DNS record on your own zone. Everything runs on your machine — there is **no shared service, no proxy server, no account on someone else's platform**. You authenticate with your own Cloudflare API token, the CLI talks to `api.cloudflare.com` directly, and `cloudflared` handles the QUIC connection to the Cloudflare edge.
 
-- 🪶 **Single static binary** — Rust, `rustls` TLS (no system OpenSSL), ~4 MB
+- 🪶 **Single static binary** — Rust, `rustls` TLS (no system OpenSSL), ~7 MB on Windows; the Linux build is larger because it embeds the Secret Service client
 - 🪪 **Bring your own token** — your Cloudflare account, your zone, your rate-limit quota
-- 🔒 **Local-only credentials** — token stored in `~/.cfp/config.json`, created `0600`
+- 🔒 **Local-only credentials** — token kept in the OS credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service), falling back to `~/.cfp/config.json` (`0600`)
 - 🌐 **Custom subdomains** — pick `-s myapp` or get a random one
 - 🛣️ **Five protocols** — `http`, `https`, `tcp`, `udp`, `ssh` (Cloudflare edge always serves HTTPS publicly)
 - 🔐 **Self-signed HTTPS works** — `--insecure` skips origin certificate validation for local dev servers
@@ -106,9 +106,9 @@ compiled into the binary, and an asset with no pinned digest is refused
 rather than installed unverified. Writes are staged and renamed atomically,
 so two concurrent `cfp` runs cannot end up with a half-written executable.
 
-The tunnel token is passed to `cloudflared` through a `0600` file rather than
-the command line — argv is readable by every local user through
-`/proc/<pid>/cmdline` and `ps`.
+The tunnel token is handed to `cloudflared` through the environment
+(`TUNNEL_TOKEN`) rather than the command line — argv is readable by every
+local user through `/proc/<pid>/cmdline` and `ps`.
 
 ### Build from source
 
@@ -180,9 +180,25 @@ cfp cleanup --json        # machine-readable report
 cfp cleanup
 ```
 
-The config file lives at `~/.cfp/config.json` (created `0600`). Writes are
-atomic, so an interrupted save cannot corrupt it. You can also pass the
-token via env var for one-off use (overrides the file):
+### Where the token is kept
+
+Your API token is **not** written to the config file. `cfp key <token>` puts
+it in the OS credential store — Windows Credential Manager, macOS Keychain,
+Linux Secret Service — where the OS encrypts it at rest and binds it to
+your login. Another local user cannot read it, and it is not sitting in a
+plaintext file.
+
+If the machine has no credential store (a headless server, a container),
+`cfp` falls back to `~/.cfp/config.json`, created `0600` on Unix. A token
+left in the file by an older version is migrated into the credential store
+automatically the next time `cfp` runs — but only after the store has been
+read back and verified, so a store that refuses the secret never costs you
+your token.
+
+The config file itself holds only the non-secret settings (account, zone,
+domain) and is written atomically, so an interrupted save cannot corrupt
+it. You can also pass the token via env var for one-off use (overrides
+everything else):
 
 ```bash
 CLOUDFLARE_API_TOKEN=... cfp 8080
@@ -192,7 +208,7 @@ CLOUDFLARE_API_TOKEN=... cfp 8080
 
 | Variable | Effect |
 |---|---|
-| `CLOUDFLARE_API_TOKEN` | Overrides the token in the config file. |
+| `CLOUDFLARE_API_TOKEN` | Overrides the stored token (env → credential store → config file). |
 | `CFP_CONFIG_DIR` | Relocates the config directory (default `~/.cfp`). |
 | `CFP_GITHUB_PROXY` | Mirror prefix for the `cloudflared` download. Empty disables it. |
 | `CFP_LOG` | `trace`/`debug`/`info`/`warn`/`error`/`off`. Unset or `off` is silent. |
@@ -352,7 +368,8 @@ its runtime surface is exercised by `npm test` (`test/smoke.js`).
 
 ```
 cfp tcp 22 -s mybox
-  ├─ Load ~/.cfp/config.json              (token + account/zone/domain)
+  ├─ Resolve the token                     (env → OS credential store → config file)
+  ├─ Load ~/.cfp/config.json              (account/zone/domain)
   ├─ Ensure cloudflared                   (PATH → auto-download to ~/.cfp/bin/)
   ├─ Reclaim stale tunnels / orphaned DNS with the same name
   ├─ POST /accounts/{id}/tunnels          create named tunnel
@@ -360,11 +377,11 @@ cfp tcp 22 -s mybox
   │        ingress: [{hostname: mybox.example.com, service: tcp://localhost:22},
   │                  {service: http_status:404}]
   ├─ POST /zones/{id}/dns_records         CNAME mybox.example.com → {tunnelId}.cfargotunnel.com
-  ├─ spawn cloudflared tunnel run --token ... --no-autoupdate
+  ├─ spawn cloudflared tunnel run         (token in the environment, not in argv)
   └─ wait for Ctrl+C (or child crash if --no-restart)
-        └─ child crash (default): kill cloudflared → delete DNS → cleanup
-           connections → delete tunnel → bootstrap a fresh tunnel on the
-           same subdomain
+        └─ child crash (default): report why it died → kill cloudflared
+           → delete DNS → cleanup connections → delete tunnel → bootstrap
+           a fresh tunnel on the same subdomain
         └─ Ctrl+C: kill cloudflared → delete DNS → cleanup connections
            → delete tunnel
 ```
@@ -380,6 +397,7 @@ Conflict handling:
 
 Other guarantees worth knowing about:
 - A DNS-creation or `cloudflared`-spawn failure **unwinds** the tunnel that was just created, instead of leaving it orphaned.
+- When `cloudflared` dies, the CLI prints **why**: its exit code and the last lines it wrote to stderr. A failure that can never succeed on a retry (an invalid token, unreadable credentials) is not retried forever — after 5 consecutive failed starts the session ends and says so.
 - `drop(handle)` detaches a best-effort Cloudflare purge; `cloudpipe_sdk::cleanup` reclaims anything a hard kill leaves.
 - Generated subdomains draw from 32^7 values (the previous 10,000 made `SubdomainInUse` routine).
 
@@ -389,7 +407,7 @@ Other guarantees worth knowing about:
 - Cloudflare's API rate limits apply per token. The SDK retries transient failures automatically; sustained heavy use may still need `cfp cleanup`.
 - The `cloudflared` binary is downloaded on first use and stored at `~/.cfp/bin/cloudflared` (~40 MB). Its version is pinned, so upgrading `cfp` to pick up a newer `cloudflared` is deliberate.
 - The built-in SHA-256 table covers every platform the SDK can install on: Linux x86_64/arm64/arm, macOS x86_64/arm64, and Windows x86_64/386. If you build for a platform outside that set, either install `cloudflared` yourself and put it on `PATH`, or set `CFP_CLOUDFLARED_SHA256=<digest you verified>` — an unverified executable is never installed. CI re-derives the table from the release on every build, so a stale or wrong digest fails the build rather than your first run.
-- Auto-restart uses a bounded retry budget (5 attempts, 500 ms doubling to an 8 s cap). Beyond that the session ends and reports why, rather than reconnecting forever.
+- Auto-restart uses a bounded retry budget (5 attempts, 500 ms doubling to an 8 s cap). Beyond that the session ends and reports why, rather than reconnecting forever. The budget counts a start that died within 10 s; a tunnel that ran for hours before crashing is treated as a fresh incident, not as part of a crash loop.
 
 ## License
 

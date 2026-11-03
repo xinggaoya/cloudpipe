@@ -17,10 +17,11 @@ use std::io::IsTerminal;
 use colored::Colorize;
 
 use cloudpipe_sdk::{
-    CleanupReport, CloudflareErrorKind, Error, Event, LogLevel, Protocol, ShutdownReason,
+    CleanupReport, CloudflareErrorKind, Error, Event, LogLevel, Outcome, Protocol, ShutdownReason,
 };
 
 use crate::config::Config;
+use crate::credentials;
 
 /// How to decorate output: colours on/off and Unicode/ASCII glyphs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +268,9 @@ pub fn render_event_text(event: &Event) -> Option<EventLine> {
             dim(&format!("Creating DNS {full_name}..."), st)
         )),
         Event::CloudflaredStarted => None,
+        Event::CloudflaredExited { code, stderr } => {
+            out(render_exit_block(code.as_ref(), stderr, st))
+        }
         Event::Restarting { reason, attempt } => out(format!(
             "  {}",
             yellow(
@@ -349,6 +353,43 @@ pub fn render_event(event: Event) {
         Some(EventLine::Err(text)) => eprintln!("{text}"),
         None => {}
     }
+}
+
+/// How many of the child's stderr lines are shown when it dies.
+const EXIT_TAIL_LINES: usize = 8;
+
+/// Renders the block that explains a `cloudflared` exit: the exit status
+/// and the tail of what the child printed before it died.
+///
+/// The *last* lines are shown rather than the first: a fatal startup
+/// error is what `cloudflared` prints last, and the noise before it is
+/// what the user does not need.
+fn render_exit_block(code: Option<&i32>, stderr: &str, st: Style) -> String {
+    let head = match code {
+        Some(code) => format!("cloudflared exited (code {code})."),
+        None => "cloudflared exited.".to_string(),
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("  {}\n", red(&head, st)));
+
+    let lines: Vec<&str> = stderr.lines().collect();
+    let start = lines.len().saturating_sub(EXIT_TAIL_LINES);
+    for line in &lines[start..] {
+        out.push_str(&format!("    {}\n", dim(line, st)));
+    }
+    out.trim_end().to_string()
+}
+
+/// Whether a session outcome means the tunnel failed.
+///
+/// The outcome is written by the supervisor itself, so unlike an event
+/// it cannot race the dispatch task: by the time the session is over,
+/// the answer is final.
+///
+/// A tunnel that never came up must not exit 0.
+pub fn is_failed_outcome(outcome: Option<Outcome>) -> bool {
+    matches!(outcome, Some(outcome) if !matches!(outcome, Outcome::Stopped))
 }
 
 fn describe_reason(reason: &ShutdownReason) -> String {
@@ -480,6 +521,12 @@ pub fn step(message: &str) {
     println!("  {}", dim(message, style()));
 }
 
+/// Prints an informational note — something the user should know but
+/// that is not an error.
+pub fn note(message: &str) {
+    println!("  {}", dim(message, style()));
+}
+
 /// Prints a blank line followed by a bold section heading.
 pub fn heading(message: &str) {
     println!();
@@ -516,8 +563,8 @@ pub fn no_token_guide() {
 }
 
 /// Prints the current credential status.
-pub fn key_status(config: &Config) {
-    print!("{}", key_status_text(config));
+pub fn key_status(config: &Config, resolved: Option<&credentials::Resolved>) {
+    print!("{}", key_status_text(config, resolved));
 }
 
 /// The credential status as text.
@@ -526,12 +573,19 @@ pub fn key_status(config: &Config) {
 /// `CLOUDFLARE_API_TOKEN` is not persisted, and telling the two apart is
 /// the difference between "logged in" and "logged in until you close the
 /// shell".
-pub fn key_status_text(config: &Config) -> String {
+///
+/// `resolved` is the token the CLI actually resolved — from the
+/// environment, the OS credential store or the config file. It is a
+/// parameter rather than something this function looks up, so that
+/// rendering stays pure and a test run cannot read the developer's real
+/// credential vault.
+pub fn key_status_text(config: &Config, resolved: Option<&credentials::Resolved>) -> String {
     let st = style();
     let mut out = String::new();
 
-    match (&config.token, env_token()) {
-        (Some(token), _) => {
+    let stored = resolved.filter(|resolved| resolved.token.is_some());
+    match (&config.token, env_token(), stored) {
+        (Some(token), _, _) => {
             out.push_str(&format!(
                 "{} {} (saved to {})\n",
                 bold("Token", st),
@@ -539,14 +593,27 @@ pub fn key_status_text(config: &Config) -> String {
                 config_file_label()
             ));
         }
-        (None, Some(_)) => {
+        (None, Some(_), _) => {
             out.push_str(&format!(
                 "{} {}\n",
                 bold("Token", st),
                 yellow("from CLOUDFLARE_API_TOKEN (not persisted to disk)", st)
             ));
         }
-        (None, None) => {
+        (None, None, Some(resolved)) => {
+            let token = resolved.token.as_deref().unwrap_or_default();
+            let where_ = resolved
+                .location
+                .map(|location| location.describe())
+                .unwrap_or("the OS credential store");
+            out.push_str(&format!(
+                "{} {} (saved to {})\n",
+                bold("Token", st),
+                dim(&mask_token(token), st),
+                where_
+            ));
+        }
+        (None, None, None) => {
             out.push_str(&format!("{} {}\n", bold("Token", st), red("not set", st)));
         }
     }
@@ -758,22 +825,71 @@ mod tests {
             ..Default::default()
         };
 
-        let saved = key_status_text(&config);
+        let saved = key_status_text(&config, None);
         assert!(saved.contains("saved"), "{saved}");
         // The token itself must not be printed.
         assert!(!saved.contains("cf_saved_token"), "{saved}");
 
         // A config with no stored token must not claim to have one —
         // whether the environment supplies it or nothing does.
-        let empty = key_status_text(&Config::default());
+        let empty = key_status_text(&Config::default(), None);
         assert!(!empty.contains("saved"), "{empty}");
+    }
+
+    #[test]
+    fn a_give_up_is_a_failure_but_a_user_stop_is_not() {
+        assert!(is_failed_outcome(Some(Outcome::GaveUp)));
+        assert!(is_failed_outcome(Some(Outcome::Crashed)));
+        assert!(!is_failed_outcome(Some(Outcome::Stopped)));
+        assert!(
+            !is_failed_outcome(None),
+            "a session that is still running is not a failure"
+        );
+    }
+
+    #[test]
+    fn the_exit_block_shows_the_code_and_the_reason() {
+        let prev = set_style(Style::plain());
+        let text = render_event_text(&Event::CloudflaredExited {
+            code: Some(127),
+            stderr: "Failed to read token file: open /tmp/x: no such file".into(),
+        });
+        set_style(prev);
+
+        let text = text.expect("the exit must render");
+        let EventLine::Out(text) = text else {
+            panic!("the exit block belongs on stdout");
+        };
+        assert!(text.contains("127"), "{text}");
+        assert!(text.contains("Failed to read token file"), "{text}");
+    }
+
+    #[test]
+    fn the_exit_block_keeps_the_last_lines_of_a_long_tail() {
+        // A fatal message is what `cloudflared` prints *last*; a tail
+        // that was trimmed from the front would drop exactly the line
+        // the user needs.
+        let stderr: String = (0..40).map(|i| format!("line {i}\n")).collect::<String>()
+            + "Failed to read token file: gone\n";
+        let prev = set_style(Style::plain());
+        let text = render_event_text(&Event::CloudflaredExited {
+            code: Some(1),
+            stderr,
+        });
+        set_style(prev);
+
+        let Some(EventLine::Out(text)) = text else {
+            panic!("the exit block belongs on stdout");
+        };
+        assert!(text.contains("Failed to read token file"), "{text}");
+        assert!(!text.contains("line 0\n"), "{text}");
     }
 
     #[test]
     fn key_status_names_the_real_config_file() {
         // The path used to be hardcoded, which was wrong as soon as
         // CFP_CONFIG_DIR was set.
-        let text = key_status_text(&Config::default());
+        let text = key_status_text(&Config::default(), None);
         assert!(text.contains("Config file:"), "{text}");
         assert!(text.contains("config.json"), "{text}");
     }

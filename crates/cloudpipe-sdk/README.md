@@ -45,8 +45,8 @@ async fn main() -> anyhow::Result<()> {
 ## Highlights
 
 - **Pure async (tokio)** — no blocking calls leak into your runtime.
-- **Bring your own credentials** — pass them in code, or reuse the CLI's
-  `~/.cfp/config.json` layout.
+- **Bring your own credentials** — pass the token in code; the CLI resolves
+  it from the environment, the OS credential store, or `~/.cfp/config.json`.
 - **Event stream** — `on_event` receives lifecycle events so you render
   your own UI.
 - **Safe by default** — every Cloudflare resource created during startup is
